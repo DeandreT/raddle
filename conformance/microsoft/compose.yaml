@@ -1,0 +1,44 @@
+services:
+  sql:
+    # SQL Server 2022, resolved from Microsoft's 2022-latest image.
+    image: mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
+    environment:
+      ACCEPT_EULA: ${RADDLE_MICROSOFT_ACCEPT_EULA:-N}
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${RADDLE_MICROSOFT_SQL_PASSWORD:?Set a disposable fixture password}
+    cpus: 2
+    mem_limit: 3g
+    labels:
+      raddle.fixture: microsoft-servicebus
+    volumes:
+      - sql-state:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "SQLCMDPASSWORD=\"$$MSSQL_SA_PASSWORD\" /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+  emulator:
+    # Official Service Bus emulator 2.0.1 for linux/amd64.
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator@sha256:7607008ede6fa0f9fb4f3411bd681e39b48dcbcc90bafbc15f7bca5c3d8ced4b
+    environment:
+      ACCEPT_EULA: ${RADDLE_MICROSOFT_ACCEPT_EULA:-N}
+      SQL_SERVER: sql
+      MSSQL_SA_PASSWORD: ${RADDLE_MICROSOFT_SQL_PASSWORD:?Set a disposable fixture password}
+      EMULATOR_HTTP_PORT: 5300
+      SQL_WAIT_INTERVAL: 15
+    volumes:
+      - ./config.json:/ServiceBus_Emulator/ConfigFiles/Config.json:ro
+    ports:
+      - "127.0.0.1:${RADDLE_MICROSOFT_AMQP_PORT:-0}:5672"
+      - "127.0.0.1:${RADDLE_MICROSOFT_HTTP_PORT:-0}:5300"
+    cpus: 2
+    mem_limit: 2g
+    labels:
+      raddle.fixture: microsoft-servicebus
+    depends_on:
+      sql:
+        condition: service_healthy
+
+volumes:
+  sql-state:

@@ -15,6 +15,7 @@ archive is not permission to replace it with the unpatched registry dependency.
 - [Connection, settlement, sessions, and conformance](https://github.com/DeandreT/raddle/blob/main/docs/servicebus.md)
 - [Vendored-source provenance and publication restriction](https://github.com/DeandreT/raddle/blob/main/THIRD_PARTY.md)
 - [Independent Switchyard harness](https://github.com/DeandreT/raddle/tree/main/conformance)
+- [Official Microsoft emulator fixture](https://github.com/DeandreT/raddle/tree/main/conformance/microsoft)
 - [Source repository](https://github.com/DeandreT/raddle)
 
 Switchyard results do not establish live Azure compatibility. MIT licensed.

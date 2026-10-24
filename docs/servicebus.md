@@ -38,6 +38,13 @@ toolchain. It exercises actual AMQP sockets on both memory and durable backends.
 Run from that directory with `cargo test -- --test-threads=1`. Its failures remain
 visible; a Switchyard result never substitutes for Azure qualification.
 
+An independent [Microsoft emulator fixture](../conformance/microsoft/README.md)
+runs the same adapter contract against Microsoft's official Service Bus emulator
+without an Azure subscription. It is opt-in and uses disposable loopback-only
+containers. This supplies an additional broker implementation for local
+compatibility work, while Entra ID, cloud networking, WebSockets, and actual Azure
+service qualification remain separate from emulator results.
+
 The narrowly patched vendored client is documented in `THIRD_PARTY.md`. Git
 consumers retain the direct path dependency. Do not publish the adapter to a
 registry with an unpatched dependency substituted for this source.
