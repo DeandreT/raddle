@@ -1,0 +1,28 @@
+[package]
+name = "raddle-servicebus"
+description = "Confirmed AMQP 1.0 messaging for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+emulator = ["azservicebus/unsecured"]
+
+[dependencies]
+raddle.workspace = true
+azservicebus.workspace = true
+azure_core.workspace = true
+url.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
