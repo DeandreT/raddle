@@ -185,11 +185,16 @@ impl Envelope {
         Ok(())
     }
 
-    /// Adds correlation without changing message identity.
-    pub fn correlated(mut self, correlation_id: Uuid, causation_id: Uuid) -> Self {
+    /// Adds correlation without changing message identity, checking the full byte limit.
+    pub fn correlated(
+        mut self,
+        correlation_id: Uuid,
+        causation_id: Uuid,
+    ) -> Result<Self, WireError> {
         self.correlation_id = Some(correlation_id);
         self.causation_id = Some(causation_id);
-        self
+        self.validate(EnvelopeLimits::default())?;
+        Ok(self)
     }
 
     /// Returns a new envelope with a validated application header.

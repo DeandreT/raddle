@@ -33,6 +33,11 @@ remote handler normally; its database effects and `Scope::reply` can commit
 together. `reply` accepts only the explicitly supplied reply endpoint allowlist.
 Never construct that allowlist from inbound message headers.
 
+Adding correlation with `Envelope::correlated` returns `Result` because the
+complete encoded envelope, including correlation metadata, must fit its byte
+limit. Propagate that error just as for `with_header`; transactional reply
+creation marks the scope rollback-only if the completed envelope cannot fit.
+
 The reply listener passes its authenticated source to `accept_reply`. The first
 matching reply before the deadline wins. Unknown, late, duplicate, or already
 terminal replies do not overwrite state. A reply from the wrong responder or

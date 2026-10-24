@@ -103,6 +103,84 @@ async fn business_writes_and_effects_share_one_transaction(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn invalid_time_bounds_preserve_jobs_and_terminal_rejection_needs_no_future_time(
+    pool: PgPool,
+) {
+    let store = Store::new(pool.clone());
+    let id = enqueue(&store, DeliveryKind::Local, "audit").await;
+    let now = Utc::now();
+    for (lease, clock) in [
+        (Duration::from_nanos(1), now),
+        (Duration::from_secs(1), chrono::DateTime::<Utc>::MAX_UTC),
+    ] {
+        assert!(matches!(
+            store.claim(DeliveryKind::Local, 1, lease, clock).await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    let job = store.inspect("tenant", id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Ready);
+    assert_eq!(job.attempts, 0);
+
+    let claim = store
+        .claim(DeliveryKind::Local, 1, Duration::from_millis(1), now)
+        .await
+        .unwrap()
+        .remove(0);
+    store.complete(&claim, now).await.unwrap();
+
+    let id = enqueue(&store, DeliveryKind::Local, "audit").await;
+    let claim = store
+        .claim(DeliveryKind::Local, 1, Duration::from_secs(30), Utc::now())
+        .await
+        .unwrap()
+        .remove(0);
+    let before: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT available_at FROM raddle_jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(matches!(
+        store
+            .fail(
+                &claim,
+                raddle_postgres::FailureDisposition::Retry,
+                RetryPolicy::default(),
+                "retry",
+                chrono::DateTime::<Utc>::MAX_UTC
+            )
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let job = store.inspect("tenant", id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Active);
+    assert_eq!(job.attempts, 1);
+    let after: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT available_at FROM raddle_jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    store
+        .fail(
+            &claim,
+            raddle_postgres::FailureDisposition::Reject,
+            RetryPolicy::default(),
+            "rejected",
+            chrono::DateTime::<Utc>::MAX_UTC,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.inspect("tenant", id).await.unwrap().unwrap().status,
+        JobStatus::Dead
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn duplicate_conflicts_poison_the_entire_fanout(pool: PgPool) {
     let store = Store::new(pool.clone());
     let now = Utc::now();

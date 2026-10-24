@@ -2,9 +2,9 @@
 #![allow(clippy::unwrap_used)]
 
 use chrono::{TimeDelta, Utc};
-use raddle::wire::{Envelope, WireMessage};
+use raddle::wire::{Envelope, EnvelopeLimits, WireMessage};
 use raddle_postgres::{
-    ConversationStatus, ReplyDisposition, RequestOptions, SagaState, SagaTimeout, Store,
+    ConversationStatus, Error, ReplyDisposition, RequestOptions, SagaState, SagaTimeout, Store,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -217,7 +217,8 @@ async fn replies_are_tenant_source_and_contract_scoped(pool: PgPool) {
     scope.commit(Utc::now()).await.unwrap();
     let reply = Envelope::encode(&Reply(42))
         .unwrap()
-        .correlated(request.id(), request.id());
+        .correlated(request.id(), request.id())
+        .unwrap();
     let mut scope = store.begin().await.unwrap();
     assert_eq!(
         scope
@@ -275,7 +276,8 @@ async fn cancelled_and_expired_conversations_ignore_late_replies(pool: PgPool) {
     );
     let reply = Envelope::encode(&Reply(42))
         .unwrap()
-        .correlated(request.id(), request.id());
+        .correlated(request.id(), request.id())
+        .unwrap();
     assert_eq!(
         scope
             .accept_reply("tenant", "orders", &reply, Utc::now())
@@ -393,5 +395,62 @@ async fn completed_sagas_cannot_be_mutated_or_restarted(pool: PgPool) {
             .state()
             .count,
         1
+    );
+}
+#[derive(Serialize, Deserialize)]
+struct LargeReply(String);
+impl WireMessage for LargeReply {
+    const NAME: &'static str = "test.large-reply";
+    const VERSION: u32 = 1;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn oversized_correlated_reply_rolls_back_business_effects(pool: PgPool) {
+    sqlx::query("CREATE TABLE reply_effects(value integer)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = Store::new(pool.clone());
+    let request = Envelope::encode(&Request(1))
+        .unwrap()
+        .with_header("reply-endpoint".into(), "replies".into())
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    let now = Utc::now();
+    let empty = Envelope::with_identity(id, now, &LargeReply(String::new())).unwrap();
+    let payload_size = EnvelopeLimits::default().max_bytes - empty.to_vec().unwrap().len();
+    let response = Envelope::with_identity(id, now, &LargeReply("x".repeat(payload_size))).unwrap();
+    let mut scope = store.begin().await.unwrap();
+    sqlx::query("INSERT INTO reply_effects VALUES(1)")
+        .execute(scope.connection())
+        .await
+        .unwrap();
+    assert!(matches!(
+        scope
+            .reply(
+                "tenant",
+                &request,
+                response,
+                &["replies".parse().unwrap()],
+                now
+            )
+            .await,
+        Err(Error::Wire(_))
+    ));
+    assert!(matches!(scope.commit(now).await, Err(Error::RollbackOnly)));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM reply_effects")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM raddle_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
     );
 }

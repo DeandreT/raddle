@@ -13,5 +13,14 @@ fuzz_target!(|bytes: &[u8]| {
         assert_eq!(again.contract(), envelope.contract());
         assert_eq!(again.version(), envelope.version());
         assert_eq!(again.headers(), envelope.headers());
+        let id = envelope.id();
+        if let Ok(correlated) = envelope.correlated(id, id) {
+            let bytes = correlated
+                .to_vec()
+                .expect("validated correlation serialization");
+            let decoded = Envelope::from_slice(&bytes, limits).expect("bounded correlation");
+            assert_eq!(decoded.correlation_id(), Some(id));
+            assert_eq!(decoded.causation_id(), Some(id));
+        }
     }
 });

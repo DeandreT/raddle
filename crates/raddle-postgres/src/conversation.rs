@@ -119,7 +119,7 @@ impl Scope<'_> {
             if !allowed.iter().any(|allowed| allowed.as_str() == endpoint) {
                 return Err(Error::Invalid("reply endpoint is not authorized"));
             }
-            let response = response.correlated(request.id(), request.id());
+            let response = response.correlated(request.id(), request.id())?;
             self.stage(
                 "raddle.replies",
                 tenant,
@@ -178,7 +178,7 @@ impl Scope<'_> {
             let destination: Option<String> = sqlx::query_scalar("UPDATE raddle_conversations SET status='cancelled' WHERE tenant=$1 AND id=$2 AND status='pending' RETURNING destination")
                 .bind(tenant).bind(id).fetch_optional(self.connection()).await?;
             let Some(destination) = destination else { return Ok(false); };
-            let cancel = Envelope::encode(&Cancellation { request_id: id })?.correlated(id, id);
+            let cancel = Envelope::encode(&Cancellation { request_id: id })?.correlated(id, id)?;
             self.stage("raddle.requests", tenant, &cancel, &[Delivery::new(DeliveryKind::Remote, destination, now)]).await?;
             Ok(true)
         }.await;

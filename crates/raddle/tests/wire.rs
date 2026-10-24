@@ -103,3 +103,46 @@ fn debug_does_not_disclose_payload_or_header_values() {
             .is_err()
     );
 }
+
+#[derive(Serialize, Deserialize)]
+struct Payload(String);
+impl WireMessage for Payload {
+    const NAME: &'static str = "test.payload";
+    const VERSION: u32 = 1;
+}
+
+#[test]
+fn correlation_metadata_respects_the_envelope_byte_limit() {
+    let id = uuid::Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let limit = EnvelopeLimits::default().max_bytes;
+    let overhead = Envelope::with_identity(id, now, &Payload(String::new()))
+        .unwrap()
+        .to_vec()
+        .unwrap()
+        .len();
+    let envelope =
+        Envelope::with_identity(id, now, &Payload("x".repeat(limit - overhead))).unwrap();
+    assert_eq!(envelope.to_vec().unwrap().len(), limit);
+    assert!(matches!(
+        envelope.correlated(id, id),
+        Err(WireError::Invalid(_))
+    ));
+
+    let empty = Envelope::with_identity(id, now, &Payload(String::new())).unwrap();
+    let correlation_size = empty.correlated(id, id).unwrap().to_vec().unwrap().len() - overhead;
+    let envelope = Envelope::with_identity(
+        id,
+        now,
+        &Payload("x".repeat(limit - overhead - correlation_size)),
+    )
+    .unwrap()
+    .correlated(id, id)
+    .unwrap();
+    let bytes = envelope.to_vec().unwrap();
+    assert_eq!(bytes.len(), limit);
+    let round_trip = Envelope::from_slice(&bytes, EnvelopeLimits::default()).unwrap();
+    assert_eq!(round_trip.id(), id);
+    assert_eq!(round_trip.correlation_id(), Some(id));
+    assert_eq!(round_trip.causation_id(), Some(id));
+}
