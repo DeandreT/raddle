@@ -59,6 +59,11 @@ Persisted sagas and durable request/reply conversations share those transaction
 boundaries. A bounded ephemeral reply registry is also available for callers
 that do not need restart recovery. See [orchestration](docs/orchestration.md).
 
+`raddle-axum` adds authenticated typed HTTP requests, durable idempotent
+acceptance, and opt-in operational endpoints. Its OpenAPI 3.1 document is generated
+from the same registrations and checked against actual responses. See
+[HTTP integration](docs/http.md).
+
 ## Development
 
 The repository pins Rust in `rust-toolchain.toml`. Run:
