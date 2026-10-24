@@ -197,6 +197,30 @@ impl Store {
             return Err(Error::Invalid("invalid replay audit"));
         }
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("INSERT INTO raddle_quotas(tenant) VALUES($1) ON CONFLICT DO NOTHING")
+            .bind(tenant)
+            .execute(&mut *transaction)
+            .await?;
+        let capacity: i32 =
+            sqlx::query_scalar("SELECT max_pending FROM raddle_quotas WHERE tenant=$1 FOR UPDATE")
+                .bind(tenant)
+                .fetch_one(&mut *transaction)
+                .await?;
+        // Never wait on a running execution while holding the admission lock.
+        let candidate: Option<Uuid> = sqlx::query_scalar("SELECT id FROM raddle_jobs WHERE tenant=$1 AND id=$2 AND status='dead' AND (expires_at IS NULL OR expires_at>$3) FOR UPDATE SKIP LOCKED")
+            .bind(tenant).bind(id).bind(now).fetch_optional(&mut *transaction).await?;
+        if candidate.is_none() {
+            return Ok(false);
+        }
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM raddle_jobs WHERE tenant=$1 AND status IN ('ready','active')",
+        )
+        .bind(tenant)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if pending >= i64::from(capacity) {
+            return Err(Error::Capacity);
+        }
         let result = sqlx::query("UPDATE raddle_jobs SET status='ready',available_at=$3,attempts=0,last_error=NULL WHERE tenant=$1 AND id=$2 AND status='dead' AND (expires_at IS NULL OR expires_at > $3)")
             .bind(tenant).bind(id).bind(now).execute(&mut *transaction).await?;
         if result.rows_affected() == 0 {

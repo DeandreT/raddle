@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/raddle", "crates/raddle-postgres", "crates/raddle-axum"]
+members = ["crates/raddle", "crates/raddle-postgres", "crates/raddle-axum", "crates/raddle-sqlite", "crates/raddle-rabbitmq"]
 resolver = "3"
 
 [workspace.package]

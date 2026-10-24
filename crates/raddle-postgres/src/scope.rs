@@ -78,6 +78,12 @@ impl<'connection> Scope<'connection> {
         self.claim.as_ref().map(|claim| claim.tenant())
     }
 
+    /// Original envelope for the current worker execution, including correlation metadata.
+    /// Producer-owned scopes have no incoming envelope.
+    pub fn envelope(&self) -> Result<Option<Envelope>, Error> {
+        self.claim.as_ref().map(Claim::envelope).transpose()
+    }
+
     pub(crate) fn with_claim(mut self, claim: Claim) -> Self {
         self.claim = Some(claim);
         self

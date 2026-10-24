@@ -64,6 +64,10 @@ acceptance, and opt-in operational endpoints. Its OpenAPI 3.1 document is genera
 from the same registrations and checked against actual responses. See
 [HTTP integration](docs/http.md).
 
+`raddle-sqlite` supports single-node durable queues with explicit writer
+serialization. `raddle-rabbitmq` supports AMQP 0-9-1 confirms, mandatory routing,
+and bounded explicit-ack consumption. See [adapter guarantees](docs/adapters.md).
+
 ## Development
 
 The repository pins Rust in `rust-toolchain.toml`. Run:
