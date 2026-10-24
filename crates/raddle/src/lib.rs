@@ -32,6 +32,8 @@ mod message;
 mod publication;
 mod runtime;
 mod subscription_name;
+pub mod transport;
+pub mod wire;
 
 pub use builder::RuntimeBuilder;
 pub use delivery::EventDelivery;
