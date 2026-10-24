@@ -8,7 +8,9 @@ mod scope;
 mod store;
 mod worker;
 
-pub use conversation::{Conversation, ConversationStatus, ReplyDisposition, RequestOptions};
+pub use conversation::{
+    Cancellation, Conversation, ConversationStatus, ReplyDisposition, RequestOptions,
+};
 pub use error::Error;
 pub use job::{Claim, Delivery, DeliveryKind, FailureDisposition, Job, JobStatus, RetryPolicy};
 pub use saga::{Saga, SagaState, SagaTimeout};

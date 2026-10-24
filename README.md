@@ -76,6 +76,10 @@ consumers retain the patched source.
 
 ## Development
 
+`raddle-testkit` provides deterministic clocks, bounded transport fault scripts,
+and shared custody checks. See [qualification](docs/qualification.md) for fuzzing,
+database, feature-isolation, and native platform gates.
+
 The repository pins Rust in `rust-toolchain.toml`. Run:
 
 ```sh

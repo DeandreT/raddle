@@ -1,7 +1,7 @@
 [workspace]
-members = ["crates/raddle", "crates/raddle-postgres", "crates/raddle-axum", "crates/raddle-sqlite", "crates/raddle-rabbitmq", "crates/raddle-servicebus"]
+members = ["crates/raddle", "crates/raddle-postgres", "crates/raddle-axum", "crates/raddle-sqlite", "crates/raddle-rabbitmq", "crates/raddle-servicebus", "crates/raddle-testkit"]
 resolver = "3"
-exclude = ["conformance", "vendor/azservicebus"]
+exclude = ["conformance", "vendor/azservicebus", "fuzz"]
 
 [patch.crates-io]
 azservicebus = { path = "vendor/azservicebus" }
@@ -28,6 +28,7 @@ raddle = { path = "crates/raddle", version = "0.1.0" }
 azservicebus = { version = "0.25.1", path = "vendor/azservicebus", default-features = false, features = ["rustls"] }
 azure_core = { version = "0.25", default-features = false }
 url = "2.5"
+raddle-testkit = { path = "crates/raddle-testkit", version = "0.1.0" }
 raddle-postgres = { path = "crates/raddle-postgres", version = "0.1.0" }
 axum = { version = "0.8", features = ["json"] }
 schemars = { version = "1.0", features = ["uuid1"] }

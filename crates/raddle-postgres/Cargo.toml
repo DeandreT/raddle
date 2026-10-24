@@ -20,6 +20,7 @@ futures-util.workspace = true
 tokio = { workspace = true, features = ["time", "macros"] }
 
 [dev-dependencies]
+raddle-testkit.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

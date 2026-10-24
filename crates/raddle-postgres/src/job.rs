@@ -112,7 +112,7 @@ pub struct Job {
 }
 
 /// A leased claim. Fields are private to prevent forging a valid ownership token.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Claim {
     pub(crate) id: Uuid,
     pub(crate) owner: Uuid,
@@ -122,6 +122,16 @@ pub struct Claim {
     pub(crate) destination: String,
     pub(crate) attempts: i32,
     pub(crate) max_attempts: i32,
+}
+
+impl std::fmt::Debug for Claim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Claim")
+            .field("id", &self.id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Claim {
