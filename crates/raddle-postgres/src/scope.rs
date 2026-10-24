@@ -40,9 +40,48 @@ impl<'connection> Scope<'connection> {
         self.poisoned = true;
     }
 
+    /// Accepts one scoped idempotency key and its durable effects in this transaction.
+    /// Repeated equivalent input returns the original message identity; changed input conflicts.
+    pub async fn stage_idempotent(
+        &mut self,
+        source: &str,
+        tenant: &str,
+        key: &str,
+        envelope: &Envelope,
+        deliveries: &[Delivery],
+    ) -> Result<Uuid, Error> {
+        if self.poisoned {
+            return Err(Error::RollbackOnly);
+        }
+        let result = async {
+            if source.is_empty() || source.len() > 128 || tenant.is_empty() || tenant.len() > 128 || key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_graphic()) { return Err(Error::Invalid("invalid idempotency key")); }
+            let fingerprint = Sha256::digest(envelope.content_bytes()?).to_vec();
+            let inserted = sqlx::query("INSERT INTO raddle_idempotency(tenant,source,key,request_hash,message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+                .bind(tenant).bind(source).bind(key).bind(&fingerprint).bind(envelope.id()).execute(self.connection()).await?;
+            if inserted.rows_affected() == 0 {
+                let row = sqlx::query("SELECT request_hash,message_id FROM raddle_idempotency WHERE tenant=$1 AND source=$2 AND key=$3")
+                    .bind(tenant).bind(source).bind(key).fetch_one(self.connection()).await?;
+                if row.try_get::<Vec<u8>,_>("request_hash")? != fingerprint { return Err(Error::IdentityConflict); }
+                return Ok(row.try_get("message_id")?);
+            }
+            self.stage(source, tenant, envelope, deliveries).await?;
+            Ok(envelope.id())
+        }.await;
+        if result.is_err() {
+            self.mark_rollback_only();
+        }
+        result
+    }
+
     /// Returns the authenticated tenant of the current delivery, if this is a worker scope.
     pub fn tenant(&self) -> Option<&str> {
         self.claim.as_ref().map(|claim| claim.tenant())
+    }
+
+    /// Original envelope for the current worker execution, including correlation metadata.
+    /// Producer-owned scopes have no incoming envelope.
+    pub fn envelope(&self) -> Result<Option<Envelope>, Error> {
+        self.claim.as_ref().map(Claim::envelope).transpose()
     }
 
     pub(crate) fn with_claim(mut self, claim: Claim) -> Self {

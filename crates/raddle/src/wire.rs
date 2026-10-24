@@ -145,6 +145,19 @@ impl Envelope {
         Ok(serde_json::to_vec(self)?)
     }
 
+    /// Canonical application content, excluding retry-independent identity and creation time.
+    /// Persistence adapters use this for scoped HTTP idempotency comparisons.
+    pub fn content_bytes(&self) -> Result<Vec<u8>, WireError> {
+        Ok(serde_json::to_vec(&(
+            &self.contract,
+            self.version,
+            self.correlation_id,
+            self.causation_id,
+            &self.headers,
+            &self.payload,
+        ))?)
+    }
+
     /// Validates explicit limits without trusting application headers.
     pub fn validate(&self, limits: EnvelopeLimits) -> Result<(), WireError> {
         if self.id.is_nil() || self.version == 0 {

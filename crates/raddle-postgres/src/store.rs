@@ -26,6 +26,22 @@ impl Store {
         Ok(Scope::enroll(self.pool.begin().await?))
     }
 
+    /// Deletes a bounded page of expired idempotency records without live jobs.
+    /// The caller explicitly chooses the end of the HTTP duplicate-protection window.
+    pub async fn prune_idempotency(
+        &self,
+        tenant: &str,
+        before: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, Error> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::Invalid("invalid retention batch"));
+        }
+        let result = sqlx::query("WITH old AS (SELECT tenant,source,key FROM raddle_idempotency i WHERE tenant=$1 AND created_at < $2 AND NOT EXISTS(SELECT 1 FROM raddle_jobs j WHERE j.tenant=i.tenant AND j.message_id=i.message_id AND j.status IN ('ready','active')) ORDER BY created_at LIMIT $3 FOR UPDATE SKIP LOCKED) DELETE FROM raddle_idempotency i USING old WHERE i.tenant=old.tenant AND i.source=old.source AND i.key=old.key")
+            .bind(tenant).bind(before).bind(i64::from(limit)).execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     /// Sets a finite pending-job budget. Lowering it does not delete accepted work.
     pub async fn set_capacity(&self, tenant: &str, maximum: u32) -> Result<(), Error> {
         if tenant.is_empty() || tenant.len() > 128 || !(1..=10_000_000).contains(&maximum) {
@@ -181,6 +197,30 @@ impl Store {
             return Err(Error::Invalid("invalid replay audit"));
         }
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("INSERT INTO raddle_quotas(tenant) VALUES($1) ON CONFLICT DO NOTHING")
+            .bind(tenant)
+            .execute(&mut *transaction)
+            .await?;
+        let capacity: i32 =
+            sqlx::query_scalar("SELECT max_pending FROM raddle_quotas WHERE tenant=$1 FOR UPDATE")
+                .bind(tenant)
+                .fetch_one(&mut *transaction)
+                .await?;
+        // Never wait on a running execution while holding the admission lock.
+        let candidate: Option<Uuid> = sqlx::query_scalar("SELECT id FROM raddle_jobs WHERE tenant=$1 AND id=$2 AND status='dead' AND (expires_at IS NULL OR expires_at>$3) FOR UPDATE SKIP LOCKED")
+            .bind(tenant).bind(id).bind(now).fetch_optional(&mut *transaction).await?;
+        if candidate.is_none() {
+            return Ok(false);
+        }
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM raddle_jobs WHERE tenant=$1 AND status IN ('ready','active')",
+        )
+        .bind(tenant)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if pending >= i64::from(capacity) {
+            return Err(Error::Capacity);
+        }
         let result = sqlx::query("UPDATE raddle_jobs SET status='ready',available_at=$3,attempts=0,last_error=NULL WHERE tenant=$1 AND id=$2 AND status='dead' AND (expires_at IS NULL OR expires_at > $3)")
             .bind(tenant).bind(id).bind(now).execute(&mut *transaction).await?;
         if result.rows_affected() == 0 {
