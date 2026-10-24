@@ -1,8 +1,9 @@
 //! Opt-in conformance against Microsoft's official local Service Bus emulator.
 
 mod common;
+#[path = "support/microsoft.rs"]
+mod fixture;
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use raddle::transport::Transport;
@@ -10,31 +11,7 @@ use raddle::wire::Envelope;
 use raddle_servicebus::{Connection, Source};
 
 use common::{Order, TestResult};
-
-fn endpoint() -> TestResult<SocketAddr> {
-    if std::env::var("RADDLE_MICROSOFT_TEST_CONFIRM").as_deref() != Ok("isolated") {
-        return Err(
-            "set RADDLE_MICROSOFT_TEST_CONFIRM=isolated only for the dedicated fixture".into(),
-        );
-    }
-    let endpoint: SocketAddr = std::env::var("RADDLE_MICROSOFT_TEST_ENDPOINT")?.parse()?;
-    if !endpoint.ip().is_loopback() {
-        return Err("the official emulator fixture must use numeric loopback".into());
-    }
-    Ok(endpoint)
-}
-
-fn connection_string(endpoint: SocketAddr) -> TestResult<String> {
-    let mut service = url::Url::parse("sb://localhost/")?;
-    service
-        .set_ip_host(endpoint.ip())
-        .map_err(|()| "invalid loopback host")?;
-    // Microsoft checks that link-address hosts match the connection OPEN host.
-    // These are its documented public emulator-only credentials, not Azure secrets.
-    Ok(format!(
-        "Endpoint={service};SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;"
-    ))
-}
+use fixture::{connection_string, endpoint};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an isolated official emulator and RADDLE_MICROSOFT_TEST_ENDPOINT"]

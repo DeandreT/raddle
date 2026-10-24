@@ -534,3 +534,19 @@ async fn sub_millisecond_leases_cannot_consume_a_claim_attempt() {
     store.complete(&claim, now).await.unwrap();
     store.close().await;
 }
+
+#[tokio::test]
+async fn outbox_returns_its_transport_after_publication() {
+    let (_directory, store) = fixture().await;
+    enqueue(&store, DeliveryKind::Remote, "audit").await;
+    let transport =
+        raddle_testkit::ScriptedTransport::new([raddle_testkit::SendOutcome::Accept]).unwrap();
+    let outbox = OutboxWorker::try_new(store.clone(), transport, Duration::from_secs(5)).unwrap();
+    assert!(outbox.run_once().await.unwrap());
+    assert!(!outbox.run_once().await.unwrap());
+    let transport = outbox.into_transport();
+    let receipts = transport.receipts().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].destination, "audit");
+    store.close().await;
+}

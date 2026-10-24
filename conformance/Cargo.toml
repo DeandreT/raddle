@@ -14,6 +14,10 @@ azservicebus = { path = "../vendor/azservicebus" }
 [dependencies]
 raddle = { path = "../crates/raddle" }
 raddle-servicebus = { path = "../crates/raddle-servicebus", features = ["emulator"] }
+raddle-postgres = { path = "../crates/raddle-postgres" }
+chrono = "0.4.45"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "migrate", "macros"] }
+uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tempfile = "3"
