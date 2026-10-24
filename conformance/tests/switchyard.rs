@@ -1,13 +1,13 @@
 //! Actual loopback AMQP compatibility with an immutable Switchyard revision.
 
-use std::error::Error;
+mod common;
+
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use raddle::transport::Transport;
-use raddle::wire::{Envelope, WireMessage};
+use raddle::wire::Envelope;
 use raddle_servicebus::{Connection, Source};
-use serde::{Deserialize, Serialize};
 use sw_auth::{
     PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule,
 };
@@ -20,19 +20,10 @@ use sw_storage::{FjallStore, MemoryStore, StateStore};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+use common::{Order, TestResult};
 const HOST: &str = "raddle.servicebus.windows.net";
 // Public fixture-only key. It is not used outside this ephemeral loopback broker.
 const CONNECTION: &str = "Endpoint=sb://raddle.servicebus.windows.net/;SharedAccessKeyName=test;SharedAccessKey=raddle-public-fixture-key";
-
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-struct Order {
-    number: u32,
-}
-impl WireMessage for Order {
-    const NAME: &'static str = "orders.placed";
-    const VERSION: u32 = 1;
-}
 
 struct Node {
     broker: Broker,
@@ -109,98 +100,11 @@ impl Node {
 
 async fn exercise(node: Node) -> TestResult {
     let outcome = async {
-        eprintln!("conformance: connect");
         let connection = Connection::emulator(CONNECTION, node.address).await?;
-        eprintln!("conformance: open publishers");
-        let publisher = connection
-            .publisher([
-                ("orders".into(), "orders".into()),
-                ("events".into(), "events".into()),
-                ("sessions".into(), "sessions".into()),
-            ])
-            .await?;
-        let envelope = Envelope::encode(&Order { number: 42 })?;
-        eprintln!("conformance: send queue");
-        publisher.publish("orders", &envelope).await?;
-        eprintln!("conformance: receive queue");
-        let mut receiver = connection
-            .receiver(Source::Queue("orders".into()), None, 0)
-            .await?;
-        let mut received = receiver.receive(1, Duration::from_secs(2)).await?;
-        assert_eq!(received.len(), 1);
-        let first = &mut received[0];
-        assert_eq!(first.decode()?.id(), envelope.id());
-        assert_eq!(first.decode()?.decode::<Order>()?, Order { number: 42 });
-        eprintln!("conformance: renew/abandon");
-        receiver.renew(first).await?;
-        receiver.abandon(first).await?;
-        let mut received = receiver.receive(1, Duration::from_secs(2)).await?;
-        assert_eq!(received.len(), 1);
-        eprintln!("conformance: dead-letter");
-        receiver
-            .dead_letter(&mut received[0], "test-poison")
-            .await?;
-        eprintln!("conformance: open dead-letter receiver");
-        let mut dead = connection
-            .receiver(Source::DeadLetters("orders".into()), None, 0)
-            .await?;
-        let mut received = dead.receive(1, Duration::from_secs(2)).await?;
-        assert_eq!(received.len(), 1);
-        dead.complete(&mut received[0]).await?;
-        assert!(dead.complete(&mut received[0]).await.is_err());
-        dead.close().await?;
-        receiver.close().await?;
-
-        eprintln!("conformance: topic subscription");
-        let mut subscription = connection
-            .receiver(
-                Source::Subscription {
-                    topic: "events".into(),
-                    subscription: "audit".into(),
-                },
-                None,
-                0,
-            )
-            .await?;
-        publisher.publish("events", &envelope).await?;
-        let mut received = subscription.receive(1, Duration::from_secs(2)).await?;
-        assert_eq!(received.len(), 1);
-        subscription
-            .dead_letter(&mut received[0], "test-subscription-poison")
-            .await?;
-        subscription.close().await?;
-        let mut subscription_dead = connection
-            .receiver(
-                Source::SubscriptionDeadLetters {
-                    topic: "events".into(),
-                    subscription: "audit".into(),
-                },
-                None,
-                0,
-            )
-            .await?;
-        let mut received = subscription_dead.receive(1, Duration::from_secs(2)).await?;
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].decode()?.id(), envelope.id());
-        subscription_dead.complete(&mut received[0]).await?;
-        subscription_dead.close().await?;
-
-        eprintln!("conformance: session");
-        let session_message = Envelope::encode(&Order { number: 7 })?
-            .with_header("session-id".into(), "order-7".into())?;
-        publisher.publish("sessions", &session_message).await?;
-        let mut session = connection
-            .receiver(Source::Queue("sessions".into()), Some("order-7"), 0)
-            .await?;
-        eprintln!("conformance: renew session");
-        session.renew_session().await?;
-        eprintln!("conformance: receive session message");
-        let mut received = session.receive(1, Duration::from_secs(2)).await?;
-        assert_eq!(received.len(), 1);
-        session.complete(&mut received[0]).await?;
-        session.close().await?;
-        publisher.close().await?;
-        connection.close().await?;
+        let result = common::exercise(&connection).await;
+        let closed = connection.close().await;
+        result?;
+        closed?;
         Ok(())
     }
     .await;

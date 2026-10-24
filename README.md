@@ -81,6 +81,10 @@ and [vendored dependency provenance](THIRD_PARTY.md). This adapter is not
 publishable to a registry while it requires the vendored client fixes; Git
 consumers retain the patched source.
 
+Local Service Bus conformance can run against both Switchyard and
+[Microsoft's official emulator](conformance/microsoft/README.md), without Azure
+access. These checks do not claim live Azure identity or network qualification.
+
 ## Development
 
 `raddle-testkit` provides deterministic clocks, bounded transport fault scripts,
