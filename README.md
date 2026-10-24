@@ -68,6 +68,12 @@ from the same registrations and checked against actual responses. See
 serialization. `raddle-rabbitmq` supports AMQP 0-9-1 confirms, mandatory routing,
 and bounded explicit-ack consumption. See [adapter guarantees](docs/adapters.md).
 
+`raddle-servicebus` supplies AMQP 1.0 connections, confirmed publication,
+peek-lock settlement, and session receivers. See [Service Bus integration](docs/servicebus.md)
+and [vendored dependency provenance](THIRD_PARTY.md). This adapter is not
+publishable to a registry while it requires the vendored client fixes; Git
+consumers retain the patched source.
+
 ## Development
 
 `raddle-testkit` provides deterministic clocks, bounded transport fault scripts,

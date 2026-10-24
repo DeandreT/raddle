@@ -1,0 +1,27 @@
+[package]
+name = "raddle-conformance"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[patch.crates-io]
+azservicebus = { path = "../vendor/azservicebus" }
+
+[dependencies]
+raddle = { path = "../crates/raddle" }
+raddle-servicebus = { path = "../crates/raddle-servicebus", features = ["emulator"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tempfile = "3"
+azservicebus = { version = "0.25.1", default-features = false, features = ["rustls", "unsecured"] }
+url = "2.5"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sw-server = { package = "server", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-domain = { package = "domain", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-storage = { package = "storage", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-protocol = { package = "protocol-amqp", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-auth = { package = "auth", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }

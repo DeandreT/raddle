@@ -3,6 +3,10 @@
 Each adapter retains its native transaction and protocol guarantees. They are
 not interchangeable connections to one uniform broker.
 
+Kafka and JetStream are separate expansion decisions: their offset, ordering,
+and acknowledgment models require their own adapters and qualification, not a
+configuration switch on RabbitMQ or Service Bus.
+
 ## SQLite
 
 `raddle-sqlite` is for embedded, single-node installations. `Store::open` enables
