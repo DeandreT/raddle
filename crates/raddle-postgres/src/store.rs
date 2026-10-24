@@ -26,6 +26,22 @@ impl Store {
         Ok(Scope::enroll(self.pool.begin().await?))
     }
 
+    /// Deletes a bounded page of expired idempotency records without live jobs.
+    /// The caller explicitly chooses the end of the HTTP duplicate-protection window.
+    pub async fn prune_idempotency(
+        &self,
+        tenant: &str,
+        before: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, Error> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::Invalid("invalid retention batch"));
+        }
+        let result = sqlx::query("WITH old AS (SELECT tenant,source,key FROM raddle_idempotency i WHERE tenant=$1 AND created_at < $2 AND NOT EXISTS(SELECT 1 FROM raddle_jobs j WHERE j.tenant=i.tenant AND j.message_id=i.message_id AND j.status IN ('ready','active')) ORDER BY created_at LIMIT $3 FOR UPDATE SKIP LOCKED) DELETE FROM raddle_idempotency i USING old WHERE i.tenant=old.tenant AND i.source=old.source AND i.key=old.key")
+            .bind(tenant).bind(before).bind(i64::from(limit)).execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     /// Sets a finite pending-job budget. Lowering it does not delete accepted work.
     pub async fn set_capacity(&self, tenant: &str, maximum: u32) -> Result<(), Error> {
         if tenant.is_empty() || tenant.len() > 128 || !(1..=10_000_000).contains(&maximum) {

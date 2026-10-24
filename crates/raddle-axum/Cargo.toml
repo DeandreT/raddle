@@ -1,0 +1,30 @@
+[package]
+name = "raddle-axum"
+description = "Authenticated Axum adapters with generated OpenAPI for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+raddle.workspace = true
+raddle-postgres.workspace = true
+axum.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net"] }
+tower.workspace = true
+http-body-util.workspace = true
+sqlx.workspace = true
+jsonschema = { version = "0.33", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[lints]
+workspace = true
