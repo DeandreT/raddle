@@ -70,6 +70,10 @@ and bounded explicit-ack consumption. See [adapter guarantees](docs/adapters.md)
 
 ## Development
 
+`raddle-testkit` provides deterministic clocks, bounded transport fault scripts,
+and shared custody checks. See [qualification](docs/qualification.md) for fuzzing,
+database, feature-isolation, and native platform gates.
+
 The repository pins Rust in `rust-toolchain.toml`. Run:
 
 ```sh

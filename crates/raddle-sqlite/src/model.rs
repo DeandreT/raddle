@@ -115,7 +115,7 @@ pub struct Job {
 }
 
 /// A private-generation ownership token for one delivery.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Claim {
     pub(crate) id: String,
     pub(crate) generation: i64,
@@ -124,6 +124,16 @@ pub struct Claim {
     pub(crate) tenant: String,
     pub(crate) attempts: i64,
     pub(crate) max_attempts: i64,
+}
+
+impl std::fmt::Debug for Claim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Claim")
+            .field("id", &self.id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 impl Claim {
     /// Internal delivery ID.
