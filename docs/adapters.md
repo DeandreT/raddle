@@ -25,6 +25,8 @@ generation-fenced takeover, expiry, quota, audited replay, and explicit complete
 tombstone retention are supported. Replay is also subject to admission capacity.
 Workers are caller-owned futures. Dropping an execution rolls back its business
 writes; the claimed attempt remains recoverable after its lease expires.
+Use `outbox.into_transport()` after the batch futures finish to recover and
+explicitly close the publisher before closing its broker connection.
 Claim leases range from one millisecond through two hours; shorter leases are
 refused rather than silently rounded to zero by timestamp storage.
 

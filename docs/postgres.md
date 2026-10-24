@@ -53,6 +53,9 @@ item later is an intentional operator action, not strict historical FIFO.
 `OutboxWorker` publishes outside database transactions and marks completion only
 after broker acceptance. A crash after acceptance but before completion causes
 republishing with the same message identity. Consumers must be idempotent.
+After its batch futures finish, `outbox.into_transport()` returns the owned
+publisher so the application can close it explicitly before closing its broker
+connection. Consuming the worker does not abandon a hidden background task.
 
 Each tenant defaults to a finite 100,000 pending jobs; `set_capacity` changes that
 budget. Admission serializes quota checks within each tenant's transaction.

@@ -137,6 +137,13 @@ impl<T: Transport> OutboxWorker<T> {
             timeout,
         })
     }
+
+    /// Returns the owned transport for explicit shutdown after batch futures finish.
+    /// This worker starts no background tasks; consuming it cannot race a borrowed batch.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
     /// Publishes at most one due message and preserves its identity across retries.
     pub async fn run_once(&self) -> Result<bool, Error> {
         let Some(claim) = self

@@ -201,6 +201,12 @@ impl<T: Transport> OutboxWorker<T> {
         }
     }
 
+    /// Returns the owned transport for explicit shutdown after batch futures finish.
+    /// This worker starts no background tasks; consuming it cannot race a borrowed batch.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
     /// Publishes a bounded batch outside database transactions.
     pub async fn run_once(&self, limit: u32) -> Result<usize, Error> {
         use futures_util::stream::StreamExt;

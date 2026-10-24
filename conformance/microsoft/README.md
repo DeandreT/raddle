@@ -7,6 +7,11 @@ real five-second message lease to expire and verifies recovery after reconnectin
 No Azure subscription or cloud credentials are needed. The fixture is for
 sequential disposable tests only.
 
+The optional `durable_microsoft` target combines this broker with an isolated
+PostgreSQL database. It publishes a persisted request through the outbox,
+deliberately redelivers both request and reply after committed inbox custody,
+and verifies one business execution and a recoverable durable conversation.
+
 The images are pinned by digest: official Service Bus emulator 2.0.1 for
 Linux/amd64 and SQL Server 2022. They need Docker Compose, several GB of RAM/disk,
 and an available loopback port. SQL is not exposed to the host; AMQP and the
@@ -33,8 +38,23 @@ http=$(docker compose -p "$project" -f "$compose" port emulator 5300)
 curl --fail --retry 30 --retry-all-errors --retry-delay 2 --max-time 10 "http://$http/health"
 export RADDLE_MICROSOFT_TEST_ENDPOINT=$(docker compose -p "$project" -f "$compose" port emulator 5672)
 export RADDLE_MICROSOFT_TEST_CONFIRM=isolated
-cargo test --manifest-path conformance/Cargo.toml --test microsoft -- --ignored --test-threads=1
+cargo +1.97.1 test --manifest-path conformance/Cargo.toml --locked --test microsoft -- --ignored --test-threads=1
 ```
+
+The explicit toolchain matches `conformance/rust-toolchain.toml`; invoking Cargo
+from the repository root otherwise selects the older production toolchain.
+
+For the full durable workflow, also supply `DATABASE_URL` for a disposable
+PostgreSQL server with test-database creation permission, then run:
+
+```sh
+cargo +1.97.1 test --manifest-path conformance/Cargo.toml --locked --test durable_microsoft -- --ignored --test-threads=1
+```
+
+SQLx allocates an isolated database for that case. The PostgreSQL URL is not the
+emulator's internal SQL Server database, and neither should contain application
+or customer data. The test's dedicated `durable-requests` and `durable-replies`
+queues are separate from the transport-only checks.
 
 Always clean up the same project, including on test failure:
 
