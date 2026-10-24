@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use raddle::transport::Transport;
 use raddle::wire::{Envelope, WireMessage};
@@ -15,7 +15,7 @@ use sw_domain::{
     CommandKind, EntityPath, NamespaceName, QueueConfig, StateMachine, SubscriptionConfig,
     SubscriptionName, TopicConfig,
 };
-use sw_server::{Broker, LocalProposer, SystemClock};
+use sw_server::{Broker, LocalProposer, ManualClock, TimerWorker};
 use sw_storage::{FjallStore, MemoryStore, StateStore};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -36,13 +36,20 @@ impl WireMessage for Order {
 
 struct Node {
     broker: Broker,
+    clock: ManualClock,
     address: SocketAddr,
     listener: JoinHandle<std::io::Result<()>>,
 }
 
 impl Node {
     async fn start<S: StateStore>(store: S) -> TestResult<Self> {
-        let broker = Broker::spawn(LocalProposer::new(StateMachine::new(store), SystemClock));
+        let clock = ManualClock::at(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?,
+        );
+        let broker = Broker::spawn(LocalProposer::new(StateMachine::new(store), clock.clone()));
         let namespace = NamespaceName::new("raddle")?;
         for (entity, sessions) in [("orders", false), ("sessions", true)] {
             broker.handle().submit_blocking(
@@ -87,6 +94,7 @@ impl Node {
         let listener = tokio::spawn(listener.serve(socket));
         Ok(Self {
             broker,
+            clock,
             address,
             listener,
         })
@@ -157,8 +165,25 @@ async fn exercise(node: Node) -> TestResult {
         publisher.publish("events", &envelope).await?;
         let mut received = subscription.receive(1, Duration::from_secs(2)).await?;
         assert_eq!(received.len(), 1);
-        subscription.complete(&mut received[0]).await?;
+        subscription
+            .dead_letter(&mut received[0], "test-subscription-poison")
+            .await?;
         subscription.close().await?;
+        let mut subscription_dead = connection
+            .receiver(
+                Source::SubscriptionDeadLetters {
+                    topic: "events".into(),
+                    subscription: "audit".into(),
+                },
+                None,
+                0,
+            )
+            .await?;
+        let mut received = subscription_dead.receive(1, Duration::from_secs(2)).await?;
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].decode()?.id(), envelope.id());
+        subscription_dead.complete(&mut received[0]).await?;
+        subscription_dead.close().await?;
 
         eprintln!("conformance: session");
         let session_message = Envelope::encode(&Order { number: 7 })?
@@ -296,4 +321,49 @@ fn fully_qualified_link_addresses_resolve_to_their_entity() -> TestResult {
         _ => panic!("absolute queue address did not resolve to a queue"),
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_lock_is_refused_and_work_survives_reconnection() -> TestResult {
+    let node = Node::start(MemoryStore::default()).await?;
+    let result = async {
+        let connection = Connection::emulator(CONNECTION, node.address).await?;
+        let publisher = connection
+            .publisher([("orders".into(), "orders".into())])
+            .await?;
+        let envelope = Envelope::encode(&Order { number: 91 })?;
+        publisher.publish("orders", &envelope).await?;
+        let mut receiver = connection
+            .receiver(Source::Queue("orders".into()), None, 0)
+            .await?;
+        let mut received = receiver.receive(1, Duration::from_secs(2)).await?;
+        let held = received.first_mut().ok_or("missing initial delivery")?;
+        node.clock.advance(65_000);
+        let handle = node.broker.handle();
+        assert_eq!(
+            TimerWorker::new(&handle)
+                .sweep_once()?
+                .locks_returned_to_ready,
+            1
+        );
+        assert!(receiver.renew(held).await.is_err());
+        let _ = receiver.close().await;
+        let _ = publisher.close().await;
+        let _ = connection.close().await;
+
+        let replacement = Connection::emulator(CONNECTION, node.address).await?;
+        let mut receiver = replacement
+            .receiver(Source::Queue("orders".into()), None, 0)
+            .await?;
+        let mut received = receiver.receive(1, Duration::from_secs(2)).await?;
+        let held = received.first_mut().ok_or("missing recovered delivery")?;
+        assert_eq!(held.decode()?.id(), envelope.id());
+        receiver.complete(held).await?;
+        receiver.close().await?;
+        replacement.close().await?;
+        Ok(())
+    }
+    .await;
+    node.close().await;
+    result
 }

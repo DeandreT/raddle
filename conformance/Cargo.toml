@@ -20,8 +20,8 @@ tempfile = "3"
 azservicebus = { version = "0.25.1", default-features = false, features = ["rustls", "unsecured"] }
 url = "2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sw-server = { package = "server", git = "https://github.com/DeandreT/switchyard", rev = "80e650b84a41ebd07349b116553b9f6a2f364915" }
-sw-domain = { package = "domain", git = "https://github.com/DeandreT/switchyard", rev = "80e650b84a41ebd07349b116553b9f6a2f364915" }
-sw-storage = { package = "storage", git = "https://github.com/DeandreT/switchyard", rev = "80e650b84a41ebd07349b116553b9f6a2f364915" }
-sw-protocol = { package = "protocol-amqp", git = "https://github.com/DeandreT/switchyard", rev = "80e650b84a41ebd07349b116553b9f6a2f364915" }
-sw-auth = { package = "auth", git = "https://github.com/DeandreT/switchyard", rev = "80e650b84a41ebd07349b116553b9f6a2f364915" }
+sw-server = { package = "server", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-domain = { package = "domain", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-storage = { package = "storage", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-protocol = { package = "protocol-amqp", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-auth = { package = "auth", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }

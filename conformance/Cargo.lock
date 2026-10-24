@@ -20,7 +20,7 @@ dependencies = [
 [[package]]
 name = "amqp"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=80e650b84a41ebd07349b116553b9f6a2f364915#80e650b84a41ebd07349b116553b9f6a2f364915"
+source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
 dependencies = [
  "serde",
  "serde_amqp",
@@ -140,7 +140,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "auth"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=80e650b84a41ebd07349b116553b9f6a2f364915#80e650b84a41ebd07349b116553b9f6a2f364915"
+source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -346,7 +346,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "cluster"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=80e650b84a41ebd07349b116553b9f6a2f364915#80e650b84a41ebd07349b116553b9f6a2f364915"
+source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
 dependencies = [
  "domain",
  "serde",
@@ -586,7 +586,7 @@ dependencies = [
 [[package]]
 name = "domain"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=80e650b84a41ebd07349b116553b9f6a2f364915#80e650b84a41ebd07349b116553b9f6a2f364915"
+source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
 dependencies = [
  "postcard",
  "regex-automata",
@@ -1704,12 +1704,13 @@ dependencies = [
 [[package]]
 name = "protocol-amqp"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=80e650b84a41ebd07349b116553b9f6a2f364915#80e650b84a41ebd07349b116553b9f6a2f364915"
+source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
 dependencies = [
  "amqp",
  "auth",
  "domain",
  "futures-util",
+ "percent-encoding",
  "rustls",
  "rustls-pemfile",
  "serde_amqp",
@@ -2188,7 +2189,7 @@ dependencies = [
 [[package]]
 name = "server"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=80e650b84a41ebd07349b116553b9f6a2f364915#80e650b84a41ebd07349b116553b9f6a2f364915"
+source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
 dependencies = [
  "auth",
  "clap",
@@ -2307,7 +2308,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "storage"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=80e650b84a41ebd07349b116553b9f6a2f364915#80e650b84a41ebd07349b116553b9f6a2f364915"
+source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
 dependencies = [
  "fjall",
  "thiserror 2.0.21",
