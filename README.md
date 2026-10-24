@@ -41,8 +41,19 @@ assert_eq!(runtime.invoke(Greeting("world".into())).await?, "Hello, world!");
 
 Run the complete request/event example with `cargo run -p raddle --example local`.
 See the crate documentation for concurrency, fan-out, cancellation, and shutdown
-contracts. [Architecture](docs/architecture.md) describes the boundaries for
-durable execution and additional adapters.
+contracts. [Architecture](docs/architecture.md) describes the adapter boundaries.
+
+## Durable execution
+
+`raddle-postgres` provides explicit SQLx transaction enrollment, durable local
+queues and outbox delivery, named fan-out, delayed work, bounded retries, fenced
+claims, tenant budgets, audited replay, and explicit tombstone retention. See
+[PostgreSQL integration](docs/postgres.md) for ownership and failure guarantees.
+
+Wire messages have stable names and schema versions, validated envelopes,
+bounded metadata, and explicit upcasters. These are separate from local Rust
+type identities. A confirmed transport still provides at-least-once delivery;
+external side effects require idempotency.
 
 ## Development
 
