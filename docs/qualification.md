@@ -54,3 +54,21 @@ Linux cross-check or successful target compilation is not a substitute for
 native runtime tests on Windows or macOS. Do not mark an unavailable platform
 qualified. Keep environment-specific receipts in the associated issue, not in
 these reusable instructions.
+
+## Package qualification
+
+Verify the publishable package archives as well as the workspace checkout:
+
+```sh
+cargo package --workspace --exclude raddle-servicebus --locked
+```
+
+This creates and builds local archives; it does not upload them. Check that each
+archive includes its package README, license, and required migration files.
+Examples marked as test targets are also exercised by the workspace test suite;
+the PostgreSQL walkthrough additionally needs the isolated database gate.
+
+`raddle-servicebus` remains excluded from this registry-oriented verification
+while it requires the patched vendored dependency. Its package metadata forbids
+publication. Continue to qualify it from the source workspace and independent
+conformance harness rather than replacing the patched client for packaging.

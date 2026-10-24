@@ -68,6 +68,13 @@ from the same registrations and checked against actual responses. See
 serialization. `raddle-rabbitmq` supports AMQP 0-9-1 confirms, mandatory routing,
 and bounded explicit-ack consumption. See [adapter guarantees](docs/adapters.md).
 
+Run the [SQLite durable walkthrough](crates/raddle-sqlite/examples/sqlite_durable.rs)
+against a dedicated example file, or the
+[PostgreSQL purchase/receipt walkthrough](crates/raddle-postgres/examples/postgres_durable.rs)
+against an explicitly confirmed isolated database. Both retain the same effects
+when rerun. See [running the walkthroughs](docs/walkthroughs.md) for commands and
+safety boundaries.
+
 `raddle-servicebus` supplies AMQP 1.0 connections, confirmed publication,
 peek-lock settlement, and session receivers. See [Service Bus integration](docs/servicebus.md)
 and [vendored dependency provenance](THIRD_PARTY.md). This adapter is not
