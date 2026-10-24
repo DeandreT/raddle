@@ -25,6 +25,7 @@
 //! ```
 
 mod builder;
+pub mod conversation;
 mod delivery;
 mod error;
 mod handler;

@@ -55,6 +55,10 @@ bounded metadata, and explicit upcasters. These are separate from local Rust
 type identities. A confirmed transport still provides at-least-once delivery;
 external side effects require idempotency.
 
+Persisted sagas and durable request/reply conversations share those transaction
+boundaries. A bounded ephemeral reply registry is also available for callers
+that do not need restart recovery. See [orchestration](docs/orchestration.md).
+
 ## Development
 
 The repository pins Rust in `rust-toolchain.toml`. Run:
