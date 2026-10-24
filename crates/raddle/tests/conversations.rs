@@ -20,7 +20,10 @@ async fn validates_responder_and_consumes_only_one_matching_reply() {
     let hub = ReplyHub::try_new(1).unwrap();
     let id = Uuid::new_v4();
     let waiter = hub.register(id, "orders", Reply::NAME).unwrap();
-    let reply = Envelope::encode(&Reply(42)).unwrap().correlated(id, id);
+    let reply = Envelope::encode(&Reply(42))
+        .unwrap()
+        .correlated(id, id)
+        .unwrap();
     assert!(!hub.deliver("other", reply.clone()).unwrap());
     assert!(hub.deliver("orders", reply.clone()).unwrap());
     assert!(!hub.deliver("orders", reply).unwrap());
@@ -57,7 +60,10 @@ async fn dropping_an_old_waiter_cannot_remove_a_new_registration() {
     let old = hub.register(id, "orders", Reply::NAME).unwrap();
     hub.deliver(
         "orders",
-        Envelope::encode(&Reply(1)).unwrap().correlated(id, id),
+        Envelope::encode(&Reply(1))
+            .unwrap()
+            .correlated(id, id)
+            .unwrap(),
     )
     .unwrap();
     let new = hub.register(id, "orders", Reply::NAME).unwrap();
@@ -65,7 +71,10 @@ async fn dropping_an_old_waiter_cannot_remove_a_new_registration() {
     assert!(
         hub.deliver(
             "orders",
-            Envelope::encode(&Reply(2)).unwrap().correlated(id, id)
+            Envelope::encode(&Reply(2))
+                .unwrap()
+                .correlated(id, id)
+                .unwrap()
         )
         .unwrap()
     );

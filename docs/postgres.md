@@ -36,6 +36,9 @@ Claims are bounded to 256 rows and use `SKIP LOCKED`. Expired claims get a new
 generation. Before business writes, execution locks and validates the original
 claim. That database lock fences recovery even when the lease time passes.
 Workers apply a database statement timeout as well as a Rust future timeout.
+Leases range from one millisecond through two hours. Claim and retry timestamps
+outside the representable clock range return a typed error before changing
+durable state; a terminal rejection does not require a future retry timestamp.
 
 Retries use bounded exponential backoff with deterministic per-message jitter.
 Abandoned attempts count toward exhaustion. Expired/exhausted work becomes dead

@@ -74,6 +74,7 @@ impl Store {
     ///
     /// For a partition key, only its earliest unfinished visible job is eligible.
     /// Database sequence order is not an ordering guarantee between uncommitted producers.
+    /// Leases must be between one millisecond and two hours; timestamp overflow is rejected.
     pub async fn claim(
         &self,
         kind: DeliveryKind,
@@ -81,11 +82,16 @@ impl Store {
         lease: Duration,
         now: DateTime<Utc>,
     ) -> Result<Vec<Claim>, Error> {
-        if !(1..=256).contains(&limit) || lease.is_zero() || lease > Duration::from_secs(7200) {
+        if !(1..=256).contains(&limit)
+            || !(Duration::from_millis(1)..=Duration::from_secs(7200)).contains(&lease)
+        {
             return Err(Error::Invalid("invalid claim bounds"));
         }
-        let until =
-            now + chrono::Duration::from_std(lease).map_err(|_| Error::Invalid("invalid lease"))?;
+        let until = now
+            .checked_add_signed(
+                chrono::Duration::from_std(lease).map_err(|_| Error::Invalid("invalid lease"))?,
+            )
+            .ok_or(Error::Invalid("lease timestamp overflow"))?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query("WITH expired AS (SELECT id FROM raddle_jobs WHERE kind=$1 AND (expires_at <= $2 OR attempts >= max_attempts) AND (status='ready' OR (status='active' AND lease_until <= $2)) FOR UPDATE SKIP LOCKED) UPDATE raddle_jobs j SET status='dead',last_error=CASE WHEN j.expires_at <= $2 THEN 'expired' ELSE 'attempts-exhausted' END,owner=NULL,lease_until=NULL FROM expired e WHERE j.id=e.id")
             .bind(kind.as_str()).bind(now).execute(&mut *transaction).await?;
@@ -149,9 +155,15 @@ impl Store {
     ) -> Result<(), Error> {
         let terminal =
             disposition == FailureDisposition::Reject || claim.attempts >= claim.max_attempts;
-        let due = now
-            + chrono::Duration::from_std(policy.delay(claim))
-                .map_err(|_| Error::Invalid("invalid retry duration"))?;
+        let due = if terminal {
+            now
+        } else {
+            now.checked_add_signed(
+                chrono::Duration::from_std(policy.delay(claim))
+                    .map_err(|_| Error::Invalid("invalid retry duration"))?,
+            )
+            .ok_or(Error::Invalid("retry timestamp overflow"))?
+        };
         let changed = sqlx::query("UPDATE raddle_jobs SET status=$4,available_at=$5,owner=NULL,lease_until=NULL,last_error=$6 WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active'")
             .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(if terminal { "dead" } else { "ready" }).bind(due).bind(code).execute(&self.pool).await?;
         if changed.rows_affected() == 1 {

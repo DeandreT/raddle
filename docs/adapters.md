@@ -25,6 +25,8 @@ generation-fenced takeover, expiry, quota, audited replay, and explicit complete
 tombstone retention are supported. Replay is also subject to admission capacity.
 Workers are caller-owned futures. Dropping an execution rolls back its business
 writes; the claimed attempt remains recoverable after its lease expires.
+Claim leases range from one millisecond through two hours; shorter leases are
+refused rather than silently rounded to zero by timestamp storage.
 
 PostgreSQL's saga/conversation and HTTP idempotency tables are not implicitly
 created in SQLite. Use PostgreSQL when those capabilities or parallel writers

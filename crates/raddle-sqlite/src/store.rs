@@ -57,6 +57,7 @@ impl Store {
         Ok(())
     }
     /// Claims due work atomically, including lease takeover and attempt exhaustion.
+    /// Leases must be between one millisecond and two hours to survive storage precision.
     pub async fn claim(
         &self,
         kind: DeliveryKind,
@@ -64,7 +65,9 @@ impl Store {
         lease: Duration,
         now: DateTime<Utc>,
     ) -> Result<Vec<Claim>, Error> {
-        if !(1..=256).contains(&limit) || lease.is_zero() || lease > Duration::from_secs(7200) {
+        if !(1..=256).contains(&limit)
+            || !(Duration::from_millis(1)..=Duration::from_secs(7200)).contains(&lease)
+        {
             return Err(Error::Invalid("invalid claim limits"));
         }
         let now = now.timestamp_millis();

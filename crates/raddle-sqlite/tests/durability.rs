@@ -511,3 +511,26 @@ async fn replay_cannot_bypass_the_pending_capacity() {
     );
     store.close().await;
 }
+
+#[tokio::test]
+async fn sub_millisecond_leases_cannot_consume_a_claim_attempt() {
+    let (_directory, store) = fixture().await;
+    let id = enqueue(&store, DeliveryKind::Local, "audit").await;
+    assert!(matches!(
+        store
+            .claim(DeliveryKind::Local, 1, Duration::from_nanos(1), Utc::now())
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    let job = store.inspect("tenant", id).await.unwrap().unwrap();
+    assert_eq!(job.status, "ready");
+    assert_eq!(job.attempts, 0);
+    let now = Utc::now();
+    let claim = store
+        .claim(DeliveryKind::Local, 1, Duration::from_millis(1), now)
+        .await
+        .unwrap()
+        .remove(0);
+    store.complete(&claim, now).await.unwrap();
+    store.close().await;
+}
