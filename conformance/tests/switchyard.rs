@@ -169,12 +169,58 @@ async fn exercise(node: Node) -> TestResult {
             .await?;
         eprintln!("conformance: renew session");
         session.renew_session().await?;
+        eprintln!("conformance: receive session message");
         let mut received = session.receive(1, Duration::from_secs(2)).await?;
         assert_eq!(received.len(), 1);
         session.complete(&mut received[0]).await?;
         session.close().await?;
         publisher.close().await?;
         connection.close().await?;
+        Ok(())
+    }
+    .await;
+    node.close().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_session_renewal() -> TestResult {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .try_init();
+    let node = Node::start(MemoryStore::default()).await?;
+    let options = azservicebus::ServiceBusClientOptions {
+        custom_endpoint_address: Some(url::Url::parse(&format!("amqp://{}", node.address))?),
+        retry_options: azservicebus::ServiceBusRetryOptions {
+            max_retries: 0,
+            try_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let outcome = async {
+        let mut client = Box::pin(
+            azservicebus::ServiceBusClient::unsecured()
+                .new_from_connection_string(CONNECTION, options),
+        )
+        .await?;
+        let mut sender = Box::pin(client.create_sender("sessions", Default::default())).await?;
+        let mut message = azservicebus::ServiceBusMessage::new(vec![1, 2, 3]);
+        message.set_session_id(Some("raw-session".into()))?;
+        Box::pin(sender.send_message(message)).await?;
+        let mut receiver = Box::pin(client.accept_session_for_queue(
+            "sessions",
+            "raw-session",
+            Default::default(),
+        ))
+        .await?;
+        Box::pin(receiver.renew_session_lock())
+            .await
+            .map_err(|error| format!("fixture session renewal: {error:?}"))?;
+        let _ = Box::pin(receiver.dispose()).await;
+        let _ = Box::pin(sender.dispose()).await;
+        let _ = Box::pin(client.dispose()).await;
         Ok(())
     }
     .await;
@@ -240,7 +286,11 @@ async fn raw_client_connection() -> TestResult {
 
 #[test]
 fn fully_qualified_link_addresses_resolve_to_their_entity() -> TestResult {
-    let attachment = sw_protocol::parse_attachment("amqps://raddle.servicebus.windows.net/orders")?;
+    let normalized = sw_protocol::normalize_link_address(
+        "amqps://raddle.servicebus.windows.net/orders",
+        Some(HOST),
+    )?;
+    let attachment = sw_protocol::parse_attachment(&normalized)?;
     match attachment {
         sw_protocol::Attachment::Queue(entity) => assert_eq!(entity.as_str(), "orders"),
         _ => panic!("absolute queue address did not resolve to a queue"),
