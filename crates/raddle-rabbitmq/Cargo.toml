@@ -1,0 +1,27 @@
+[package]
+name = "raddle-rabbitmq"
+description = "Confirmed AMQP 0-9-1 transport for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+raddle.workspace = true
+lapin = { version = "4.12.3", default-features = false, features = ["tokio", "rustls", "rustls--ring", "rustls-webpki-roots-certs"] }
+futures-util.workspace = true
+tokio = { workspace = true, features = ["time"] }
+thiserror.workspace = true
+url = "2.5"
+uuid.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+chrono.workspace = true
+raddle-postgres.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

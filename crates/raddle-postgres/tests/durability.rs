@@ -404,6 +404,40 @@ struct Uncertain {
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn replay_cannot_bypass_the_pending_capacity(pool: PgPool) {
+    let store = Store::new(pool);
+    store.set_capacity("tenant", 1).await.unwrap();
+    let dead = enqueue(&store, DeliveryKind::Local, "audit").await;
+    let claim = store
+        .claim(DeliveryKind::Local, 1, Duration::from_secs(60), Utc::now())
+        .await
+        .unwrap()
+        .remove(0);
+    store
+        .fail(
+            &claim,
+            raddle_postgres::FailureDisposition::Reject,
+            RetryPolicy::default(),
+            "rejected",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    enqueue(&store, DeliveryKind::Local, "audit").await;
+    assert!(matches!(
+        store
+            .replay("tenant", dead, "operator", "retry", Utc::now())
+            .await,
+        Err(Error::Capacity)
+    ));
+    assert_eq!(
+        store.inspect("tenant", dead).await.unwrap().unwrap().status,
+        JobStatus::Dead
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn capacity_is_atomic_and_duplicates_do_not_consume_another_slot(pool: PgPool) {
     let store = Store::new(pool.clone());
     store.set_capacity("tenant", 1).await.unwrap();
