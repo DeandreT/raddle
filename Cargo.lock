@@ -2237,6 +2237,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "raddle",
+ "raddle-testkit",
  "serde",
  "serde_json",
  "sha2",
@@ -2269,11 +2270,24 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "raddle",
+ "raddle-testkit",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
  "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "raddle-testkit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "raddle",
+ "serde",
  "thiserror",
  "tokio",
  "uuid",

@@ -42,9 +42,11 @@ pub enum ReplyDisposition {
     Rejected,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Cancellation {
-    request_id: Uuid,
+/// Cooperative cancellation request; receiving it cannot undo committed effects.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Cancellation {
+    /// Identity of the original request whose remaining work should be stopped.
+    pub request_id: Uuid,
 }
 impl WireMessage for Cancellation {
     const NAME: &'static str = "raddle.cancel";

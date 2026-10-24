@@ -294,6 +294,27 @@ async fn cancelled_and_expired_conversations_ignore_late_replies(pool: PgPool) {
         ConversationStatus::Cancelled
     );
     let other = Envelope::encode(&Request(2)).unwrap();
+    let claims = store
+        .claim(
+            raddle_postgres::DeliveryKind::Remote,
+            8,
+            std::time::Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let cancellation = claims
+        .iter()
+        .map(|claim| claim.envelope().unwrap())
+        .find(|envelope| envelope.contract() == "raddle.cancel")
+        .unwrap();
+    assert_eq!(
+        cancellation
+            .decode::<raddle_postgres::Cancellation>()
+            .unwrap()
+            .request_id,
+        request.id()
+    );
     let mut scope = store.begin().await.unwrap();
     scope.request("tenant", &other, &options).await.unwrap();
     scope.commit(Utc::now()).await.unwrap();
