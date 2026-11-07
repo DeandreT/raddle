@@ -19,6 +19,15 @@ transfer, so an immediate broker acceptance cannot be lost locally. Cancellation
 before enqueue removes that registration; after any frame is enqueued, unsettled
 state remains available for acknowledgment or link recovery. A timeout or caller
 cancellation is still uncertain and must not be treated as rejection.
+The SDK also distinguishes settlement from acceptance: `Rejected`, `Released`,
+and `Modified` are failed attempts, never successful publication. If its bounded
+retry policy permits another attempt, it sends a fresh delivery of the same
+payload and message identity and waits for that delivery's outcome. Repeated
+refusals remain errors, so the outbox retains retryable custody rather than
+marking refused work completed. An unfinished delivery wait is retained across
+internal attempt deadlines; a completed future is never polled again. Cancelling
+the entire public send drops that wait and leaves its outcome uncertain. Enqueued
+payloads remain available for normal AMQP acknowledgment or recovery.
 The conservative 240 KiB envelope limit leaves space for Standard-tier AMQP
 framing. Sessions use the validated `session-id` envelope header.
 
@@ -82,6 +91,8 @@ belong to the outbox rather than an unbounded send loop.
 The opt-in `emulator` feature enables plaintext connections only to an explicit
 numeric loopback address. It is not a production transport and cannot be enabled
 silently through an inbound message or header.
+Loopback connections retain the adapter's normal bounded retry policy, so
+emulator conformance exercises the same refusal handling as production.
 
 The separate `conformance` workspace pins a Switchyard revision and its required
 toolchain. It exercises actual AMQP sockets on both memory and durable backends.

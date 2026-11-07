@@ -48,9 +48,10 @@ async fn submit(api: &Api, key: &str, value: u32) -> (u16, Value) {
     (status, body)
 }
 
-#[sqlx::test(migrations = "../raddle-postgres/migrations")]
+#[sqlx::test]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn concurrent_duplicates_have_one_durable_effect_and_conflicts_are_rejected(pool: PgPool) {
+    Store::new(pool.clone()).migrate().await.unwrap();
     let api = api(pool.clone());
     let (a, b) = tokio::join!(submit(&api, "same-key", 42), submit(&api, "same-key", 42));
     assert_eq!(a.0, 202);

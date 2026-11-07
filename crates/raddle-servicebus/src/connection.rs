@@ -97,7 +97,7 @@ impl Connection {
         );
         // Retain the normal bounded attempt timeout: SQL-backed emulators may
         // need more than five seconds while starting or running under load.
-        options.retry_options.max_retries = 0;
+        // Keep the normal retry policy too, including negative-outcome retries.
         let client = Box::pin(
             ServiceBusClient::unsecured().new_from_connection_string(connection_string, options),
         )

@@ -13,20 +13,21 @@ use super::amqp_constants;
 
 pub(crate) const LOCK_TOKEN_DELIVERY_ANNOTATION: &str = "x-opt-lock-token";
 
-/// State of a batch envelope. Delivery is not considered complete until the envelope is settled.
+/// Publication state of a batch envelope. Only an Accepted outcome confirms success.
 ///
 /// The AMQP sender will keep the message in its internal unsettled map until the delivery is
-/// settled by the receiver. All unsettled messages will be resent upon re-attaching the sender.
-/// This is why a sent but not settled message should not be retried.
+/// settled by the receiver. Pending deliveries remain owned during recovery;
+/// they are not resent merely because a caller stops waiting. A completed
+/// refusal consumes its delivery future and permits a fresh transfer on retry.
 pub(crate) enum BatchEnvelopeState {
-    /// The envelope has not been sent yet.
+    /// The envelope is ready for a fresh transfer, including after a refusal.
     NotSent,
 
     /// The envelope has been sent but not settled by the receiver.
     Sent(DeliveryFut<Result<Outcome, SendError>>),
 
-    /// The envelope has been settled by the receiver.
-    Settled,
+    /// The receiver explicitly accepted the envelope.
+    Accepted,
 }
 
 impl std::fmt::Debug for BatchEnvelopeState {
@@ -34,7 +35,7 @@ impl std::fmt::Debug for BatchEnvelopeState {
         match self {
             BatchEnvelopeState::NotSent => write!(f, "NotSent"),
             BatchEnvelopeState::Sent(_) => write!(f, "Sent"),
-            BatchEnvelopeState::Settled => write!(f, "Settled"),
+            BatchEnvelopeState::Accepted => write!(f, "Accepted"),
         }
     }
 }

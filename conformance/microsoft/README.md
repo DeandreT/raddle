@@ -72,9 +72,10 @@ match the connection OPEN hostname; mixing `localhost` with `127.0.0.1` fails
 that check even though both resolve locally. Raddle still rejects plaintext
 endpoints outside numeric loopback.
 
-Emulator connections retain the normal bounded 30-second per-attempt deadline,
-with automatic retries disabled. The shared receive checks use a matching
-bounded wait rather than relying on in-memory broker response times.
+Emulator connections retain the same bounded retry policy as production,
+including the normal 30-second per-attempt deadline. Shared receives enforce
+their caller's total wait across retries. A retried publication must receive
+an actual broker acceptance; a refused attempt is never counted as success.
 
 ## What this does not establish
 
