@@ -20,6 +20,7 @@ impl WireMessage for Order {
 }
 
 pub async fn exercise(connection: &Connection) -> TestResult {
+    let started = tokio::time::Instant::now();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_ansi(false)
@@ -80,7 +81,10 @@ pub async fn exercise(connection: &Connection) -> TestResult {
         .await
         .map_err(|error| format!("closing queue receiver: {error}"))?;
 
-    eprintln!("adapter contract: topic subscription");
+    eprintln!(
+        "adapter contract: topic subscription at {:?}",
+        started.elapsed()
+    );
     let mut subscription = connection
         .receiver(
             Source::Subscription {
@@ -102,6 +106,10 @@ pub async fn exercise(connection: &Connection) -> TestResult {
         .map_err(|error| format!("receiving subscription: {error}"))?;
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].decode()?.id(), envelope.id());
+    eprintln!(
+        "adapter contract: dead-letter subscription at {:?}",
+        started.elapsed()
+    );
     subscription
         .dead_letter(&mut received[0], "test-subscription-poison")
         .await
@@ -110,6 +118,10 @@ pub async fn exercise(connection: &Connection) -> TestResult {
         .close()
         .await
         .map_err(|error| format!("closing subscription: {error}"))?;
+    eprintln!(
+        "adapter contract: open subscription dead letters at {:?}",
+        started.elapsed()
+    );
     let mut subscription_dead = connection
         .receiver(
             Source::SubscriptionDeadLetters {
@@ -121,12 +133,20 @@ pub async fn exercise(connection: &Connection) -> TestResult {
         )
         .await
         .map_err(|error| format!("opening subscription dead letters: {error}"))?;
+    eprintln!(
+        "adapter contract: receive subscription dead letters at {:?}",
+        started.elapsed()
+    );
     let mut received = subscription_dead
         .receive(1, wait)
         .await
         .map_err(|error| format!("receiving subscription dead letters: {error}"))?;
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].decode()?.id(), envelope.id());
+    eprintln!(
+        "adapter contract: complete subscription dead letter at {:?}",
+        started.elapsed()
+    );
     subscription_dead
         .complete(&mut received[0])
         .await
