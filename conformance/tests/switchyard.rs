@@ -102,7 +102,10 @@ async fn exercise(node: Node) -> TestResult {
     let outcome = async {
         let connection = Connection::emulator(CONNECTION, node.address).await?;
         let result = common::exercise(&connection).await;
-        let closed = connection.close().await;
+        let closed = connection
+            .close()
+            .await
+            .map_err(|error| format!("closing broker connection: {error}"));
         result?;
         closed?;
         Ok(())
