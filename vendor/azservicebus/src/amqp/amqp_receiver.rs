@@ -1,8 +1,5 @@
 use fe2o3_amqp::{
-    link::{
-        delivery::DeliveryInfo, DetachError, IllegalLinkStateError, ReceiverAttachExchange,
-        RecvError,
-    },
+    link::{delivery::DeliveryInfo, DetachError, IllegalLinkStateError, RecvError},
     Delivery, Receiver,
 };
 use fe2o3_amqp_types::{
@@ -12,12 +9,15 @@ use fe2o3_amqp_types::{
 };
 use serde_amqp::Value;
 use std::future::Future;
-use std::{collections::HashSet, sync::Arc, time::Duration as StdDuration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration as StdDuration,
+};
 use tokio::sync::{mpsc, Mutex};
 use url::Url;
 
 use crate::{
-    authorization::service_bus_claim,
     core::{RecoverableTransport, TransportReceiver},
     primitives::{
         disposition_status::DispositionStatus,
@@ -50,12 +50,12 @@ use super::{
     error::{AmqpDispositionError, AmqpRecvError, AmqpRequestResponseError, RecoverReceiverError},
 };
 
-async fn receive_messages(
+pub(super) async fn receive_messages(
     receiver: &mut Receiver,
     prefetch_count: u32,
     receive_mode: &ServiceBusReceiveMode,
     receiver_epoch: uuid::Uuid,
-    buffer: &mut Vec<ServiceBusReceivedMessage>,
+    buffer: &mut VecDeque<ServiceBusReceivedMessage>,
     max_messages: u32,
 ) -> Result<(), AmqpRecvError> {
     // Credit mode is manual, need to set credit
@@ -67,18 +67,13 @@ async fn receive_messages(
         receiver.set_credit(remaining).await?;
     }
 
-    super::receive_batch::fill(buffer, max_messages, async || {
+    while buffer.len() < max_messages as usize {
         let delivery: Delivery<Body<Value>> = receiver.recv().await?;
-
-        let mut is_settled = false;
-        if *receive_mode == ServiceBusReceiveMode::ReceiveAndDelete {
-            receiver.accept(&delivery).await.map_err(RecvError::from)?;
-            is_settled = true;
-        }
-
         let lock_token =
             lock_token_from_delivery(&delivery).ok_or(AmqpRecvError::LockTokenNotFound)?;
         let (delivery_info, raw_amqp_message) = delivery.into_parts();
+        let is_settled = *receive_mode == ServiceBusReceiveMode::ReceiveAndDelete;
+        let accepted_info = is_settled.then(|| delivery_info.clone());
         let lock_token = ReceivedMessageLockToken::Delivery {
             receiver_epoch,
             delivery_info,
@@ -90,9 +85,13 @@ async fn receive_messages(
             lock_token,
         };
 
-        Ok(message)
-    })
-    .await
+        // No await may separate acquiring a delivery from retaining its custody.
+        buffer.push_back(message);
+        if let Some(info) = accepted_info {
+            receiver.accept(info).await.map_err(RecvError::from)?;
+        }
+    }
+    Ok(())
 }
 
 fn lock_token_from_delivery<B>(delivery: &Delivery<B>) -> Option<Uuid> {
@@ -208,104 +207,126 @@ impl RecoverableTransport for AmqpReceiver {
     type RecoverError = RecoverReceiverError;
 
     async fn recover(&mut self) -> Result<(), Self::RecoverError> {
-        // A resumed/replaced link cannot confirm old local custody merely by
-        // receiving a management no-op success for an obsolete lock token.
-        self.receiver_epoch = uuid::Uuid::new_v4();
-        self.request_response_locked_messages.clear();
-        let mut connection_scope = self.connection_scope.lock().await;
-        connection_scope.recover().await?;
-
-        // Auth with CBS
-        let endpoint = format!("{}/{}", self.service_endpoint, self.entity_path);
-        let resource = endpoint.clone();
-        let required_claims = vec![service_bus_claim::SEND.to_string()];
-        connection_scope
-            .request_refreshable_authorization_using_cbs(
-                self.id,
-                endpoint,
-                resource,
-                required_claims,
-            )
-            .await?;
-
-        let fresh = self.receiver.is_none();
-        if fresh {
-            let _ = self
-                .cbs_command_sender
-                .send(amqp_cbs_link::Command::RemoveAuthorizationRefresher(
-                    self.id,
-                ))
-                .await;
-            let (id, receiver, cbs) = connection_scope
-                .open_receiver_link(
-                    &self.service_endpoint,
-                    &self.entity_path,
-                    &self.identifier_str,
-                    &self.receive_mode,
-                    self.receiver_type.clone(),
-                    self.prefetch_count,
-                )
-                .await?;
-            self.id = id;
-            self.link_name = receiver.name().to_owned();
-            self.receiver = Some(receiver);
-            self.cbs_command_sender = cbs;
+        self.finish_credit_cleanup().await;
+        if self.receive_recovery.operation.is_none() {
+            self.receive_recovery.needed = true;
+            crate::util::time::sleep(self.receive_recovery.remaining()).await;
+            self.cache_session_lease();
+            // Rotate only when a recovery actually starts, not on every short poll.
+            self.receiver_epoch = uuid::Uuid::new_v4();
+            self.request_response_locked_messages.clear();
+            let mut transport = super::receiver_recovery::ReceiverRecovery {
+                id: self.id,
+                receiver: self.receiver.take(),
+                management_link: None,
+                cbs_command_sender: self.cbs_command_sender.clone(),
+                service_endpoint: self.service_endpoint.clone(),
+                entity_path: self.entity_path.clone(),
+                identifier: self.identifier_str.clone(),
+                receive_mode: self.receive_mode,
+                receiver_type: self.receiver_type.clone(),
+                prefetch_count: self.prefetch_count,
+                connection_scope: self.connection_scope.clone(),
+            };
+            self.receive_recovery.operation =
+                Some(super::receive_batch::OwnedOperation::new(async move {
+                    let result = transport.run().await;
+                    (transport, result)
+                }));
         }
-        if !fresh {
-            let receiver = self
-                .receiver
-                .as_mut()
-                .ok_or(RecoverReceiverError::ConnectionScopeDisposed)?;
-            // Resume the receiver on the new session
-            let mut exchange = receiver
-                .detach_then_resume_on_session(&connection_scope.session.handle)
-                .await?;
-
-            // `ReceiverAttachExchange::Complete` => Resume is complete
-            //
-            // `ReceiverAttachExchange::IncompleteUnsettled` => There are unsettled messages, multiple
-            // detach and re-attach may happen in order to reduce the number of unsettled messages.
-            //
-            // `ReceiverAttachExchange::Resume` => There is one message that is partially transferred,
-            // so it would be OK to let the user use the receiver to receive the message
-            while let ReceiverAttachExchange::IncompleteUnsettled = exchange {
-                match receiver.recv::<Body<Value>>().await {
-                    Ok(delivery) => {
-                        let modified = Modified {
-                            delivery_failed: None,
-                            undeliverable_here: None,
-                            message_annotations: None,
-                        };
-                        if let Err(err) = receiver.modify(delivery, modified).await {
-                            log::error!("Failed to abandon message: {}", err);
-                            exchange = receiver
-                                .detach_then_resume_on_session(&connection_scope.session.handle)
-                                .await?;
-                        }
-                    }
-                    Err(err) => {
-                        log::error!("Failed to receive message while trying to settle (abandon) the unsettled: {}", err);
-                        exchange = receiver
-                            .detach_then_resume_on_session(&connection_scope.session.handle)
-                            .await?;
-                    }
-                }
+        let Some(operation) = self.receive_recovery.operation.as_mut() else {
+            return Err(RecoverReceiverError::ConnectionScopeDisposed);
+        };
+        // Await a reference: caller cancellation leaves the owned future intact.
+        let (transport, result) = operation.await;
+        self.receive_recovery.operation = None;
+        self.id = transport.id;
+        self.receiver = transport.receiver;
+        self.cbs_command_sender = transport.cbs_command_sender;
+        if let Some(receiver) = &self.receiver {
+            self.link_name = receiver.name().to_owned();
+        }
+        if let Some(management) = transport.management_link {
+            self.management_link = management;
+        }
+        self.cache_session_lease();
+        match &result {
+            Ok(()) => self.receive_recovery.recovered(),
+            Err(error) => {
+                self.receive_recovery.failed(&*self.retry_policy, error);
             }
         }
-        self.management_link = connection_scope
-            .open_management_link(
-                &self.service_endpoint,
-                &self.entity_path,
-                &self.identifier_str,
-            )
-            .await?;
-        self.cbs_command_sender = connection_scope.cbs_link.command_sender().clone();
-        self.receive_recovery.recovered();
-        Ok(())
+        result
     }
 }
 
 impl AmqpReceiver {
+    fn cache_session_lease(&mut self) {
+        if let Some(receiver) = &self.receiver {
+            self.receive_recovery.session_locked_until =
+                receiver.properties(super::amqp_session_receiver::get_session_locked_until);
+        }
+    }
+
+    pub(super) fn session_id(&self) -> Option<&str> {
+        match &self.receiver_type {
+            ReceiverType::Session { session_id } => session_id.as_deref(),
+            ReceiverType::NonSession => None,
+        }
+    }
+
+    pub(super) fn session_locked_until(&self) -> time::OffsetDateTime {
+        match self.receiver.as_ref() {
+            Some(receiver) => {
+                receiver.properties(super::amqp_session_receiver::get_session_locked_until)
+            }
+            None => self.receive_recovery.session_locked_until,
+        }
+        .unwrap_or(crate::constants::DEFAULT_OFFSET_DATE_TIME)
+    }
+
+    pub(super) fn set_session_locked_until(&mut self, until: time::OffsetDateTime) {
+        self.receive_recovery.session_locked_until = Some(until);
+        if let Some(receiver) = &mut self.receiver {
+            receiver.properties_mut(|properties| {
+                properties.get_or_insert_with(Fields::default).insert(
+                    super::amqp_client_constants::LOCKED_UNTIL_UTC.into(),
+                    Value::Timestamp(Timestamp::from(until)),
+                );
+            });
+        }
+    }
+
+    pub(super) async fn finish_credit_cleanup(&mut self) {
+        if let Some(operation) = self.receive_recovery.cleanup.as_mut() {
+            let (receiver, result) = operation.await;
+            self.receive_recovery.cleanup = None;
+            self.receiver = Some(receiver);
+            self.receive_recovery.cleanup_error = result.err();
+        }
+        if let Some(error) = self.receive_recovery.cleanup_error.take() {
+            self.receive_recovery
+                .failed(&*self.retry_policy, &AmqpRecvError::from(error));
+        }
+    }
+
+    /// Management must never race an unfinished recovery or use its old link.
+    pub(super) async fn prepare_management(&mut self) -> Result<(), AmqpRequestResponseError> {
+        self.finish_credit_cleanup().await;
+        if self.receive_recovery.needed {
+            self.recover().await.map_err(|_| {
+                AmqpRequestResponseError::RequestResponse(
+                    fe2o3_amqp_management::error::Error::Send(
+                        fe2o3_amqp::link::SendError::LinkStateError(
+                            fe2o3_amqp::link::LinkStateError::IllegalSessionState,
+                        ),
+                    ),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn receiver_mut(&mut self) -> Result<&mut Receiver, IllegalLinkStateError> {
         self.receiver
             .as_mut()
@@ -315,31 +336,28 @@ impl AmqpReceiver {
     async fn receive_messages_with_timeout(
         &mut self,
         prefetch_count: u32,
-        buffer: &mut Vec<ServiceBusReceivedMessage>,
         max_messages: u32,
-        max_wait_time: StdDuration,
     ) -> Result<(), AmqpRecvError> {
+        self.cache_session_lease();
         let lease = super::receive_batch::CreditLease {
             slot: &mut self.receiver,
-            recovery: &mut self.receive_recovery,
+            cleanup: &mut self.receive_recovery.cleanup,
+            cleanup_error: &mut self.receive_recovery.cleanup_error,
             manual: prefetch_count == 0,
         };
         let receiver = lease
             .slot
             .as_mut()
             .ok_or(IllegalLinkStateError::IllegalState)?;
-        let result = tokio::select! {
-            _ = crate::util::time::sleep(max_wait_time) => {
-                Ok(())
-            }
-            result = receive_messages(receiver, prefetch_count, &self.receive_mode, self.receiver_epoch, buffer, max_messages) => {
-                result
-            }
-        };
-        if result.is_err() {
-            lease.recovery.needed = true;
-        }
-        result
+        receive_messages(
+            receiver,
+            prefetch_count,
+            &self.receive_mode,
+            self.receiver_epoch,
+            &mut self.receive_recovery.buffer,
+            max_messages,
+        )
+        .await
     }
 
     async fn complete_message(
@@ -442,6 +460,7 @@ impl AmqpReceiver {
         request: &mut ReceiveBySequenceNumberRequest,
         try_timeout: &StdDuration,
     ) -> Result<ReceiveBySequenceNumberResponse, AmqpRequestResponseError> {
+        self.prepare_management().await?;
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
@@ -456,6 +475,7 @@ impl AmqpReceiver {
         request: &mut UpdateDispositionRequest,
         try_timeout: &StdDuration,
     ) -> Result<(), AmqpDispositionError> {
+        self.finish_credit_cleanup().await;
         match &message.lock_token {
             ReceivedMessageLockToken::Delivery { receiver_epoch, .. }
                 if *receiver_epoch != self.receiver_epoch
@@ -496,6 +516,7 @@ impl AmqpReceiver {
         request: &mut PeekMessageRequest,
         try_timeout: &StdDuration,
     ) -> Result<PeekMessageResponse, AmqpRequestResponseError> {
+        self.prepare_management().await?;
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
@@ -508,6 +529,7 @@ impl AmqpReceiver {
         request: &mut PeekSessionMessageRequest,
         try_timeout: &StdDuration,
     ) -> Result<PeekSessionMessageResponse, AmqpRequestResponseError> {
+        self.prepare_management().await?;
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
@@ -520,6 +542,7 @@ impl AmqpReceiver {
         request: &mut RenewLockRequest,
         try_timeout: &StdDuration,
     ) -> Result<RenewLockResponse, AmqpRequestResponseError> {
+        self.prepare_management().await?;
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
@@ -575,60 +598,74 @@ impl TransportReceiver for AmqpReceiver {
     ) -> Result<Vec<ServiceBusReceivedMessage>, Self::ReceiveError> {
         let max_wait_time =
             max_wait_time.unwrap_or_else(|| self.retry_policy.options().try_timeout);
-        let prefetch_count = self.prefetch_count;
-        // Recovery and its absolute retry deadline belong to the receiver, not a
-        // cancelled run_operation invocation. Short polls cannot reset either.
-        let result = super::receive_batch::with_deadline(
-            Vec::with_capacity(max_messages as usize),
-            max_wait_time,
-            async |buffer| {
-                let mut failed_attempts = 0;
-                loop {
-                    if self.receive_recovery.needed {
-                        crate::util::time::sleep(self.receive_recovery.remaining()).await;
-                        self.recover()
-                            .await
-                            .map_err(|_| RetryError::Operation(AmqpRecvError::RecoveryPending))?;
+        if max_messages == 0 {
+            return Ok(Vec::new());
+        }
+        // A caller may have dropped its receive after one or more transfers.
+        // Return that custody before attempting any link recovery or new credit.
+        if !self.receive_recovery.buffer.is_empty() {
+            return Ok(self.receive_recovery.take_batch(max_messages));
+        }
+        let result = crate::util::time::timeout(max_wait_time, async {
+            loop {
+                self.finish_credit_cleanup().await;
+                if self.receive_recovery.needed {
+                    self.recover()
+                        .await
+                        .map_err(|_| RetryError::Operation(AmqpRecvError::RecoveryPending))?;
+                }
+                let attempt = self
+                    .receive_messages_with_timeout(self.prefetch_count, max_messages)
+                    .await;
+                match attempt {
+                    Ok(()) => {
+                        self.receive_recovery.healthy();
+                        return Ok(());
                     }
-                    let attempt = self
-                        .receive_messages_with_timeout(
-                            prefetch_count,
-                            buffer,
-                            max_messages,
-                            max_wait_time,
-                        )
-                        .await;
-                    match attempt {
-                        Ok(()) if !self.receive_recovery.needed => return Ok(()),
-                        Ok(()) => {
-                            return Err(RetryError::Operation(AmqpRecvError::RecoveryPending))
+                    Err(error) => {
+                        let retry = self.receive_recovery.failed(&*self.retry_policy, &error);
+                        if !self.receive_recovery.buffer.is_empty() {
+                            return Ok(());
                         }
-                        Err(error) => {
-                            failed_attempts += 1;
-                            let delay = self
-                                .retry_policy
-                                .calculate_retry_delay(&error, failed_attempts);
-                            self.receive_recovery.failed(delay);
-                            if !buffer.is_empty() {
-                                return Ok(());
-                            }
-                            if delay.is_none() {
-                                return Err(RetryError::Operation(error));
-                            }
+                        if !retry {
+                            return Err(RetryError::Operation(error));
                         }
                     }
                 }
-            },
-        )
+            }
+        })
         .await;
-        self.receive_recovery.finish(
-            result,
-            RetryError::Operation(AmqpRecvError::RecoveryPending),
-        )
+        // Cleanup can fail during CreditLease::drop at the deadline; record that
+        // failure synchronously before deciding whether this was a healthy idle.
+        if let Some(error) = self.receive_recovery.cleanup_error.take() {
+            self.receive_recovery
+                .failed(&*self.retry_policy, &AmqpRecvError::from(error));
+        }
+        if result.is_err() && !self.receive_recovery.pending() {
+            // Reaching the receive deadline on a healthy link is ordinary idle,
+            // not another failure in the transport's persistent retry sequence.
+            self.receive_recovery.healthy();
+        }
+        if !self.receive_recovery.buffer.is_empty() {
+            return Ok(self.receive_recovery.take_batch(max_messages));
+        }
+        match result {
+            Ok(Err(error)) => Err(error),
+            _ if self.receive_recovery.pending() => {
+                Err(RetryError::Operation(AmqpRecvError::RecoveryPending))
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Closes the connection to the transport consumer instance.
     async fn close(mut self) -> Result<(), Self::CloseError> {
+        self.finish_credit_cleanup().await;
+        if self.receive_recovery.operation.is_some() {
+            // Finish the owned handshake before closing its resources. Cancelling
+            // a close drops the whole receiver, not a supposedly reusable link.
+            let _ = self.recover().await;
+        }
         let _ = self
             .cbs_command_sender
             .send(amqp_cbs_link::Command::RemoveAuthorizationRefresher(

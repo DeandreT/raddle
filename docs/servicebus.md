@@ -46,18 +46,27 @@ the local custody generation; an obsolete held delivery cannot be settled by
 mistaking a successful stale-token no-op for confirmation.
 
 Each bounded receive uses one total deadline across attempts, retry delays,
-recovery, and credit cleanup. Recovery and its absolute retry deadline persist
-across calls: a short poll interrupted during recovery returns an error, not a
-successful idle result. It returns at most the requested count, including
-when an earlier attempt acquired part of the batch. An idle deadline returns an
-empty batch even for a wait longer than the ordinary SDK attempt timeout. A
-partial batch is returned instead of hiding acquired locks behind a later
-receive error; errors before acquiring any message remain errors. Prefetch can
-hold additional locks on the receiver, but does not enlarge the returned batch.
-Manual credit is revoked when a receive returns or is cancelled. If that flow
-cannot be enqueued immediately, the link is discarded and the next receive must
-recover it. This cleanup owns no background task; already acquired partial
-batches remain visible even when their link's custody has become uncertain.
+recovery, and credit cleanup. The actual recovery future and its absolute retry
+deadline persist across short calls, including backoff after a failed recovery.
+A deadline with unfinished maintenance and no acquired messages returns an error,
+not a successful idle result. An ordinary idle deadline returns an empty batch
+even for a wait longer than the SDK attempt timeout.
+
+Each call returns at most the requested count. Acquired partial batches are
+returned on a later error or deadline. If the caller cancels the entire receive,
+acquired messages stay on the receiver and are returned by the next receive,
+including when its requested count is smaller. Lock deadlines continue to run
+while custody is retained; recovery invalidates the old custody generation.
+Prefetch can hold additional locks but does not enlarge the returned batch.
+
+On return or cancellation, manual-credit cleanup attempts to enqueue a zero-credit
+flow. If the outgoing queue is full, the receiver owns the unfinished cleanup
+future and link; it does not discard them or issue new credit. Subsequent receive,
+management, settlement, or close calls poll this cleanup before using the link.
+Queued revocation is not proof that the broker has observed it: in-flight transfers
+and locks remain possible until the broker processes the flow. Under backpressure,
+callers must continue polling the receiver or close it to progress cleanup. No
+application background task is spawned to finish recovery or cleanup.
 
 Close receivers and publishers before closing the shared connection. Reconnection
 and bounded protocol retries use the client library; durable retry decisions

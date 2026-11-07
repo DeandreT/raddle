@@ -40,17 +40,21 @@ The management wrapper assigns unique request IDs, discards replies with another
 correlation ID, and decodes status and typed bodies only after matching. This
 also isolates late replies after cancellation without patching another dependency.
 
-Bounded receives apply a single total deadline around protocol retries and drain,
+Bounded receives apply a single total deadline around protocol retries and cleanup,
 fill only the remaining batch capacity, and return acquired partial batches on a
 later error or deadline instead of dropping their custody. Idle waits may exceed
 the ordinary operation timeout without becoming transport errors. The patched
 source requires Rust 1.85 or later for lending async callbacks; raddle's pinned
 toolchain is newer.
-Receive recovery/backoff state survives short calls and cancellation. Manual
-credit cleanup runs on drop; a blocked cleanup invalidates the link for recovery
-instead of leaving it reusable with outstanding credit. Receiver custody epochs
-invalidate held deliveries from recovered links rather than accepting stale-token
-no-op dispositions. No extra background tasks are introduced.
+The receiver retains actual owned recovery and credit-cleanup futures across
+short calls and cancellation, including recovery-failure backoff. A blocked
+zero-credit flow retains its link and queue position instead of relying on a
+best-effort destructor detach; later calls must finish cleanup before granting
+new credit. Enqueueing revocation does not establish immediate broker observation.
+Acquired partial deliveries survive caller cancellation and remain bounded by the
+next requested batch size. Receiver custody epochs invalidate held deliveries
+from recovered links rather than accepting stale-token no-op dispositions. No
+extra background tasks or dependencies are introduced.
 
 Both Cargo workspaces select the same vendored source. The adapter's direct path
 dependency also preserves that selection for Git consumers, not just workspace
