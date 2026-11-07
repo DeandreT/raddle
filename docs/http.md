@@ -21,6 +21,12 @@ inside the adapter before a success response is returned. Serialization failures
 return the stable JSON error contract with status 500; neither partial reply
 content nor the serializer's error text is returned.
 
+A transactional synchronous handler must await its SQLx scope's commit before
+returning a reply, and propagate commit failures through its handler error. The
+adapter awaits that same handler; it does not open or commit a hidden transaction.
+Consequently, a failed application commit cannot become an HTTP success merely
+because business statements or message staging finished earlier.
+
 `ApiBuilder::durable<M>` registers a POST operation returning 202 only after its
 SQLx transaction commits. It requires an `Idempotency-Key` header scoped by
 tenant and route. Concurrent equivalent submissions return the original message
@@ -46,7 +52,10 @@ builder. Generated JSON Schema references are relocated into OpenAPI components
 without dropping nested definitions. Request schemas describe deserialization;
 response schemas describe serialization, including direction-specific Serde names
 and skipped fields. Tests validate actual responses against those schemas and
-exercise both router calls and a real HTTP socket. Additional
+exercise both router calls and a real HTTP socket. Authenticated per-operation
+checks distinguish actual registered handlers from authentication on a fallback
+route. Database-backed socket checks cover committed replies, failed commits,
+durable acceptance rollback, and tenant-scoped audited replay. Additional
 application-owned routes require their own implementation-checked contracts.
 
 The body limit is 1 MiB. JSON, path, authentication, method, and missing-route

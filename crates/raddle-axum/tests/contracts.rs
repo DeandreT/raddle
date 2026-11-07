@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
+use raddle::wire::WireMessage;
 use raddle::{Request as Message, RuntimeBuilder};
 use raddle_axum::{Api, ApiBuilder, ApiError, Authenticated, Permission, Principal};
 use raddle_postgres::Store;
@@ -28,6 +29,11 @@ struct EchoReply {
 impl Message for Echo {
     type Reply = EchoReply;
     type Error = Infallible;
+}
+
+impl WireMessage for Echo {
+    const NAME: &'static str = "test.http.echo";
+    const VERSION: u32 = 1;
 }
 
 fn authenticate(headers: &HeaderMap) -> Result<Principal, ApiError> {
@@ -59,15 +65,14 @@ fn api() -> Api {
     let mut api = ApiBuilder::new(runtime.build(), authenticate);
     api.request::<Echo>("/echo").unwrap();
     // The metrics route does not connect to this deliberately unused pool.
-    api.operations(
-        "/ops",
-        Store::new(
-            PgPoolOptions::new()
-                .connect_lazy("postgresql://localhost/unused")
-                .unwrap(),
-        ),
-    )
-    .unwrap();
+    let store = Store::new(
+        PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/unused")
+            .unwrap(),
+    );
+    api.durable::<Echo>("/durable", store.clone(), "echo")
+        .unwrap();
+    api.operations("/ops", store).unwrap();
     api.build()
 }
 
@@ -162,6 +167,9 @@ async fn typed_handler_and_errors_match_openapi() {
         if status == 401 {
             assert_eq!(response.headers()["WWW-Authenticate"], "Bearer");
         }
+        if status == 405 {
+            assert_eq!(response.headers()["Allow"], "POST");
+        }
         let body = json_body(response).await;
         assert_eq!(body["code"], code);
         validate(
@@ -186,7 +194,6 @@ async fn advertised_operations_and_headers_are_served_by_the_router() {
         for (method, operation) in methods.as_object().unwrap() {
             assert_eq!(operation["security"], json!([{"bearerAuth":[]}]));
             assert!(operation["responses"]["401"]["headers"]["WWW-Authenticate"].is_object());
-            // Anonymous calls reach the common authentication layer, not a missing route.
             let path = path.replace("{id}", "00000000-0000-0000-0000-000000000001");
             let response = api
                 .router()
@@ -194,8 +201,39 @@ async fn advertised_operations_and_headers_are_served_by_the_router() {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()["WWW-Authenticate"], "Bearer");
+            // Authentication also wraps fallback routes, so a 401 alone cannot
+            // establish route existence. Only the actual operation denies this
+            // authenticated principal's missing permission before database access.
+            let response = api
+                .router()
+                .oneshot(request(
+                    &path,
+                    &method.to_uppercase(),
+                    Some("Bearer no-role"),
+                    "",
+                ))
+                .await
+                .unwrap();
+            let expected = if path == "/openapi.json" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(response.status(), expected, "{method} {path}");
         }
     }
+    let missing = api
+        .router()
+        .oneshot(request(
+            "/not-advertised",
+            "GET",
+            Some("Bearer no-role"),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     let response = api
         .router()
         .oneshot(request("/ops/metrics", "GET", Some("Bearer allowed"), ""))
