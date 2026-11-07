@@ -13,6 +13,13 @@ transport, and HTTP integrations belong in separate crates that depend on the
 core, never the reverse. Backend interfaces are introduced alongside a real
 implementation rather than guessed in advance.
 
+Application hosting lives in `raddle-host`, above the core and persistence
+adapters. Applications explicitly register services and poll the host's run
+future. The host owns only those registered task lifetimes, readiness generations,
+restart budgets and shutdown joins; constructing a runtime still starts nothing.
+HTTP and gRPC are separate adapters to that same bounded typed executor. They do
+not introduce another handler runtime or silently finalize application transactions.
+
 ## Local execution contract
 
 Each request type has one handler, reply type, and domain error type. Event
@@ -74,3 +81,33 @@ timeout generations, not replayed Rust call stacks. Distributed request/reply
 separates ephemeral waiters from durable conversations. A timeout means no result
 was observed, not that the remote operation failed. Reply destinations are
 configured and authorized, never arbitrary inbound URLs.
+
+## Application composition
+
+Typed pipeline middleware is part of a handler's existing admission boundary.
+Local cascading effects are drained only after the producing handler releases its
+permit; total-effect and depth limits prevent unbounded recursion. These local
+effects are volatile. Persist intent through the SQLx scope when it must survive
+a process exit, and never infer exactly-once execution from a successful local call.
+
+Recurring schedules persist message templates and explicit missed-tick policy.
+Each schedule advances atomically with its emitted jobs, in its own failure
+boundary. Typed saga dispatch selects correlation from application code but takes
+tenant ownership from the authenticated durable execution scope.
+
+Cluster membership and agent leases are PostgreSQL coordination primitives.
+Same-scope lease enforcement fences database effects with an owner/epoch check
+and transaction-held locks. It cannot revoke an already sent HTTP request or
+other external effect. Applications own configured agents and their scheduling.
+
+Event streams use optimistic stream revisions and a transaction-held tenant
+position counter. A later position cannot commit around an uncommitted earlier
+append in that tenant. Projections checkpoint per projection/tenant/stream in the
+same transaction as their read-model writes and outgoing messages. Separate stream
+transactions allow unrelated streams to continue when one event cannot be applied.
+
+These capabilities are independently implemented Rust APIs. Ecosystem-specific
+ORM integration, automatic handler discovery, runtime code generation and a
+complete event database are not implied by supporting messaging and projections.
+Additional transport or database adapters retain their own capability and
+qualification requirements; one adapter's tests cannot certify another backend.

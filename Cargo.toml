@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/raddle", "crates/raddle-postgres", "crates/raddle-axum", "crates/raddle-sqlite", "crates/raddle-rabbitmq", "crates/raddle-servicebus", "crates/raddle-testkit"]
+members = ["crates/raddle", "crates/raddle-postgres", "crates/raddle-axum", "crates/raddle-sqlite", "crates/raddle-rabbitmq", "crates/raddle-servicebus", "crates/raddle-testkit", "crates/raddle-host", "crates/raddle-admin", "crates/raddle-grpc"]
 resolver = "3"
 exclude = ["conformance", "vendor/azservicebus", "vendor/fe2o3-amqp", "vendor/fe2o3-amqp-management", "vendor/fe2o3-amqp-cbs", "fuzz"]
 
@@ -33,6 +33,8 @@ azure_core = { version = "0.25", default-features = false }
 url = "2.5"
 raddle-testkit = { path = "crates/raddle-testkit", version = "0.1.0" }
 raddle-postgres = { path = "crates/raddle-postgres", version = "0.1.0" }
+raddle-host = { path = "crates/raddle-host", version = "0.1.0" }
+raddle-grpc = { path = "crates/raddle-grpc", version = "0.1.0" }
 axum = { version = "0.8", features = ["json"] }
 schemars = { version = "1.0", features = ["uuid1"] }
 tower = { version = "0.5", features = ["util"] }

@@ -9,7 +9,7 @@ use crate::{Claim, DeliveryKind, Error, FailureDisposition, Job, JobStatus, Retr
 /// PostgreSQL-backed inbox/outbox. Clones share only SQLx's connection pool.
 #[derive(Clone)]
 pub struct Store {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl Store {

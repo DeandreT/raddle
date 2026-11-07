@@ -18,9 +18,12 @@ serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "net"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }
 tower.workspace = true
 http-body-util.workspace = true
 sqlx.workspace = true

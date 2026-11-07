@@ -64,7 +64,7 @@ pub(crate) fn operation(
 ) -> Value {
     let mut responses = Map::new();
     responses.insert(success.to_string(), json!({ "description": "Successful operation", "content": { "application/json": { "schema": response } } }));
-    for status in [400, 401, 403, 404, 405, 409, 413, 415, 422, 500, 503] {
+    for status in [400, 401, 403, 404, 405, 409, 413, 415, 422, 429, 500, 503] {
         let mut error = json!({ "description": "Operation rejected", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } });
         if status == 401 {
             error["headers"] = json!({ "WWW-Authenticate": { "description": "Bearer authentication challenge", "schema": { "type": "string" } } });

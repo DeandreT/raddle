@@ -59,10 +59,46 @@ Persisted sagas and durable request/reply conversations share those transaction
 boundaries. A bounded ephemeral reply registry is also available for callers
 that do not need restart recovery. See [orchestration](docs/orchestration.md).
 
+## Application framework
+
+See [capabilities and ownership](docs/capabilities.md) and the
+[composed application walkthrough](docs/application.md) for the full execution path.
+
+Typed [pipelines](docs/pipelines.md) add ordered async middleware, validation,
+explicit context, bounded cascading commands/events, and owned retry decisions.
+Ordinary dispatch retains its original typed reply and never silently retries
+side effects or executes returned work.
+
+[`raddle-host`](crates/raddle-host/README.md) supervises explicitly registered
+services with bounded restart policies, generation-safe readiness, cooperative
+shutdown and an enforced drain deadline. PostgreSQL worker/outbox helpers and
+explicit RabbitMQ topology declarations compose with application-owned state;
+see [hosting](docs/hosting.md).
+
+PostgreSQL adds [recurring interval schedules and typed saga dispatch](docs/recurring.md),
+[cluster membership and fenced singleton agents](docs/cluster.md), and
+[event streams, aggregate rehydration and durable projections](docs/events.md).
+Business state and these durable effects use the same SQLx transaction. A failed
+independent message, schedule or projection stream does not require stopping
+unrelated work. Database fencing does not make external side effects transactional.
+
+## Network interfaces and operations
+
 `raddle-axum` adds authenticated typed HTTP requests, durable idempotent
 acceptance, and opt-in operational endpoints. Its OpenAPI 3.1 document is generated
 from the same registrations and checked against actual responses. See
 [HTTP integration](docs/http.md).
+
+HTTP also supports explicit typed path/query/header/JSON binding, bounded SSE,
+per-identity ingress limits, private conditional GET revalidation,
+authenticated readiness and payload-free tenant queue views. The
+[`raddle-grpc`](crates/raddle-grpc/README.md) adapter exposes typed registrations
+through a documented Protobuf JSON bridge over standard gRPC, with application-owned
+authentication and listener configuration. The
+[`raddle-admin`](crates/raddle-admin/README.md) CLI provides read-only diagnostics
+and explicitly confirmed, audited tenant-scoped replay.
+
+## Storage and transports
 
 `raddle-sqlite` supports single-node durable queues with explicit writer
 serialization. `raddle-rabbitmq` supports AMQP 0-9-1 confirms, mandatory routing,

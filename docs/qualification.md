@@ -6,6 +6,33 @@ unification can hide missing production features. The optional Service Bus
 `emulator` feature and its separate conformance workspace are additional gates,
 not substitutes for default-feature builds or live Azure qualification.
 
+## Application framework checks
+
+Core tests cover middleware entry/exit order, typed validation, cancellation and
+permit release, finite cascading graphs, independent effect outcomes and owned
+retry decisions. Host tests cover service restart exhaustion, readiness generation
+fencing, permanent failure, cancellation and deadline-enforced task joining.
+
+With a disposable `DATABASE_URL`, run the ignored PostgreSQL cluster, recurring,
+saga-dispatch, event, operation-cancellation and operations tests as well as the
+existing durability suites. Their cases exercise concurrent ownership, expired
+leases and stale snapshots; interrupted transactional work; recurring progress;
+event commit visibility; isolated stream checkpoints; and retained successful work.
+Run `raddle-host`'s database tests and integrated application against a disposable
+local RabbitMQ broker. Broker tests must use run-owned entity names and clean
+those entities up; topology creation is explicit, never an implicit cloud step.
+
+HTTP checks include real sockets for finite SSE and database-backed authenticated
+readiness, while RPC checks use standard Tonic clients over actual HTTP/2 sockets.
+The gRPC Protobuf contract is part of its package. CLI integration tests execute
+the compiled binary against an isolated database, checking server-enforced
+read-only diagnostics and explicitly confirmed tenant-scoped replay/audit.
+
+Qualify each new package independently with default features as well as in the
+workspace. Dependency feature unification is not proof that an isolated package
+builds. Check package contents for its license, README, migrations and protocol
+sources, and retain exact command exits rather than accepting filtered log output.
+
 ## Offline and database checks
 
 The normal workspace suite covers typed runtime behavior, independent fan-out,

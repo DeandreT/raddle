@@ -61,3 +61,63 @@ application-owned routes require their own implementation-checked contracts.
 The body limit is 1 MiB. JSON, path, authentication, method, and missing-route
 errors use one stable JSON shape. The 401 response includes a Bearer challenge.
 HTTP tracing records only completion status and duration.
+
+## Typed binding and validation
+
+Implement `HttpRequest` with explicit Serde/JSON Schema `Path`, `Query` and `Body`
+types and a fallible `bind` function. `ApiBuilder::query` binds body-free GETs;
+`bound_request` binds POST JSON alongside path/query/header inputs. Named scalar
+path fields must match the template exactly. Query defaults follow Serde; nested
+JSON query objects and catch-all paths are not silently advertised as supported.
+Declare additional scalar headers in `HEADERS`; the adapter checks required
+headers before invoking the binder. Authorization remains the authenticator's
+responsibility, and the trusted principal remains separate in `Authenticated<M>`.
+The binder can return `ApiError::invalid()` without exposing supplied values.
+Runtime pipelines can add reusable asynchronous validation to the same handler.
+
+## Bounded server-sent events
+
+`ApiBuilder::events` registers authenticated GET query ingress whose typed reply
+is `EventStream<T>`. `EventStream::channel` requires a finite capacity of 1–256;
+`StreamOptions` bounds event count and lifetime. SSE carries JSON `data` values;
+OpenAPI advertises `text/event-stream` and the `x-raddle-event-schema` describing
+each JSON value. A serialization failure closes the stream rather than returning
+private error text after headers have already been sent.
+
+The application owns producer tasks. Dropping or completing the response closes
+the channel, unblocking pending sends with a closed error. The runtime's handler
+permit covers stream creation, not its lifetime. Clients must reconnect/reconcile
+using application-defined cursors if durable streaming is needed: this bounded
+stream is not a persisted subscription or delivery acknowledgment protocol.
+
+## Readiness and diagnostics
+
+`health(prefix, store, workers_ready)` adds private `/live`, `/ready` and `/queues`
+routes. All require Inspect permission. Liveness reports that the router is
+responding; readiness combines a bounded database round trip with the configured
+worker readiness callback, returning 503 when either is false. Connect that
+callback to actual host readiness rather than assuming a spawned task is ready.
+A database probe or idle outbox cannot establish broker connectivity.
+
+The queue view is scoped to the authenticated tenant and contains aggregate
+ready/active/dead/completed/due counts, never bodies, error text or cross-tenant
+enumeration. See [raddle-admin](../crates/raddle-admin/README.md) for command-line
+diagnostics and explicit audited replay without an HTTP listener.
+
+## Ingress limits and conditional responses
+
+`limits(RequestLimits)` opts the API into a finite fixed-window request budget
+per authenticated tenant and subject. The identity table is bounded; when it is
+full, new identities receive the same safe 429 response until old windows expire.
+Caller-supplied tenant/subject headers cannot select a new budget. Authentication
+still runs on denied requests. This is an in-process limiter, not a distributed
+quota service; apply an upstream limiter when a shared cluster budget is required.
+
+`conditional_get(path)` opts an already registered JSON GET into SHA-256 ETag
+revalidation. A matching `If-None-Match` returns a body-free 304, but only **after**
+current authentication, binding, validation and handler execution. Resource-level
+authorization cannot be bypassed by a previous response. Responses use
+`Cache-Control: private, no-cache` and vary on Authorization. The adapter retains
+no shared response cache and buffers at most 1 MiB for two seconds; it does not
+apply conditional caching to SSE or error responses. This saves unchanged response
+transfer, not application/database execution.

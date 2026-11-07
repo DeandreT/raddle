@@ -6,7 +6,7 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::Semaphore;
 
 use crate::handler::{self, ErasedRequest, Subscriber};
-use crate::{Event, ExecutionError, PublishReport, Request, SubscriptionOutcome};
+use crate::{Event, ExecutionContext, ExecutionError, PublishReport, Request, SubscriptionOutcome};
 
 struct Registry {
     requests: HashMap<TypeId, Box<dyn ErasedRequest>>,
@@ -51,6 +51,18 @@ impl Runtime {
         &self,
         message: M,
     ) -> Result<M::Reply, ExecutionError<M::Error>> {
+        self.invoke_with_context(message, ExecutionContext::new())
+            .await
+    }
+
+    /// Executes with explicit local context, preserving normal admission and cancellation.
+    ///
+    /// Context is diagnostic only. Passing a context does not authorize a request.
+    pub async fn invoke_with_context<M: Request>(
+        &self,
+        message: M,
+        context: ExecutionContext,
+    ) -> Result<M::Reply, ExecutionError<M::Error>> {
         use tracing::Instrument;
 
         let handler =
@@ -67,7 +79,7 @@ impl Runtime {
             .await
             .map_err(|_| ExecutionError::Closed)?;
         let result = handler
-            .call(Box::new(message))
+            .call(Box::new(message), context)
             .instrument(tracing::debug_span!(
                 "raddle.invoke",
                 message = any::type_name::<M>()
@@ -86,6 +98,16 @@ impl Runtime {
     /// An event without subscribers has an empty successful report, even after
     /// admission closes, because no handler needs admission.
     pub async fn publish<E: Event>(&self, event: E) -> PublishReport<E::Error> {
+        self.publish_with_context(event, ExecutionContext::new())
+            .await
+    }
+
+    /// Publishes with explicit diagnostic context; subscriber outcomes remain independent.
+    pub async fn publish_with_context<E: Event>(
+        &self,
+        event: E,
+        context: ExecutionContext,
+    ) -> PublishReport<E::Error> {
         use futures_util::stream::StreamExt;
         use tracing::Instrument;
 
@@ -103,7 +125,7 @@ impl Runtime {
                     Ok(_permit) => {
                         let result = subscriber
                             .handler
-                            .call(event)
+                            .call(event, context)
                             .instrument(tracing::debug_span!(
                                 "raddle.publish",
                                 message = any::type_name::<E>(),

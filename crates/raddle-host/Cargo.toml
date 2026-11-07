@@ -1,0 +1,28 @@
+[package]
+name = "raddle-host"
+description = "Explicit bounded Tokio application supervision for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+raddle.workspace = true
+raddle-postgres.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+sqlx.workspace = true
+chrono.workspace = true
+serde.workspace = true
+uuid.workspace = true
+url.workspace = true
+raddle-rabbitmq = { path = "../raddle-rabbitmq", version = "0.1.0" }
+lapin = { version = "4.12.3", default-features = false, features = ["tokio"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true
