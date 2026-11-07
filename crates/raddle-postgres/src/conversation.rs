@@ -198,31 +198,36 @@ impl Store {
         now: DateTime<Utc>,
     ) -> Result<Option<Conversation>, Error> {
         let mut scope = self.begin().await?;
-        sqlx::query("UPDATE raddle_conversations SET status='timed-out' WHERE tenant=$1 AND id=$2 AND status='pending' AND deadline <= $3")
-            .bind(tenant).bind(id).bind(now).execute(scope.connection()).await?;
         let row = sqlx::query(
-            "SELECT status,response FROM raddle_conversations WHERE tenant=$1 AND id=$2",
+            "SELECT status,response,deadline FROM raddle_conversations WHERE tenant=$1 AND id=$2 FOR UPDATE",
         )
         .bind(tenant)
         .bind(id)
         .fetch_optional(scope.connection())
         .await?;
-        let result = row
-            .map(|row| {
-                let status = match row.try_get::<&str, _>("status")? {
-                    "pending" => ConversationStatus::Pending,
-                    "completed" => ConversationStatus::Completed,
-                    "cancelled" => ConversationStatus::Cancelled,
-                    "timed-out" => ConversationStatus::TimedOut,
-                    _ => return Err(Error::Invalid("invalid conversation state")),
-                };
-                let reply = row
-                    .try_get::<Option<Vec<u8>>, _>("response")?
-                    .map(|bytes| Envelope::from_slice(&bytes, Default::default()))
-                    .transpose()?;
-                Ok(Conversation { id, status, reply })
-            })
-            .transpose()?;
+        // Reconcile the row actually returned, not an earlier UPDATE snapshot
+        // that could have missed a concurrently committed insertion.
+        let result = if let Some(row) = row {
+            let status = match row.try_get::<&str, _>("status")? {
+                "pending" if row.try_get::<DateTime<Utc>, _>("deadline")? <= now => {
+                    sqlx::query("UPDATE raddle_conversations SET status='timed-out' WHERE tenant=$1 AND id=$2")
+                            .bind(tenant).bind(id).execute(scope.connection()).await?;
+                    ConversationStatus::TimedOut
+                }
+                "pending" => ConversationStatus::Pending,
+                "completed" => ConversationStatus::Completed,
+                "cancelled" => ConversationStatus::Cancelled,
+                "timed-out" => ConversationStatus::TimedOut,
+                _ => return Err(Error::Invalid("invalid conversation state")),
+            };
+            let reply = row
+                .try_get::<Option<Vec<u8>>, _>("response")?
+                .map(|bytes| Envelope::from_slice(&bytes, Default::default()))
+                .transpose()?;
+            Some(Conversation { id, status, reply })
+        } else {
+            None
+        };
         scope.commit(now).await?;
         Ok(result)
     }

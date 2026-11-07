@@ -28,10 +28,14 @@ impl HeldMessage {
         if self.settled {
             return Err(Error::Invalid("already settled"));
         }
-        self.delivery
+        let sent = self
+            .delivery
             .ack(BasicAckOptions::default())
             .await
             .map_err(|_| Error::Broker)?;
+        if !sent {
+            return Err(Error::Broker);
+        }
         self.settled = true;
         Ok(())
     }
@@ -40,13 +44,17 @@ impl HeldMessage {
         if self.settled {
             return Err(Error::Invalid("already settled"));
         }
-        self.delivery
+        let sent = self
+            .delivery
             .nack(BasicNackOptions {
                 requeue: requeue == Requeue::Yes,
                 ..Default::default()
             })
             .await
             .map_err(|_| Error::Broker)?;
+        if !sent {
+            return Err(Error::Broker);
+        }
         self.settled = true;
         Ok(())
     }

@@ -25,7 +25,9 @@ pub struct Worker {
     timeout: Duration,
 }
 impl Worker {
-    /// Uses one active SQLite transaction at a time.
+    /// Uses one active SQLite transaction at a time. The handler budget covers
+    /// cooperative Rust futures and SQLite VM work, not writer acquisition,
+    /// filesystem I/O, native SQLite functions, or blocking application code.
     pub fn try_new(store: Store, timeout: Duration) -> Result<Self, Error> {
         if timeout.is_zero() || timeout > Duration::from_secs(3600) {
             return Err(Error::Invalid("invalid timeout"));
@@ -65,7 +67,9 @@ impl Worker {
         );
         Ok(())
     }
-    /// Executes at most one local job. Dropping the future rolls back in-flight writes.
+    /// Executes at most one local job. The deadline interrupts SQLite VM work.
+    /// Dropping the future interrupts in-flight SQL and closes its connection,
+    /// rolling back writes; the claim remains recoverable after lease expiry.
     pub async fn run_once(&self) -> Result<bool, Error> {
         let Some(claim) = self
             .store
@@ -98,18 +102,27 @@ impl Worker {
                 .await?;
             return Ok(true);
         };
-        let mut scope = self.store.execution(&claim, Utc::now()).await?;
-        match tokio::time::timeout(self.timeout, handler(&envelope, &mut scope)).await {
-            Ok(Ok(())) => scope.commit(Utc::now()).await?,
-            result => {
+        let mut scope = self
+            .store
+            .worker_execution(&claim, Utc::now(), self.timeout)
+            .await?;
+        let result = tokio::time::timeout(self.timeout, handler(&envelope, &mut scope)).await;
+        let expired = scope.stop_deadline().await?;
+        match (result, expired) {
+            (Ok(Ok(())), false) => scope.commit(Utc::now()).await?,
+            (result, expired) => {
                 scope.rollback().await?;
                 self.store
                     .fail(
                         &claim,
-                        result
-                            .ok()
-                            .and_then(Result::err)
-                            .unwrap_or(FailureDisposition::Retry),
+                        if expired {
+                            FailureDisposition::Retry
+                        } else {
+                            result
+                                .ok()
+                                .and_then(Result::err)
+                                .unwrap_or(FailureDisposition::Retry)
+                        },
                         Utc::now(),
                     )
                     .await?;

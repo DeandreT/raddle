@@ -13,6 +13,14 @@ application's existing SQLx transaction. All repository queries use
 same transaction. `commit` commits everything; dropping or rolling back the
 scope commits nothing. A staging failure makes the scope rollback-only.
 
+Application-owned Read Committed, Repeatable Read, and Serializable transactions
+are supported. Admission writes the tenant's quota row before counting pending
+jobs, so an older fixed snapshot cannot admit work using a stale count. Under
+Repeatable Read or Serializable, a concurrent admission can therefore return
+PostgreSQL serialization failure (`40001`) through `Error::Database`. Roll back
+and retry the entire application transaction, including its business reads and
+writes; retrying only staging inside the same transaction is not safe.
+
 Do not issue manual transaction-control SQL through the borrowed connection.
 Propagate application failures or call `mark_rollback_only`; swallowing an error
 does not make its surrounding operation successful. PostgreSQL transactions do
@@ -36,6 +44,9 @@ Claims are bounded to 256 rows and use `SKIP LOCKED`. Expired claims get a new
 generation. Before business writes, execution locks and validates the original
 claim. That database lock fences recovery even when the lease time passes.
 Workers apply a database statement timeout as well as a Rust future timeout.
+Execution timeouts range from one millisecond through one hour; positive
+sub-millisecond timeouts are rejected rather than disabling PostgreSQL's deadline
+by truncating them to zero milliseconds.
 Leases range from one millisecond through two hours. Claim and retry timestamps
 outside the representable clock range return a typed error before changing
 durable state; a terminal rejection does not require a future retry timestamp.
@@ -44,6 +55,8 @@ Retries use bounded exponential backoff with deterministic per-message jitter.
 Abandoned attempts count toward exhaustion. Expired/exhausted work becomes dead
 and can be inspected without retrieving its payload. Replay requires a tenant,
 actor, and reason and retains an audit record; already expired work is not replayed.
+Candidate selection independently excludes exhausted work, even if a locked row
+was skipped by the preceding dead-letter sweep and unlocks before selection.
 
 An optional partition key serializes unfinished visible work for that tenant,
 destination, and delivery kind. It does not establish a global ordering between
@@ -77,6 +90,7 @@ cargo test -p raddle-postgres -- --ignored
 ```
 
 The suite exercises atomic business writes, duplicate conflicts, fencing,
-lease loss, independent subscribers, delayed delivery, retries, replay, and real
+lease loss, independent subscribers, delayed delivery, retries, replay,
+fixed-snapshot admission, coordinated exhaustion/lookup races, and real
 subprocess exits before commit and after a simulated durable broker acceptance.
 It does not substitute the simulated sink for real transport qualification.
