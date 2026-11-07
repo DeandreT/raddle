@@ -1,0 +1,355 @@
+extend = "../Makefile.toml"
+
+[tasks.feature_check]
+dependencies = [
+  "check_feature_acceptor",
+  "check_feature_rustls",
+  "check_feature_nativetls",
+  "check_feature_transaction",
+  "check_feature_tracing",
+  "check_feature_log",
+  "check_feature_group1",
+  "check_feature_group2",
+  "check_feature_group3",
+  "check_feature_group4",
+  "check_feature_group5",
+  "check_feature_group6",
+  "check_feature_group7",
+  "check_all_features",
+
+  "check_feature_acceptor_wasm32",
+  "check_feature_nativetls_wasm32",
+  "check_feature_transaction_wasm32",
+  "check_feature_tracing_wasm32",
+  "check_feature_log_wasm32",
+  "check_feature_group2_wasm32",
+  "check_feature_group4_wasm32",
+  "check_feature_group5_wasm32",
+  "check_feature_group6_wasm32",
+
+  # # rustls has problem with wasm target
+  # "check_feature_rustls_wasm32",
+  # "check_feature_group1_wasm32",
+  # "check_feature_group3_wasm32",
+  # "check_feature_group7_wasm32",
+  # "check_all_features_wasm32",
+]
+
+[tasks.check_all_features]
+args = [
+  "check",
+  "--all-features",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_acceptor]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "acceptor",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_rustls]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "rustls",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_nativetls]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "native-tls",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_transaction]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "transaction",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group1]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "rustls, transaction",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group2]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "native-tls, transaction",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group3]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "acceptor, rustls, transaction",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group4]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "acceptor, native-tls, transaction",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group5]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "scram",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group6]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "native-tls, scram",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group7]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "rustls, scram",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_tracing]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "tracing",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_log]
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "log",
+]
+command = "cargo"
+toolchain = "stable"
+
+
+[tasks.check_all_features_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--all-features",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_acceptor_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "acceptor",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_rustls_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "rustls",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_nativetls_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "native-tls",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_transaction_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "transaction",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group1_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "rustls, transaction",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group2_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "native-tls, transaction",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group3_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "acceptor, rustls, transaction",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group4_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "acceptor, native-tls, transaction",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group5_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "scram",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group6_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "native-tls, scram",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_group7_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "rustls, scram",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_tracing_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "tracing",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"
+
+[tasks.check_feature_log_wasm32]
+env = { RUSTFLAGS='--cfg getrandom_backend="wasm_js"' }
+args = [
+  "check",
+  "--no-default-features",
+  "--features",
+  "log",
+  "--target",
+  "wasm32-unknown-unknown",
+]
+command = "cargo"
+toolchain = "stable"

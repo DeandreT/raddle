@@ -10,6 +10,7 @@ use raddle::{Request as Message, RuntimeBuilder};
 use raddle_axum::{Api, ApiBuilder, ApiError, Authenticated, Permission, Principal};
 use raddle_postgres::Store;
 use schemars::JsonSchema;
+use serde::ser::{Error as _, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -299,4 +300,122 @@ async fn overlapping_methods_are_preserved_in_the_specification() {
             assert!(ids.insert(operation["operationId"].as_str().unwrap()));
         }
     }
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DirectionalFields {
+    #[serde(rename(serialize = "output_name", deserialize = "input_name"))]
+    name: String,
+    #[serde(skip_serializing)]
+    input_only: String,
+    #[serde(skip_deserializing)]
+    output_only: String,
+    #[serde(default)]
+    defaulted: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct Asymmetric {
+    nested: DirectionalFields,
+}
+
+impl Message for Asymmetric {
+    type Reply = Self;
+    type Error = Infallible;
+}
+
+#[tokio::test]
+async fn request_and_reply_schemas_follow_their_respective_serde_contracts() {
+    let mut runtime = RuntimeBuilder::default();
+    runtime
+        .handle(|request: Authenticated<Asymmetric>| async move {
+            let (_, mut message) = request.into_parts();
+            assert_eq!(message.nested.input_only, "not returned");
+            message.nested.output_only = "returned".into();
+            Ok(message)
+        })
+        .unwrap();
+    let mut builder = ApiBuilder::new(runtime.build(), authenticate);
+    builder.request::<Asymmetric>("/asymmetric").unwrap();
+    let api = builder.build();
+    let input = json!({"nested":{"input_name":"hello","input_only":"not returned"}});
+    let operation = &api.specification()["paths"]["/asymmetric"]["post"];
+    validate(
+        &operation["requestBody"]["content"]["application/json"]["schema"],
+        api.specification(),
+        &input,
+    );
+    let response = api
+        .router()
+        .oneshot(request(
+            "/asymmetric",
+            "POST",
+            Some("Bearer allowed"),
+            &input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["Content-Type"], "application/json");
+    let body = json_body(response).await;
+    assert_eq!(
+        body,
+        json!({"nested":{"output_name":"hello","output_only":"returned","defaulted":""}})
+    );
+    validate(
+        &operation["responses"]["200"]["content"]["application/json"]["schema"],
+        api.specification(),
+        &body,
+    );
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct BrokenSerialization;
+
+impl Message for BrokenSerialization {
+    type Reply = BrokenReply;
+    type Error = Infallible;
+}
+
+#[derive(JsonSchema)]
+struct BrokenReply;
+
+impl Serialize for BrokenReply {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut object = serializer.serialize_struct("BrokenReply", 1)?;
+        object.serialize_field("partial", "private reply content")?;
+        Err(S::Error::custom("private serialization error"))
+    }
+}
+
+#[tokio::test]
+async fn reply_serialization_failure_uses_the_safe_documented_json_error() {
+    let mut runtime = RuntimeBuilder::default();
+    runtime
+        .handle(|_: Authenticated<BrokenSerialization>| async { Ok(BrokenReply) })
+        .unwrap();
+    let mut builder = ApiBuilder::new(runtime.build(), authenticate);
+    builder.request::<BrokenSerialization>("/broken").unwrap();
+    let api = builder.build();
+    let response = api
+        .router()
+        .oneshot(request("/broken", "POST", Some("Bearer allowed"), "null"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.headers()["Content-Type"], "application/json");
+    let body = json_body(response).await;
+    assert_eq!(
+        body,
+        json!({"code":"internal","message":"internal response failure"})
+    );
+    validate(
+        &api.specification()["paths"]["/broken"]["post"]["responses"]["500"]["content"]["application/json"]
+            ["schema"],
+        api.specification(),
+        &body,
+    );
 }

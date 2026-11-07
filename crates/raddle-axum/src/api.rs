@@ -14,6 +14,7 @@ use raddle::wire::{Envelope, WireMessage};
 use raddle::{ExecutionError, Request, Runtime};
 use raddle_postgres::{Delivery, DeliveryKind, Store};
 use schemars::JsonSchema;
+use schemars::generate::Contract;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -66,7 +67,7 @@ impl ApiBuilder {
     /// Requires application-supplied bearer validation; there is no anonymous default.
     pub fn new(runtime: Runtime, authenticator: impl Authenticator) -> Self {
         let mut schemas = Map::new();
-        specification::schema::<ErrorBody>("Error", &mut schemas);
+        specification::schema::<ErrorBody>("Error", Contract::Serialize, &mut schemas);
         Self {
             router: Router::new(),
             runtime,
@@ -100,15 +101,23 @@ impl ApiBuilder {
 
     /// Mounts a typed request through `Runtime::invoke`, including trusted identity.
     /// Applications register a handler for `Authenticated<M>` in that runtime.
+    /// Reply serialization failures return a fixed JSON error with status 500.
     pub fn request<M>(&mut self, path: &str) -> Result<&mut Self, ApiError>
     where
         M: Request + DeserializeOwned + JsonSchema,
         M::Reply: Serialize + JsonSchema,
     {
         let index = self.reserve(path, "post")?;
-        let request = specification::schema::<M>(&format!("Request{index}"), &mut self.schemas);
-        let response =
-            specification::schema::<M::Reply>(&format!("Reply{index}"), &mut self.schemas);
+        let request = specification::schema::<M>(
+            &format!("Request{index}"),
+            Contract::Deserialize,
+            &mut self.schemas,
+        );
+        let response = specification::schema::<M::Reply>(
+            &format!("Reply{index}"),
+            Contract::Serialize,
+            &mut self.schemas,
+        );
         self.paths
             .entry(path.to_owned())
             .or_insert_with(|| json!({}))["post"] =
@@ -121,10 +130,9 @@ impl ApiBuilder {
                 async move {
                     principal.require(Permission::Invoke)?;
                     let Json(message) = body.map_err(json_error)?;
-                    runtime
+                    let reply = runtime
                         .invoke(Authenticated::new(principal, message))
                         .await
-                        .map(Json)
                         .map_err(|error| match error {
                             ExecutionError::Handler(_) => ApiError::new(
                                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -139,7 +147,17 @@ impl ApiBuilder {
                                 ErrorCode::Internal,
                                 "internal execution failure",
                             ),
-                        })
+                        })?;
+                    // Serialize before constructing the response: Axum's Json would expose
+                    // serializer error text through its plain-text 500 fallback.
+                    let body = serde_json::to_vec(&reply).map_err(|_| {
+                        ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ErrorCode::Internal,
+                            "internal response failure",
+                        )
+                    })?;
+                    Ok::<_, ApiError>(([(header::CONTENT_TYPE, "application/json")], body))
                 }
             },
         );
@@ -156,8 +174,13 @@ impl ApiBuilder {
     ) -> Result<&mut Self, ApiError> {
         raddle::SubscriptionName::try_new(subscription).map_err(|_| ApiError::invalid())?;
         let index = self.reserve(path, "post")?;
-        let request = specification::schema::<M>(&format!("Request{index}"), &mut self.schemas);
-        let response = specification::schema::<Accepted>("Accepted", &mut self.schemas);
+        let request = specification::schema::<M>(
+            &format!("Request{index}"),
+            Contract::Deserialize,
+            &mut self.schemas,
+        );
+        let response =
+            specification::schema::<Accepted>("Accepted", Contract::Serialize, &mut self.schemas);
         let mut operation = specification::operation("post", index, Some(request), response, 202);
         operation["parameters"] = json!([{ "in": "header", "name": "Idempotency-Key", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 }, "description": "Tenant- and route-scoped idempotency key" }]);
         self.paths
@@ -223,9 +246,17 @@ impl ApiBuilder {
         }
         let index = self.registered.len() + 1;
         self.registered.extend(keys);
-        let view = specification::schema::<JobView>("Job", &mut self.schemas);
-        let request = specification::schema::<ReplayRequest>("ReplayRequest", &mut self.schemas);
-        let response = specification::schema::<ReplayResponse>("ReplayResponse", &mut self.schemas);
+        let view = specification::schema::<JobView>("Job", Contract::Serialize, &mut self.schemas);
+        let request = specification::schema::<ReplayRequest>(
+            "ReplayRequest",
+            Contract::Deserialize,
+            &mut self.schemas,
+        );
+        let response = specification::schema::<ReplayResponse>(
+            "ReplayResponse",
+            Contract::Serialize,
+            &mut self.schemas,
+        );
         let parameter = json!([{ "name":"id", "in":"path", "required":true, "schema":{"type":"string","format":"uuid"} }]);
         let mut inspect_op = specification::operation("get", index, None, view, 200);
         inspect_op["parameters"] = parameter.clone();

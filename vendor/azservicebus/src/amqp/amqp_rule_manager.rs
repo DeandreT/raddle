@@ -76,7 +76,7 @@ impl AmqpRuleManager {
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
-        let response = self.management_link.client_mut().call(request).await?;
+        let response = self.management_link.call(request).await?;
         Ok(response)
     }
 
@@ -88,7 +88,7 @@ impl AmqpRuleManager {
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
-        let response = self.management_link.client_mut().call(request).await?;
+        let response = self.management_link.call(request).await?;
         Ok(response)
     }
 
@@ -100,7 +100,7 @@ impl AmqpRuleManager {
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
-        let response = self.management_link.client_mut().call(request).await?;
+        let response = self.management_link.call(request).await?;
         Ok(response)
     }
 }

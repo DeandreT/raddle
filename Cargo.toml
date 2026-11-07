@@ -1,10 +1,13 @@
 [workspace]
 members = ["crates/raddle", "crates/raddle-postgres", "crates/raddle-axum", "crates/raddle-sqlite", "crates/raddle-rabbitmq", "crates/raddle-servicebus", "crates/raddle-testkit"]
 resolver = "3"
-exclude = ["conformance", "vendor/azservicebus", "fuzz"]
+exclude = ["conformance", "vendor/azservicebus", "vendor/fe2o3-amqp", "vendor/fe2o3-amqp-management", "vendor/fe2o3-amqp-cbs", "fuzz"]
 
 [patch.crates-io]
 azservicebus = { path = "vendor/azservicebus" }
+fe2o3-amqp = { path = "vendor/fe2o3-amqp" }
+fe2o3-amqp-management = { path = "vendor/fe2o3-amqp-management" }
+fe2o3-amqp-cbs = { path = "vendor/fe2o3-amqp-cbs" }
 
 [workspace.package]
 version = "0.1.0"

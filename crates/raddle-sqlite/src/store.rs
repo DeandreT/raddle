@@ -6,6 +6,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::execution::Execution;
 use crate::{Claim, DeliveryKind, Error, FailureDisposition, Job, Scope};
 
 /// Single-node SQLite store. `open` uses WAL, full synchronization and one connection.
@@ -31,6 +32,7 @@ impl Store {
         })
     }
     /// Uses an application-owned pool whose durability options it controls.
+    /// Workers reserve each execution connection's SQLite progress-handler slot.
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
@@ -101,13 +103,32 @@ impl Store {
         claim: &Claim,
         now: DateTime<Utc>,
     ) -> Result<Scope<'static>, Error> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::fence_execution(self.begin().await?, claim, now).await
+    }
+
+    pub(crate) async fn worker_execution(
+        &self,
+        claim: &Claim,
+        now: DateTime<Utc>,
+        timeout: Duration,
+    ) -> Result<Scope<'static>, Error> {
+        let execution = Execution::begin(&self.pool).await?;
+        let mut scope = Self::fence_execution(Scope::execution(execution), claim, now).await?;
+        scope.start_deadline(timeout).await?;
+        Ok(scope)
+    }
+
+    async fn fence_execution(
+        mut scope: Scope<'static>,
+        claim: &Claim,
+        now: DateTime<Utc>,
+    ) -> Result<Scope<'static>, Error> {
         let held:Option<String>=sqlx::query_scalar("SELECT id FROM raddle_jobs WHERE id=? AND generation=? AND status='active' AND lease_until>?")
-            .bind(&claim.id).bind(claim.generation).bind(now.timestamp_millis()).fetch_optional(&mut *transaction).await?;
+            .bind(&claim.id).bind(claim.generation).bind(now.timestamp_millis()).fetch_optional(scope.connection()).await?;
         if held.is_none() {
             return Err(Error::StaleClaim);
         }
-        Ok(Scope::enroll(transaction).with_claim(claim.clone()))
+        Ok(scope.with_claim(claim.clone()))
     }
     /// Completes an acknowledged outgoing delivery only while its generation is owned.
     pub async fn complete(&self, claim: &Claim, now: DateTime<Utc>) -> Result<(), Error> {

@@ -423,6 +423,8 @@ impl From<OpenMgmtLinkError> for OpenReceiverError {
 /// Error recovering a receiver link
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RecoverReceiverError {
+    #[error(transparent)]
+    OpenReceiver(#[from] OpenReceiverError),
     /// Connection scope is disposed
     #[error("The connection scope is disposed")]
     ConnectionScopeDisposed,
@@ -631,6 +633,8 @@ impl ServiceBusRetryPolicyError for AmqpSendError {
 /// Error receiving message from the service
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AmqpRecvError {
+    #[error("Receiver recovery is pending; no healthy idle receive was confirmed")]
+    RecoveryPending,
     /// Error with receiving the message
     #[error(transparent)]
     Recv(#[from] RecvError),
@@ -669,6 +673,12 @@ impl ServiceBusRetryPolicyError for AmqpRecvError {
 /// Error with message disposition
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AmqpDispositionError {
+    #[error("The message no longer belongs to a live receiver lock")]
+    MessageLockLost,
+    /// The broker-supplied lock deadline has already elapsed locally.
+    #[error("The message lock has expired")]
+    MessageLockExpired,
+
     /// Error with the link state
     #[error(transparent)]
     IllegalState(#[from] IllegalLinkStateError),
@@ -685,6 +695,8 @@ pub(crate) enum AmqpDispositionError {
 impl ServiceBusRetryPolicyError for AmqpDispositionError {
     fn should_try_recover(&self) -> bool {
         match self {
+            Self::MessageLockLost => false,
+            Self::MessageLockExpired => false,
             Self::IllegalState(IllegalLinkStateError::IllegalSessionState) => true,
             Self::IllegalState(IllegalLinkStateError::IllegalState) => false,
             Self::RequestResponse(err) => should_try_recover_from_management_error(err),

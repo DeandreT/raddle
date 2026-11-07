@@ -91,14 +91,21 @@ async fn confirms_returns_prefetch_and_explicit_settlement() -> Result<(), Box<d
             .ok_or("missing requeue")?;
         assert_eq!(redelivered.decode()?.id(), first.id());
         redelivered.complete().await?;
-        let held = receiver
+        let mut held = receiver
             .receive(Duration::from_secs(5))
             .await?
             .ok_or("missing second delivery")?;
         assert_eq!(held.decode()?.id(), second.id());
         // Closing a channel without acknowledging preserves work for another consumer.
-        drop(held);
         receiver.close().await?;
+        assert!(
+            held.complete().await.is_err(),
+            "a closed receiver cannot acknowledge"
+        );
+        assert!(
+            held.reject(Requeue::No).await.is_err(),
+            "a closed receiver cannot reject"
+        );
         let mut receiver = connection.receiver(&queue, 1).await?;
         let mut held = receiver
             .receive(Duration::from_secs(5))

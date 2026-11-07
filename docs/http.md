@@ -16,7 +16,10 @@ logged or returned in the HTTP error contract.
 whose response is `M::Reply`. Register its handler as `Authenticated<M>` in the
 ordinary raddle runtime. That wrapper carries the verified principal into the
 same bounded executor used by local callers. Domain failures return a fixed 422
-response, not the potentially sensitive error string.
+response, not the potentially sensitive error string. Replies are serialized
+inside the adapter before a success response is returned. Serialization failures
+return the stable JSON error contract with status 500; neither partial reply
+content nor the serializer's error text is returned.
 
 `ApiBuilder::durable<M>` registers a POST operation returning 202 only after its
 SQLx transaction commits. It requires an `Idempotency-Key` header scoped by
@@ -40,8 +43,10 @@ business endpoints are publicly reachable.
 All supplied routes, the authenticated `/openapi.json` endpoint, intentional
 headers, request/response schemas, errors, and security scheme come from the
 builder. Generated JSON Schema references are relocated into OpenAPI components
-without dropping nested definitions. Tests validate actual responses against
-those schemas and exercise both router calls and a real HTTP socket. Additional
+without dropping nested definitions. Request schemas describe deserialization;
+response schemas describe serialization, including direction-specific Serde names
+and skipped fields. Tests validate actual responses against those schemas and
+exercise both router calls and a real HTTP socket. Additional
 application-owned routes require their own implementation-checked contracts.
 
 The body limit is 1 MiB. JSON, path, authentication, method, and missing-route

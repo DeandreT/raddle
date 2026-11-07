@@ -1,8 +1,17 @@
 use schemars::JsonSchema;
+use schemars::generate::{Contract, SchemaSettings};
 use serde_json::{Map, Value, json};
 
-pub(crate) fn schema<T: JsonSchema>(name: &str, components: &mut Map<String, Value>) -> Value {
-    let mut root = schemars::schema_for!(T).to_value();
+pub(crate) fn schema<T: JsonSchema>(
+    name: &str,
+    contract: Contract,
+    components: &mut Map<String, Value>,
+) -> Value {
+    let mut root = SchemaSettings::draft2020_12()
+        .with(|settings| settings.contract = contract)
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .to_value();
     let definitions = root.as_object_mut().and_then(|object| {
         object.remove("$schema");
         object

@@ -1,4 +1,3 @@
-
 use fe2o3_amqp_types::{
     definitions::Fields,
     primitives::{Binary, OrderedMap, Timestamp},
@@ -8,11 +7,14 @@ use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
 
 use crate::{
-    constants::DEFAULT_OFFSET_DATE_TIME, core::{RecoverableTransport, TransportReceiver, TransportSessionReceiver}, primitives::{
+    core::{RecoverableTransport, TransportReceiver, TransportSessionReceiver},
+    primitives::{
         service_bus_peeked_message::ServiceBusPeekedMessage,
-        service_bus_received_message::ServiceBusReceivedMessage,
+        service_bus_received_message::{lock_deadline, ServiceBusReceivedMessage},
         service_bus_retry_policy::run_operation,
-    }, sealed::Sealed, ServiceBusReceiveMode
+    },
+    sealed::Sealed,
+    ServiceBusReceiveMode,
 };
 
 use super::{
@@ -30,19 +32,44 @@ use super::{
 };
 
 pub(super) fn get_session_locked_until(properties: &Option<Fields>) -> Option<OffsetDateTime> {
-    // SessionLockedUntil = link.Settings.Properties.TryGetValue<long>(
-    //     AmqpClientConstants.LockedUntilUtc, out var lockedUntilUtcTicks)
-    //     ? new DateTime(lockedUntilUtcTicks, DateTimeKind.Utc)
-    //     : DateTime.MinValue;
+    // Azure's long form is DateTime.Ticks: 100ns intervals since 0001-01-01,
+    // not Unix milliseconds. Other peers encode the AMQP timestamp form.
     properties
         .as_ref()
         .and_then(|map| map.get(LOCKED_UNTIL_UTC))
         .and_then(|value| match value {
-            Value::Timestamp(timestamp) => Some(timestamp.clone()),
-            _ => None, // TODO: what if it's not a timestamp?
+            Value::Long(ticks) => session_deadline_from_ticks(*ticks),
+            _ => lock_deadline(value),
         })
-        .map(OffsetDateTime::from)
-    // .unwrap_or(DEFAULT_OFFSET_DATE_TIME)
+}
+
+fn session_deadline_from_ticks(ticks: i64) -> Option<OffsetDateTime> {
+    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    const MAX_DATETIME_TICKS: i64 = 3_155_378_975_999_999_999;
+
+    if !(0..=MAX_DATETIME_TICKS).contains(&ticks) {
+        return None;
+    }
+    // Widen before subtraction/multiplication; no broker-provided i64 may panic
+    // or wrap, and out-of-range sentinels must not become an expired lease.
+    let unix_nanos = (i128::from(ticks) - i128::from(UNIX_EPOCH_TICKS)) * 100;
+    OffsetDateTime::from_unix_timestamp_nanos(unix_nanos).ok()
+}
+
+pub(super) fn receiver_session_id(receiver: &fe2o3_amqp::Receiver) -> Option<&str> {
+    receiver
+        .source()
+        .as_ref()
+        .and_then(|source| source.filter.as_ref())
+        .and_then(|filter| filter.get(amqp_client_constants::SESSION_FILTER_NAME))
+        .and_then(|value| match value {
+            Value::String(string) => Some(string.as_str()),
+            Value::Described(described) => match &described.value {
+                Value::String(string) => Some(string.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
 }
 
 /// An AMQP receiver for session enabled entities.
@@ -65,15 +92,11 @@ impl AmqpSessionReceiver {
         request: &mut RenewSessionLockRequest,
         try_timeout: &StdDuration,
     ) -> Result<RenewSessionLockResponse, AmqpRequestResponseError> {
+        self.inner.prepare_management().await?;
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
-        let response = self
-            .inner
-            .management_link
-            .client_mut()
-            .call(request)
-            .await?;
+        let response = self.inner.management_link.call(request).await?;
         Ok(response)
     }
 
@@ -82,15 +105,11 @@ impl AmqpSessionReceiver {
         request: &mut SetSessionStateRequest,
         try_timeout: &StdDuration,
     ) -> Result<SetSessionStateResponse, AmqpRequestResponseError> {
+        self.inner.prepare_management().await?;
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
-        let response = self
-            .inner
-            .management_link
-            .client_mut()
-            .call(request)
-            .await?;
+        let response = self.inner.management_link.call(request).await?;
         Ok(response)
     }
 
@@ -99,15 +118,11 @@ impl AmqpSessionReceiver {
         request: &mut GetSessionStateRequest,
         try_timeout: &StdDuration,
     ) -> Result<GetSessionStateResponse, AmqpRequestResponseError> {
+        self.inner.prepare_management().await?;
         let server_timeout = try_timeout.as_millis() as u32;
         request.set_server_timeout(Some(server_timeout));
 
-        let response = self
-            .inner
-            .management_link
-            .client_mut()
-            .call(request)
-            .await?;
+        let response = self.inner.management_link.call(request).await?;
         Ok(response)
     }
 }
@@ -247,35 +262,15 @@ impl TransportReceiver for AmqpSessionReceiver {
 
 impl TransportSessionReceiver for AmqpSessionReceiver {
     fn session_id(&self) -> Option<&str> {
-        self.inner
-            .receiver
-            .source()
-            .as_ref()
-            .and_then(|source| source.filter.as_ref())
-            .and_then(|filter| filter.get(amqp_client_constants::SESSION_FILTER_NAME))
-            .and_then(|value| match value {
-                Value::String(ref string) => Some(string.as_str()),
-                Value::Described(described) => match described.value {
-                    Value::String(ref string) => Some(string.as_str()),
-                    _ => None,
-                },
-                _ => None,
-            })
+        self.inner.session_id()
     }
 
     fn session_locked_until(&self) -> OffsetDateTime {
-        self.inner.receiver.properties(get_session_locked_until)
-            .unwrap_or(DEFAULT_OFFSET_DATE_TIME)
+        self.inner.session_locked_until()
     }
 
     fn set_session_locked_until(&mut self, session_locked_until: OffsetDateTime) {
-        let timestamp = Timestamp::from(session_locked_until);
-        let op = move |properties: &mut Option<Fields>| {
-            properties
-                .get_or_insert(Fields::default())
-                .insert(LOCKED_UNTIL_UTC.into(), Value::Timestamp(timestamp));
-        };
-        self.inner.receiver.properties_mut(op);
+        self.inner.set_session_locked_until(session_locked_until);
     }
 
     async fn renew_session_lock(
@@ -283,7 +278,7 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
         session_id: &str,
     ) -> Result<OffsetDateTime, Self::RequestResponseError> {
         let mut request =
-            RenewSessionLockRequest::new(session_id, Some(self.inner.receiver.name().to_string()));
+            RenewSessionLockRequest::new(session_id, Some(self.inner.link_name.clone()));
         let mut try_timeout = self.inner.retry_policy.calculate_try_timeout(0);
 
         let response = run_operation!(
@@ -302,7 +297,7 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
         session_id: &str,
     ) -> Result<Vec<u8>, Self::RequestResponseError> {
         let mut request =
-            GetSessionStateRequest::new(session_id, Some(self.inner.receiver.name().to_string()));
+            GetSessionStateRequest::new(session_id, Some(self.inner.link_name.clone()));
         let mut try_timeout = self.inner.retry_policy.calculate_try_timeout(0);
 
         let response = run_operation!(
@@ -324,7 +319,7 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
         let mut request = SetSessionStateRequest::new(
             session_id,
             Binary::from(session_state),
-            Some(self.inner.receiver.name().to_string()),
+            Some(self.inner.link_name.clone()),
         );
         let mut try_timeout = self.inner.retry_policy.calculate_try_timeout(0);
 
@@ -336,5 +331,81 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
             self.recover()
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod session_deadline_tests {
+    use fe2o3_amqp_types::{definitions::Fields, primitives::Timestamp};
+    use serde_amqp::Value;
+    use time::{Duration, OffsetDateTime};
+
+    use super::get_session_locked_until;
+    use crate::amqp::amqp_client_constants::LOCKED_UNTIL_UTC;
+
+    fn deadline(value: Value) -> Option<OffsetDateTime> {
+        let mut properties = Fields::new();
+        properties.insert(LOCKED_UNTIL_UTC.into(), value);
+        get_session_locked_until(&Some(properties))
+    }
+
+    #[test]
+    fn dotnet_tick_leases_preserve_epoch_precision_and_expiry() {
+        const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+        for (ticks, expected) in [
+            (
+                UNIX_EPOCH_TICKS - 1,
+                OffsetDateTime::UNIX_EPOCH - Duration::nanoseconds(100),
+            ),
+            (UNIX_EPOCH_TICKS, OffsetDateTime::UNIX_EPOCH),
+            (
+                UNIX_EPOCH_TICKS + 1,
+                OffsetDateTime::UNIX_EPOCH + Duration::nanoseconds(100),
+            ),
+        ] {
+            assert_eq!(deadline(Value::Long(ticks)), Some(expected));
+        }
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(60);
+        let expired = deadline(Value::Long(UNIX_EPOCH_TICKS + 590_000_000)).unwrap();
+        let live = deadline(Value::Long(UNIX_EPOCH_TICKS + 610_000_000)).unwrap();
+        assert!(
+            expired < now,
+            "an expired long lease must remain visible to settlement preflight"
+        );
+        assert!(live > now);
+    }
+
+    #[test]
+    fn dotnet_tick_bounds_are_checked_without_panics_or_wrapping() {
+        assert_eq!(
+            deadline(Value::Long(0)),
+            Some(time::macros::datetime!(0001-01-01 0:00 UTC))
+        );
+        assert_eq!(
+            deadline(Value::Long(3_155_378_975_999_999_999)),
+            Some(time::macros::datetime!(9999-12-31 23:59:59.9999999 UTC))
+        );
+        for ticks in [i64::MIN, -1, 3_155_378_976_000_000_000, i64::MAX] {
+            assert_eq!(deadline(Value::Long(ticks)), None, "ticks: {ticks}");
+        }
+    }
+
+    #[test]
+    fn timestamp_leases_and_missing_or_malformed_properties_remain_supported() {
+        assert_eq!(
+            deadline(Value::Timestamp(Timestamp::from_milliseconds(42))),
+            Some(OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(42))
+        );
+        assert_eq!(get_session_locked_until(&None), None);
+        assert_eq!(get_session_locked_until(&Some(Fields::new())), None);
+        for value in [
+            Value::Null,
+            Value::String("invalid".into()),
+            Value::Ulong(u64::MAX),
+            Value::Timestamp(Timestamp::from_milliseconds(i64::MIN)),
+            Value::Timestamp(Timestamp::from_milliseconds(i64::MAX)),
+        ] {
+            assert_eq!(deadline(value), None);
+        }
     }
 }

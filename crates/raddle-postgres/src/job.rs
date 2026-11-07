@@ -162,12 +162,14 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Validates positive durations and a bounded scheduling horizon.
+    /// Validates positive backoff and an execution timeout from one millisecond
+    /// through one hour. Smaller timeouts would disable PostgreSQL's deadline
+    /// when converted to its millisecond statement timeout.
     pub fn try_new(base: Duration, maximum: Duration, timeout: Duration) -> Result<Self, Error> {
         if base.is_zero()
             || maximum < base
             || maximum > Duration::from_secs(86400 * 30)
-            || timeout.is_zero()
+            || timeout < Duration::from_millis(1)
             || timeout > Duration::from_secs(3600)
         {
             return Err(Error::Invalid("invalid retry durations"));

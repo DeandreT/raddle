@@ -43,6 +43,11 @@ matching reply before the deadline wins. Unknown, late, duplicate, or already
 terminal replies do not overwrite state. A reply from the wrong responder or
 contract is rejected. Querying a conversation reconciles deadline expiry and
 returns its durable result, so a caller can reconnect after a process restart.
+The lookup locks the row it actually observes and reconciles that row's deadline
+before returning. It cannot return an expired pending result merely because a
+concurrent insertion became visible between statements. An insertion not yet
+visible to the lookup may still yield no conversation; callers can query again
+after its transaction commits.
 
 `cancel_request` commits local cancellation and a best-effort cancellation
 command atomically. Applications that support remote cancellation must handle

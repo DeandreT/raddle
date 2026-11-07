@@ -19,6 +19,10 @@ pub struct Scope<'connection> {
 
 impl<'connection> Scope<'connection> {
     /// Takes ownership of an existing application transaction; never opens another.
+    ///
+    /// Repeatable Read and Serializable are supported. Concurrent admission may
+    /// return PostgreSQL serialization failure (`40001`); retry the entire
+    /// application transaction with a fresh snapshot, not just its staging call.
     pub fn enroll(transaction: Transaction<'connection, Postgres>) -> Self {
         Self {
             transaction,
@@ -130,8 +134,11 @@ impl<'connection> Scope<'connection> {
             .bind(tenant)
             .execute(&mut *self.transaction)
             .await?;
+        // A lock alone does not refresh a Repeatable Read snapshot. Writing a
+        // new tuple version makes stale admissions fail with serialization
+        // failure instead of counting jobs from before the preceding admission.
         let capacity: i32 =
-            sqlx::query_scalar("SELECT max_pending FROM raddle_quotas WHERE tenant=$1 FOR UPDATE")
+            sqlx::query_scalar("UPDATE raddle_quotas SET max_pending=max_pending WHERE tenant=$1 RETURNING max_pending")
                 .bind(tenant)
                 .fetch_one(&mut *self.transaction)
                 .await?;

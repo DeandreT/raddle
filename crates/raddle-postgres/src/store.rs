@@ -96,7 +96,7 @@ impl Store {
         sqlx::query("WITH expired AS (SELECT id FROM raddle_jobs WHERE kind=$1 AND (expires_at <= $2 OR attempts >= max_attempts) AND (status='ready' OR (status='active' AND lease_until <= $2)) FOR UPDATE SKIP LOCKED) UPDATE raddle_jobs j SET status='dead',last_error=CASE WHEN j.expires_at <= $2 THEN 'expired' ELSE 'attempts-exhausted' END,owner=NULL,lease_until=NULL FROM expired e WHERE j.id=e.id")
             .bind(kind.as_str()).bind(now).execute(&mut *transaction).await?;
         let rows = sqlx::query(
-            "WITH candidates AS (SELECT j.id FROM raddle_jobs j WHERE j.kind=$1 AND j.available_at <= $2 AND (j.expires_at IS NULL OR j.expires_at > $2) AND (j.status='ready' OR (j.status='active' AND j.lease_until <= $2)) AND NOT EXISTS (SELECT 1 FROM raddle_jobs previous WHERE j.partition_key IS NOT NULL AND previous.tenant=j.tenant AND previous.kind=j.kind AND previous.destination=j.destination AND previous.partition_key=j.partition_key AND previous.sequence < j.sequence AND previous.status NOT IN ('completed','dead')) ORDER BY j.sequence LIMIT $3 FOR UPDATE OF j SKIP LOCKED) UPDATE raddle_jobs j SET status='active',owner=$4,lease_until=$5,generation=generation+1,attempts=attempts+1 FROM candidates c WHERE j.id=c.id RETURNING j.id,j.owner,j.generation,j.envelope,j.tenant,j.destination,j.attempts,j.max_attempts"
+            "WITH candidates AS (SELECT j.id FROM raddle_jobs j WHERE j.kind=$1 AND j.available_at <= $2 AND j.attempts < j.max_attempts AND (j.expires_at IS NULL OR j.expires_at > $2) AND (j.status='ready' OR (j.status='active' AND j.lease_until <= $2)) AND NOT EXISTS (SELECT 1 FROM raddle_jobs previous WHERE j.partition_key IS NOT NULL AND previous.tenant=j.tenant AND previous.kind=j.kind AND previous.destination=j.destination AND previous.partition_key=j.partition_key AND previous.sequence < j.sequence AND previous.status NOT IN ('completed','dead')) ORDER BY j.sequence LIMIT $3 FOR UPDATE OF j SKIP LOCKED) UPDATE raddle_jobs j SET status='active',owner=$4,lease_until=$5,generation=generation+1,attempts=attempts+1 FROM candidates c WHERE j.id=c.id RETURNING j.id,j.owner,j.generation,j.envelope,j.tenant,j.destination,j.attempts,j.max_attempts"
         ).bind(kind.as_str()).bind(now).bind(i64::from(limit)).bind(Uuid::new_v4()).bind(until).fetch_all(&mut *transaction).await?;
         let claims = rows
             .into_iter()
@@ -213,8 +213,10 @@ impl Store {
             .bind(tenant)
             .execute(&mut *transaction)
             .await?;
+        // Replay participates in the same tuple-version fence as staging,
+        // including admissions enrolled with an older Repeatable Read snapshot.
         let capacity: i32 =
-            sqlx::query_scalar("SELECT max_pending FROM raddle_quotas WHERE tenant=$1 FOR UPDATE")
+            sqlx::query_scalar("UPDATE raddle_quotas SET max_pending=max_pending WHERE tenant=$1 RETURNING max_pending")
                 .bind(tenant)
                 .fetch_one(&mut *transaction)
                 .await?;

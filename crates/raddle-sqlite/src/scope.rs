@@ -1,14 +1,45 @@
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use raddle::wire::Envelope;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 
+use crate::execution::Execution;
 use crate::{Claim, Delivery, Error};
+
+enum ScopeTransaction<'connection> {
+    Enrolled(Transaction<'connection, Sqlite>),
+    Execution(Execution),
+}
+
+impl ScopeTransaction<'_> {
+    fn connection(&mut self) -> &mut SqliteConnection {
+        match self {
+            Self::Enrolled(transaction) => transaction,
+            Self::Execution(execution) => execution.connection(),
+        }
+    }
+
+    async fn commit(self) -> Result<(), sqlx::Error> {
+        match self {
+            Self::Enrolled(transaction) => transaction.commit().await,
+            Self::Execution(execution) => execution.commit().await,
+        }
+    }
+
+    async fn rollback(self) -> Result<(), sqlx::Error> {
+        match self {
+            Self::Enrolled(transaction) => transaction.rollback().await,
+            Self::Execution(execution) => execution.rollback().await,
+        }
+    }
+}
 
 /// Owns the application's actual SQLite transaction and all staged effects.
 pub struct Scope<'connection> {
-    transaction: Transaction<'connection, Sqlite>,
+    transaction: ScopeTransaction<'connection>,
     poisoned: bool,
     claim: Option<Claim>,
 }
@@ -16,14 +47,14 @@ impl<'connection> Scope<'connection> {
     /// Enrolls an existing transaction. Prefer `BEGIN IMMEDIATE` for read/write operations.
     pub fn enroll(transaction: Transaction<'connection, Sqlite>) -> Self {
         Self {
-            transaction,
+            transaction: ScopeTransaction::Enrolled(transaction),
             poisoned: false,
             claim: None,
         }
     }
     /// Gives application repositories the same connection.
     pub fn connection(&mut self) -> &mut SqliteConnection {
-        &mut self.transaction
+        self.transaction.connection()
     }
     /// Prevents commit after an application-level error.
     pub fn mark_rollback_only(&mut self) {
@@ -41,6 +72,28 @@ impl<'connection> Scope<'connection> {
     pub(crate) fn with_claim(mut self, claim: Claim) -> Self {
         self.claim = Some(claim);
         self
+    }
+
+    pub(crate) fn execution(execution: Execution) -> Self {
+        Self {
+            transaction: ScopeTransaction::Execution(execution),
+            poisoned: false,
+            claim: None,
+        }
+    }
+
+    pub(crate) async fn start_deadline(&mut self, timeout: Duration) -> Result<(), Error> {
+        let ScopeTransaction::Execution(execution) = &mut self.transaction else {
+            return Err(Error::Invalid("not a worker execution"));
+        };
+        Ok(execution.set_deadline(timeout).await?)
+    }
+
+    pub(crate) async fn stop_deadline(&mut self) -> Result<bool, Error> {
+        let ScopeTransaction::Execution(execution) = &mut self.transaction else {
+            return Err(Error::Invalid("not a worker execution"));
+        };
+        Ok(execution.stop_deadline().await?)
     }
 
     /// Stages all local/remote destinations atomically with application writes.
@@ -94,7 +147,7 @@ impl<'connection> Scope<'connection> {
             );
             let fingerprint = digest.finalize().to_vec();
             let existing=sqlx::query("SELECT id,fingerprint FROM raddle_jobs WHERE source=? AND tenant=? AND destination=? AND kind=? AND message_id=?")
-                .bind(source).bind(tenant).bind(&delivery.destination).bind(delivery.kind.as_str()).bind(envelope.id().to_string()).fetch_optional(&mut *self.transaction).await?;
+                .bind(source).bind(tenant).bind(&delivery.destination).bind(delivery.kind.as_str()).bind(envelope.id().to_string()).fetch_optional(self.transaction.connection()).await?;
             if let Some(existing) = existing {
                 if existing.try_get::<Vec<u8>, _>("fingerprint")? != fingerprint {
                     return Err(Error::IdentityConflict);
@@ -107,24 +160,24 @@ impl<'connection> Scope<'connection> {
             }
             let id = Uuid::new_v4();
             sqlx::query("INSERT INTO raddle_jobs(id,source,tenant,destination,kind,message_id,envelope,fingerprint,available_at,expires_at,partition_key,max_attempts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-                .bind(id.to_string()).bind(source).bind(tenant).bind(&delivery.destination).bind(delivery.kind.as_str()).bind(envelope.id().to_string()).bind(&bytes).bind(fingerprint).bind(delivery.available_at.timestamp_millis()).bind(delivery.expires_at.map(|time|time.timestamp_millis())).bind(&delivery.partition_key).bind(i64::from(delivery.max_attempts)).execute(&mut *self.transaction).await?;
+                .bind(id.to_string()).bind(source).bind(tenant).bind(&delivery.destination).bind(delivery.kind.as_str()).bind(envelope.id().to_string()).bind(&bytes).bind(fingerprint).bind(delivery.available_at.timestamp_millis()).bind(delivery.expires_at.map(|time|time.timestamp_millis())).bind(&delivery.partition_key).bind(i64::from(delivery.max_attempts)).execute(self.transaction.connection()).await?;
             ids.push(id);
             added = true;
         }
         sqlx::query("INSERT INTO raddle_quotas(tenant) VALUES(?) ON CONFLICT DO NOTHING")
             .bind(tenant)
-            .execute(&mut *self.transaction)
+            .execute(self.transaction.connection())
             .await?;
         let capacity: i64 =
             sqlx::query_scalar("SELECT max_pending FROM raddle_quotas WHERE tenant=?")
                 .bind(tenant)
-                .fetch_one(&mut *self.transaction)
+                .fetch_one(self.transaction.connection())
                 .await?;
         let pending: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM raddle_jobs WHERE tenant=? AND status IN ('ready','active')",
         )
         .bind(tenant)
-        .fetch_one(&mut *self.transaction)
+        .fetch_one(self.transaction.connection())
         .await?;
         let completing = i64::from(
             self.claim
@@ -144,7 +197,7 @@ impl<'connection> Scope<'connection> {
         }
         if let Some(claim) = &self.claim {
             let result=sqlx::query("UPDATE raddle_jobs SET status='completed',completed_at=?,lease_until=NULL WHERE id=? AND generation=? AND status='active'")
-                .bind(now.timestamp_millis()).bind(&claim.id).bind(claim.generation).execute(&mut *self.transaction).await?;
+                .bind(now.timestamp_millis()).bind(&claim.id).bind(claim.generation).execute(self.transaction.connection()).await?;
             if result.rows_affected() != 1 {
                 self.transaction.rollback().await?;
                 return Err(Error::StaleClaim);
