@@ -77,9 +77,10 @@ async fn serve(api: &Api, tasks: &mut JoinSet<()>) -> std::net::SocketAddr {
     address
 }
 
-#[sqlx::test(migrations = "../raddle-postgres/migrations")]
+#[sqlx::test]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn synchronous_http_reply_follows_commit_and_failed_commit_is_not_success(pool: PgPool) {
+    Store::new(pool.clone()).migrate().await.unwrap();
     sqlx::query("CREATE TABLE http_parents(id INTEGER PRIMARY KEY)")
         .execute(&pool)
         .await
@@ -231,10 +232,11 @@ async fn synchronous_http_reply_follows_commit_and_failed_commit_is_not_success(
     tasks.shutdown().await;
 }
 
-#[sqlx::test(migrations = "../raddle-postgres/migrations")]
+#[sqlx::test]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn authenticated_operations_and_acceptance_match_every_advertised_route(pool: PgPool) {
     let store = Store::new(pool.clone());
+    store.migrate().await.unwrap();
     let mut builder = ApiBuilder::new(RuntimeBuilder::default().build(), authenticate);
     builder
         .durable::<Write>("/commands", store.clone(), "commands")
