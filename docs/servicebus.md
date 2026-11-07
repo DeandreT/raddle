@@ -14,6 +14,11 @@ incoming reply headers cannot select arbitrary addresses.
 Publisher success means broker acceptance, not consumer completion. Large SDK
 futures are boxed at the integration boundary so callers do not inherit their
 stack footprint. Independent outgoing entities have independent sender locks.
+The vendored AMQP sender registers its acknowledgment waiter before enqueueing a
+transfer, so an immediate broker acceptance cannot be lost locally. Cancellation
+before enqueue removes that registration; after any frame is enqueued, unsettled
+state remains available for acknowledgment or link recovery. A timeout or caller
+cancellation is still uncertain and must not be treated as rejection.
 The conservative 240 KiB envelope limit leaves space for Standard-tier AMQP
 framing. Sessions use the validated `session-id` envelope header.
 
@@ -90,6 +95,9 @@ containers. This supplies an additional broker implementation for local
 compatibility work, while Entra ID, cloud networking, WebSockets, and actual Azure
 service qualification remain separate from emulator results.
 
-The narrowly patched vendored client is documented in `THIRD_PARTY.md`. Git
-consumers retain the direct path dependency. Do not publish the adapter to a
-registry with an unpatched dependency substituted for this source.
+The narrowly patched vendored clients are documented in
+[THIRD_PARTY.md](../THIRD_PARTY.md). Git consumers retain direct paths through
+azservicebus, the AMQP core, and its management/CBS wrappers; they do not need to
+repeat this repository's Cargo patch tables. Keep those vendored directories
+together when using a source checkout. Do not publish the adapter to a registry
+with unpatched dependencies substituted for these sources.

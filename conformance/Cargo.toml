@@ -10,6 +10,9 @@ publish = false
 
 [patch.crates-io]
 azservicebus = { path = "../vendor/azservicebus" }
+fe2o3-amqp = { path = "../vendor/fe2o3-amqp" }
+fe2o3-amqp-management = { path = "../vendor/fe2o3-amqp-management" }
+fe2o3-amqp-cbs = { path = "../vendor/fe2o3-amqp-cbs" }
 
 [dependencies]
 raddle = { path = "../crates/raddle" }
@@ -24,8 +27,8 @@ tempfile = "3"
 azservicebus = { version = "0.25.1", default-features = false, features = ["rustls", "unsecured"] }
 url = "2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sw-server = { package = "server", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
-sw-domain = { package = "domain", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
-sw-storage = { package = "storage", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
-sw-protocol = { package = "protocol-amqp", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
-sw-auth = { package = "auth", git = "https://github.com/DeandreT/switchyard", rev = "36ebdba98983310fe25182b0916fdba9242629f4" }
+sw-server = { package = "server", git = "https://github.com/DeandreT/switchyard", rev = "c7556195c1ac9cec62167e78950cf93717e95ef4" }
+sw-domain = { package = "domain", git = "https://github.com/DeandreT/switchyard", rev = "c7556195c1ac9cec62167e78950cf93717e95ef4" }
+sw-storage = { package = "storage", git = "https://github.com/DeandreT/switchyard", rev = "c7556195c1ac9cec62167e78950cf93717e95ef4" }
+sw-protocol = { package = "protocol-amqp", git = "https://github.com/DeandreT/switchyard", rev = "c7556195c1ac9cec62167e78950cf93717e95ef4" }
+sw-auth = { package = "auth", git = "https://github.com/DeandreT/switchyard", rev = "c7556195c1ac9cec62167e78950cf93717e95ef4" }

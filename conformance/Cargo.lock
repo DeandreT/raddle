@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "admin-api"
+version = "0.1.0"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
+dependencies = [
+ "domain",
+ "serde",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -26,7 +35,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "amqp"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
 dependencies = [
  "serde",
  "serde_amqp",
@@ -155,7 +164,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "auth"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -372,7 +381,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "cluster"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
 dependencies = [
  "domain",
  "serde",
@@ -654,7 +663,7 @@ dependencies = [
 [[package]]
 name = "domain"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
 dependencies = [
  "postcard",
  "regex-automata",
@@ -769,8 +778,6 @@ dependencies = [
 [[package]]
 name = "fe2o3-amqp"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95c762db93ff5d7a5721c78ff41f522b24c68dbd0bc71ce0b9a8f49ab74bbb82"
 dependencies = [
  "bytes",
  "fe2o3-amqp-types",
@@ -797,8 +804,6 @@ dependencies = [
 [[package]]
 name = "fe2o3-amqp-cbs"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cae904b214ffa3c9bae26e4129d300fe79189d2ef70503071fb25ff9127531e"
 dependencies = [
  "fe2o3-amqp",
  "fe2o3-amqp-management",
@@ -808,8 +813,6 @@ dependencies = [
 [[package]]
 name = "fe2o3-amqp-management"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0582084762bdf022540c37868a0808e9f54dbcc51fe56f6212da59c167569cda"
 dependencies = [
  "fe2o3-amqp",
  "fe2o3-amqp-types",
@@ -1983,7 +1986,7 @@ dependencies = [
 [[package]]
 name = "protocol-amqp"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
 dependencies = [
  "amqp",
  "auth",
@@ -2517,8 +2520,9 @@ dependencies = [
 [[package]]
 name = "server"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
 dependencies = [
+ "admin-api",
  "auth",
  "clap",
  "cluster",
@@ -2855,7 +2859,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "storage"
 version = "0.1.0"
-source = "git+https://github.com/DeandreT/switchyard?rev=36ebdba98983310fe25182b0916fdba9242629f4#36ebdba98983310fe25182b0916fdba9242629f4"
+source = "git+https://github.com/DeandreT/switchyard?rev=c7556195c1ac9cec62167e78950cf93717e95ef4#c7556195c1ac9cec62167e78950cf93717e95ef4"
 dependencies = [
  "fjall",
  "thiserror 2.0.21",

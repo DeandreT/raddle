@@ -183,12 +183,15 @@ version = "0.10"
 
 [dependencies.fe2o3-amqp]
 version = "0.14"
+path = "../fe2o3-amqp"
 
 [dependencies.fe2o3-amqp-cbs]
 version = "0.14"
+path = "../fe2o3-amqp-cbs"
 
 [dependencies.fe2o3-amqp-management]
 version = "0.14"
+path = "../fe2o3-amqp-management"
 
 [dependencies.fe2o3-amqp-types]
 version = "0.14"

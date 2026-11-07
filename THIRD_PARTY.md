@@ -1,4 +1,6 @@
-# Vendored dependency
+# Vendored dependencies
+
+## azservicebus
 
 `vendor/azservicebus` contains the published source of `azservicebus` 0.25.1,
 authored by Minghua Wu, from <https://github.com/minghuaw/azservicebus>.
@@ -56,8 +58,46 @@ next requested batch size. Receiver custody epochs invalidate held deliveries
 from recovered links rather than accepting stale-token no-op dispositions. No
 extra background tasks or dependencies are introduced.
 
-Both Cargo workspaces select the same vendored source. The adapter's direct path
-dependency also preserves that selection for Git consumers, not just workspace
-builds. Registry publication must wait for an upstream fix or a separately
-published patched dependency; it must not silently substitute the broken registry
-package. Remove these patches only after conformance passes against their replacement.
+## fe2o3 AMQP client
+
+The following published packages by Minghua Wu are vendored from
+<https://github.com/minghuaw/fe2o3-amqp>. Each directory retains the published
+`Cargo.toml.orig` and `.cargo_vcs_info.json`. Registry archive SHA-256 values are:
+
+- `vendor/fe2o3-amqp`, version 0.14.1:
+  `95c762db93ff5d7a5721c78ff41f522b24c68dbd0bc71ce0b9a8f49ab74bbb82`.
+- `vendor/fe2o3-amqp-management`, version 0.14.0:
+  `0582084762bdf022540c37868a0808e9f54dbcc51fe56f6212da59c167569cda`.
+- `vendor/fe2o3-amqp-cbs`, version 0.14.0:
+  `6cae904b214ffa3c9bae26e4129d300fe79189d2ef70503071fb25ff9127531e`.
+
+Their published manifests declare `MIT/Apache-2.0`. The archives omit separate
+license files. Each vendored directory includes the upstream MIT `LICENSE.txt`
+from its recorded source revision: [core license](https://github.com/minghuaw/fe2o3-amqp/blob/e2d2850ddce54398e671f6e73fecca7d5ef1c081/LICENSE.txt)
+and [management/CBS license](https://github.com/minghuaw/fe2o3-amqp/blob/05ee2797c15c8c3bf427ed9d31a27c4377363299/LICENSE.txt).
+
+The core sender registers its unsettled payload and acknowledgment waiter before
+enqueueing the first transfer. An immediate broker disposition therefore cannot
+arrive before local registration and leave the publisher waiting for an already
+consumed acknowledgment. A drop guard removes registration if nothing was
+enqueued. Once any frame is enqueued, cancellation or a later send error retains
+the original payload for acknowledgment or normal link resumption. Pre-settled
+sends do not allocate a waiter. Deterministic unit tests cover the enqueue and
+disposition boundaries without adding a production delay or a background task.
+
+Management and CBS implementation sources are unchanged. Their manifests use
+direct paths to the vendored core and management package. The azservicebus
+manifest uses direct paths to all three. `fe2o3-amqp-ws` has no production
+dependency on the core client and remains a registry package; the shared AMQP
+types package also remains unchanged in the registry.
+
+Both Cargo workspaces patch all four vendored packages. The complete direct-path
+dependency graph also retains these sources for Git consumers, whose Cargo does
+not inherit a dependency's `[patch.crates-io]` table. No downstream patch table is
+required, and sender/session types must resolve to one core package. The vendored
+packages are excluded from the application workspace and remain standalone Cargo
+workspaces with their upstream test dependencies intact.
+
+Registry publication must wait for upstream fixes or separately published patched
+dependencies; it must not silently substitute the broken registry packages.
+Remove these patches only after conformance passes against their replacements.

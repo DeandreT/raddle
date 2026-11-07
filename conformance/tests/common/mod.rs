@@ -145,7 +145,14 @@ pub async fn exercise(connection: &Connection) -> TestResult {
         for number in 100..103 {
             let message = Envelope::encode(&Order { number })?;
             expected.insert(message.id());
-            publisher.publish("orders", &message).await?;
+            publisher
+                .publish("orders", &message)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "publishing bounded batch, prefetch {prefetch}, order {number}: {error}"
+                    )
+                })?;
         }
         // The first receive must not consume the third delivery. The second returns
         // its partial batch at the deadline without dropping custody of that delivery.
@@ -163,7 +170,9 @@ pub async fn exercise(connection: &Connection) -> TestResult {
                     expected.remove(&held.decode()?.id()),
                     "unexpected or duplicate delivery"
                 );
-                batches.complete(held).await?;
+                batches.complete(held).await.map_err(|error| {
+                    format!("completing bounded batch, prefetch {prefetch}: {error}")
+                })?;
                 assert!(held.is_settled());
             }
         }
