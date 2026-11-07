@@ -11,7 +11,7 @@
 
 [package]
 edition = "2021"
-rust-version = "1.75.0"
+rust-version = "1.85.0"
 name = "azservicebus"
 version = "0.25.1"
 authors = ["Minghua Wu"]

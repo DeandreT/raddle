@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 use crate::{
     constants::DEFAULT_OFFSET_DATE_TIME, core::{RecoverableTransport, TransportReceiver, TransportSessionReceiver}, primitives::{
         service_bus_peeked_message::ServiceBusPeekedMessage,
-        service_bus_received_message::ServiceBusReceivedMessage,
+        service_bus_received_message::{lock_deadline, ServiceBusReceivedMessage},
         service_bus_retry_policy::run_operation,
     }, sealed::Sealed, ServiceBusReceiveMode
 };
@@ -37,12 +37,22 @@ pub(super) fn get_session_locked_until(properties: &Option<Fields>) -> Option<Of
     properties
         .as_ref()
         .and_then(|map| map.get(LOCKED_UNTIL_UTC))
-        .and_then(|value| match value {
-            Value::Timestamp(timestamp) => Some(timestamp.clone()),
-            _ => None, // TODO: what if it's not a timestamp?
-        })
-        .map(OffsetDateTime::from)
+        .and_then(lock_deadline)
     // .unwrap_or(DEFAULT_OFFSET_DATE_TIME)
+}
+
+pub(super) fn receiver_session_id(receiver: &fe2o3_amqp::Receiver) -> Option<&str> {
+    receiver.source().as_ref()
+        .and_then(|source| source.filter.as_ref())
+        .and_then(|filter| filter.get(amqp_client_constants::SESSION_FILTER_NAME))
+        .and_then(|value| match value {
+            Value::String(string) => Some(string.as_str()),
+            Value::Described(described) => match &described.value {
+                Value::String(string) => Some(string.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
 }
 
 /// An AMQP receiver for session enabled entities.
@@ -71,7 +81,6 @@ impl AmqpSessionReceiver {
         let response = self
             .inner
             .management_link
-            .client_mut()
             .call(request)
             .await?;
         Ok(response)
@@ -88,7 +97,6 @@ impl AmqpSessionReceiver {
         let response = self
             .inner
             .management_link
-            .client_mut()
             .call(request)
             .await?;
         Ok(response)
@@ -105,7 +113,6 @@ impl AmqpSessionReceiver {
         let response = self
             .inner
             .management_link
-            .client_mut()
             .call(request)
             .await?;
         Ok(response)
@@ -247,24 +254,11 @@ impl TransportReceiver for AmqpSessionReceiver {
 
 impl TransportSessionReceiver for AmqpSessionReceiver {
     fn session_id(&self) -> Option<&str> {
-        self.inner
-            .receiver
-            .source()
-            .as_ref()
-            .and_then(|source| source.filter.as_ref())
-            .and_then(|filter| filter.get(amqp_client_constants::SESSION_FILTER_NAME))
-            .and_then(|value| match value {
-                Value::String(ref string) => Some(string.as_str()),
-                Value::Described(described) => match described.value {
-                    Value::String(ref string) => Some(string.as_str()),
-                    _ => None,
-                },
-                _ => None,
-            })
+        self.inner.receiver.as_ref().and_then(receiver_session_id)
     }
 
     fn session_locked_until(&self) -> OffsetDateTime {
-        self.inner.receiver.properties(get_session_locked_until)
+        self.inner.receiver.as_ref().and_then(|receiver| receiver.properties(get_session_locked_until))
             .unwrap_or(DEFAULT_OFFSET_DATE_TIME)
     }
 
@@ -275,7 +269,7 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
                 .get_or_insert(Fields::default())
                 .insert(LOCKED_UNTIL_UTC.into(), Value::Timestamp(timestamp));
         };
-        self.inner.receiver.properties_mut(op);
+        if let Some(receiver) = self.inner.receiver.as_mut() { receiver.properties_mut(op); }
     }
 
     async fn renew_session_lock(
@@ -283,7 +277,7 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
         session_id: &str,
     ) -> Result<OffsetDateTime, Self::RequestResponseError> {
         let mut request =
-            RenewSessionLockRequest::new(session_id, Some(self.inner.receiver.name().to_string()));
+            RenewSessionLockRequest::new(session_id, Some(self.inner.link_name.clone()));
         let mut try_timeout = self.inner.retry_policy.calculate_try_timeout(0);
 
         let response = run_operation!(
@@ -302,7 +296,7 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
         session_id: &str,
     ) -> Result<Vec<u8>, Self::RequestResponseError> {
         let mut request =
-            GetSessionStateRequest::new(session_id, Some(self.inner.receiver.name().to_string()));
+            GetSessionStateRequest::new(session_id, Some(self.inner.link_name.clone()));
         let mut try_timeout = self.inner.retry_policy.calculate_try_timeout(0);
 
         let response = run_operation!(
@@ -324,7 +318,7 @@ impl TransportSessionReceiver for AmqpSessionReceiver {
         let mut request = SetSessionStateRequest::new(
             session_id,
             Binary::from(session_state),
-            Some(self.inner.receiver.name().to_string()),
+            Some(self.inner.link_name.clone()),
         );
         let mut try_timeout = self.inner.retry_policy.calculate_try_timeout(0);
 

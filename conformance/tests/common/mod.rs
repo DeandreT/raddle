@@ -44,6 +44,7 @@ pub async fn exercise(connection: &Connection) -> TestResult {
     eprintln!("adapter contract: renew and abandon");
     receiver.renew(first).await?;
     receiver.abandon(first).await?;
+    assert!(first.is_settled());
     let mut received = receiver.receive(1, wait).await?;
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].decode()?.id(), envelope.id());
@@ -52,6 +53,7 @@ pub async fn exercise(connection: &Connection) -> TestResult {
         .dead_letter(&mut received[0], "test-poison")
         .await
         .map_err(|error| format!("dead-lettering queue delivery: {error}"))?;
+    assert!(received[0].is_settled());
     let mut dead = connection
         .receiver(Source::DeadLetters("orders".into()), None, 0)
         .await
@@ -109,6 +111,51 @@ pub async fn exercise(connection: &Connection) -> TestResult {
     subscription_dead.complete(&mut received[0]).await?;
     subscription_dead.close().await?;
 
+    eprintln!("adapter contract: bounded partial batches and idle waits");
+    for prefetch in [0, 2] {
+        let mut batches = connection
+            .receiver(Source::Queue("orders".into()), None, prefetch)
+            .await?;
+        let mut expected = std::collections::HashSet::new();
+        for number in 100..103 {
+            let message = Envelope::encode(&Order { number })?;
+            expected.insert(message.id());
+            publisher.publish("orders", &message).await?;
+        }
+        // The first receive must not consume the third delivery. The second returns
+        // its partial batch at the deadline without dropping custody of that delivery.
+        for wanted in [2, 1] {
+            let started = tokio::time::Instant::now();
+            let mut batch = tokio::time::timeout(
+                Duration::from_secs(7),
+                batches.receive(2, Duration::from_secs(2)),
+            )
+            .await??;
+            assert_eq!(batch.len(), wanted);
+            assert!(started.elapsed() < Duration::from_secs(7));
+            for held in &mut batch {
+                assert!(
+                    expected.remove(&held.decode()?.id()),
+                    "unexpected or duplicate delivery"
+                );
+                batches.complete(held).await?;
+                assert!(held.is_settled());
+            }
+        }
+        assert!(expected.is_empty());
+        let started = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                batches.receive(1, Duration::from_millis(100)),
+            )
+            .await??
+            .is_empty()
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        batches.close().await?;
+    }
+
     eprintln!("adapter contract: session");
     let session_message = Envelope::encode(&Order { number: 7 })?
         .with_header("session-id".into(), "order-7".into())?;
@@ -125,6 +172,7 @@ pub async fn exercise(connection: &Connection) -> TestResult {
         Order { number: 7 }
     );
     session.complete(&mut received[0]).await?;
+    assert!(received[0].is_settled());
     session.close().await?;
     publisher.close().await?;
     Ok(())

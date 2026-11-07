@@ -57,7 +57,7 @@ impl HeldMessage {
             .map_err(|_| WireError::Invalid("unsupported AMQP body"))?;
         Envelope::from_slice(bytes, EnvelopeLimits::default())
     }
-    /// Whether a successful disposition already consumed this lock.
+    /// Whether a broker-confirmed disposition already consumed this lock.
     pub fn is_settled(&self) -> bool {
         self.settled
     }
@@ -153,7 +153,9 @@ impl Receiver {
         })
     }
 
-    /// Waits for a bounded batch. No message is settled merely by receiving it.
+    /// Waits for at most `max_wait`, including retries, and returns at most `count` messages.
+    /// Partial batches retain custody even if a later transfer fails or the deadline elapses.
+    /// No message is settled merely by receiving it.
     pub async fn receive(
         &mut self,
         count: u32,
@@ -191,6 +193,7 @@ impl Receiver {
     }
 
     /// Completes a message only after the caller has persisted custody or its effects.
+    /// Success requires broker confirmation; expired locks fail without marking it settled.
     pub async fn complete(&mut self, message: &mut HeldMessage) -> Result<(), Error> {
         self.check(message)?;
         match &mut self.link {

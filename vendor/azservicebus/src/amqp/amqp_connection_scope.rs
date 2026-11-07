@@ -50,6 +50,7 @@ use super::{
 
 const AUTHORIZATION_REFRESH_BUFFER_SECONDS: u64 = 7 * 60;
 
+#[derive(Clone, Debug)]
 pub(crate) enum ReceiverType {
     NonSession,
     Session { session_id: Option<String> },

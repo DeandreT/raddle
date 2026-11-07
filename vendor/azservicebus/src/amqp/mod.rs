@@ -5,6 +5,7 @@ cfg_either_rustls_or_native_tls! {
     pub(crate) mod amqp_connection_scope;
     pub(crate) mod amqp_client;
     pub(crate) mod amqp_receiver;
+    mod receive_batch;
     pub(crate) mod amqp_rule_manager;
     pub(crate) mod amqp_sender;
     pub(crate) mod amqp_session_receiver;

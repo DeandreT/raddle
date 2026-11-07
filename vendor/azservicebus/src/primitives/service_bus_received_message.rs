@@ -42,6 +42,7 @@ pub(crate) enum ReceivedMessageLockToken {
     /// Message that is received using the receive link will have complete
     /// delivery information that will be used for disposition on the AMQP receiver link
     Delivery {
+        receiver_epoch: uuid::Uuid,
         delivery_info: DeliveryInfo,
         lock_token: Uuid,
     },
@@ -67,6 +68,18 @@ pub struct ServiceBusReceivedMessage {
 
     /// Delivery Info
     pub(crate) lock_token: ReceivedMessageLockToken,
+}
+
+/// Broker lock timestamps can contain unbounded/session sentinels outside the
+/// supported calendar range. Such values do not supply a finite lock deadline.
+pub(crate) fn lock_deadline(value: &Value) -> Option<OffsetDateTime> {
+    match value {
+        Value::Timestamp(timestamp) => OffsetDateTime::from_unix_timestamp_nanos(
+            i128::from(timestamp.milliseconds()) * 1_000_000,
+        )
+        .ok(),
+        _ => None,
+    }
 }
 
 impl AsRef<ServiceBusReceivedMessage> for ServiceBusReceivedMessage {
@@ -280,19 +293,15 @@ impl ServiceBusReceivedMessage {
     /// reflects the UTC instant until which the message is held locked in the queue/subscription.
     /// When the lock expires, the [`delivery_count`](#method.delivery_count) is incremented and the
     /// message is again available for retrieval. This property is read-only.
+    /// Missing, malformed, and out-of-range annotations (including unbounded
+    /// session-message sentinels) return `None`. Session ownership is governed by
+    /// the receiver's session lock, not this per-message annotation.
     pub fn locked_until(&self) -> Option<OffsetDateTime> {
         self.raw_amqp_message
             .message_annotations
             .as_ref()?
             .get(&LOCKED_UNTIL_NAME as &dyn AnnotationKey)
-            .map(|value| match value {
-                Value::Timestamp(timestamp) => {
-                    let millis = timestamp.milliseconds();
-                    let duration = TimeSpan::milliseconds(millis);
-                    OffsetDateTime::UNIX_EPOCH + duration
-                }
-                _ => unreachable!("Expecting a Timestamp"),
-            })
+            .and_then(lock_deadline)
     }
 
     /// # Panic
@@ -486,6 +495,82 @@ impl std::fmt::Display for ServiceBusReceivedMessage {
         match self.message_id() {
             Some(id) => write!(f, "{{MessageId:{}}}", id),
             None => write!(f, "{{MessageId:None"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lock_deadline_tests {
+    use fe2o3_amqp_types::{
+        messaging::{Body, Message},
+        primitives::{Timestamp, Uuid, Value},
+    };
+    use time::{Date, Duration, OffsetDateTime};
+
+    use super::{ReceivedMessageLockToken, ServiceBusReceivedMessage};
+    use crate::amqp::amqp_message_constants::LOCKED_UNTIL_NAME;
+
+    fn message(annotation: Option<Value>) -> ServiceBusReceivedMessage {
+        let mut message = ServiceBusReceivedMessage {
+            _is_settled: false,
+            raw_amqp_message: Message::builder().body(Body::<Value>::Empty).build(),
+            lock_token: ReceivedMessageLockToken::LockToken(Uuid::from([1; 16])),
+        };
+        if let Some(value) = annotation {
+            message
+                .raw_amqp_message
+                .message_annotations
+                .get_or_insert_with(Default::default)
+                .insert(LOCKED_UNTIL_NAME.into(), value);
+        }
+        message
+    }
+
+    #[test]
+    fn lock_annotations_are_bounded_at_both_calendar_limits() {
+        let min = Date::MIN.midnight().assume_utc();
+        let max = Date::MAX
+            .with_hms_milli(23, 59, 59, 999)
+            .unwrap()
+            .assume_utc();
+        let min_millis = i64::try_from(min.unix_timestamp_nanos() / 1_000_000).unwrap();
+        let max_millis = i64::try_from(max.unix_timestamp_nanos() / 1_000_000).unwrap();
+        for (millis, expected) in [
+            (i64::MIN, None),
+            (min_millis - 1, None),
+            (min_millis, Some(min)),
+            (
+                -1,
+                Some(OffsetDateTime::UNIX_EPOCH - Duration::milliseconds(1)),
+            ),
+            (0, Some(OffsetDateTime::UNIX_EPOCH)),
+            (
+                1,
+                Some(OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(1)),
+            ),
+            (max_millis, Some(max)),
+            (max_millis + 1, None),
+            (i64::MAX, None),
+        ] {
+            let message = message(Some(Value::Timestamp(Timestamp::from_milliseconds(millis))));
+            assert_eq!(
+                message.locked_until(),
+                expected,
+                "timestamp millis: {millis}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_lock_annotations_have_no_finite_deadline() {
+        assert_eq!(message(None).locked_until(), None);
+        for value in [
+            Value::Null,
+            Value::String("invalid".into()),
+            Value::Long(0),
+            Value::Ulong(u64::MAX),
+        ] {
+            assert_eq!(message(Some(value)).locked_until(), None);
         }
     }
 }
