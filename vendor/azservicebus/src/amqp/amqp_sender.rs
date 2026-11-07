@@ -1,4 +1,3 @@
-
 use fe2o3_amqp::link::DetachError;
 use fe2o3_amqp_management::error::Error as ManagementError;
 use fe2o3_amqp_types::messaging::Outcome;
@@ -57,9 +56,7 @@ impl RecoverableTransport for AmqpSender {
 
     async fn recover(&mut self) -> Result<(), Self::RecoverError> {
         let mut connection_scope = self.connection_scope.lock().await;
-        connection_scope
-            .recover()
-            .await?;
+        connection_scope.recover().await?;
 
         let endpoint = format!("{}/{}", self.service_endpoint, self.entity_path);
         let resource = endpoint.clone();
@@ -91,41 +88,7 @@ impl AmqpSender {
         &mut self,
         batch: &mut BatchEnvelope,
     ) -> Result<(), AmqpSendError> {
-        let outcome = loop {
-            match &mut batch.state {
-                BatchEnvelopeState::NotSent => match &mut batch.sendable {
-                    SendableEnvelope::Single(sendable) => {
-                        let fut = self.sender.send_batchable_ref(sendable).await?;
-                        batch.state = BatchEnvelopeState::Sent(fut);
-                    }
-                    SendableEnvelope::Batch(sendable) => {
-                        let fut = self.sender.send_batchable_ref(sendable).await?;
-                        batch.state = BatchEnvelopeState::Sent(fut);
-                    }
-                },
-                BatchEnvelopeState::Sent(fut) => break fut.await?,
-                BatchEnvelopeState::Settled => return Ok(()),
-            }
-        };
-
-        batch.state = BatchEnvelopeState::Settled;
-
-        match outcome {
-            Outcome::Accepted(_) => Ok(()),
-            Outcome::Rejected(rejected) => {
-                Err(AmqpSendError::from(NotAcceptedError::Rejected(rejected)))
-            }
-            Outcome::Released(released) => {
-                Err(AmqpSendError::from(NotAcceptedError::Released(released)))
-            }
-            Outcome::Modified(modified) => {
-                Err(AmqpSendError::from(NotAcceptedError::Modified(modified)))
-            }
-            #[cfg(feature = "transaction")]
-            Outcome::Declared(_) => {
-                unreachable!("Declared is not expected outside txn-control links")
-            }
-        }
+        send_batch_envelope(&mut self.sender, batch).await
     }
 
     async fn schedule_message_inner(
@@ -154,6 +117,49 @@ impl AmqpSender {
 }
 
 impl Sealed for AmqpSender {}
+
+async fn send_batch_envelope(
+    sender: &mut fe2o3_amqp::Sender,
+    batch: &mut BatchEnvelope,
+) -> Result<(), AmqpSendError> {
+    let outcome = loop {
+        match &mut batch.state {
+            BatchEnvelopeState::NotSent => match &mut batch.sendable {
+                SendableEnvelope::Single(sendable) => {
+                    let fut = sender.send_batchable_ref(sendable).await?;
+                    batch.state = BatchEnvelopeState::Sent(fut);
+                }
+                SendableEnvelope::Batch(sendable) => {
+                    let fut = sender.send_batchable_ref(sendable).await?;
+                    batch.state = BatchEnvelopeState::Sent(fut);
+                }
+            },
+            BatchEnvelopeState::Sent(fut) => {
+                let outcome = fut.await;
+                // A completed delivery future must never be polled again. A
+                // refusal needs a fresh transfer; a cancelled pending wait
+                // never reaches this assignment and retains its original.
+                batch.state = BatchEnvelopeState::NotSent;
+                break outcome?;
+            }
+            BatchEnvelopeState::Accepted => return Ok(()),
+        }
+    };
+    match outcome {
+        Outcome::Accepted(_) => {
+            batch.state = BatchEnvelopeState::Accepted;
+            Ok(())
+        }
+        Outcome::Rejected(rejected) => Err(NotAcceptedError::Rejected(rejected).into()),
+        Outcome::Released(released) => Err(NotAcceptedError::Released(released).into()),
+        Outcome::Modified(modified) => Err(NotAcceptedError::Modified(modified).into()),
+        #[cfg(feature = "transaction")]
+        Outcome::Declared(_) => unreachable!("Declared is not expected outside txn-control links"),
+    }
+}
+
+#[cfg(test)]
+mod tests;
 
 impl TransportSender for AmqpSender {
     type SendError = RetryError<AmqpSendError>;

@@ -15,6 +15,14 @@ authority when constructing AMQP/TLS/WebSocket connection URLs. Previously only
 `host_str()` was retained, silently selecting the protocol's default port.
 Regression tests cover TCP, WebSocket, and plaintext endpoint construction.
 
+Publication succeeds only after an explicit AMQP `Accepted` outcome. `Rejected`,
+`Released`, and `Modified` consume their completed delivery future without
+marking the envelope accepted. A permitted retry sends the retained payload as
+a fresh delivery with the same message identity. Completed delivery errors also
+discard their finished future before retrying; a pending wait cancelled by a
+deadline retains its original future for recovery instead of resending it.
+Exhausted refusals remain errors and cannot falsely complete an outbox job.
+
 The explicit plaintext development path also keeps logical service identity
 canonical (`amqps`) while the physical connection uses `amqp`. Upstream signs
 connection-string credentials for that canonical identity; changing the requested
