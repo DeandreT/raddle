@@ -27,6 +27,8 @@ struct Shared {
     auth: Arc<dyn Authenticator>,
     requests: AtomicU64,
     failures: AtomicU64,
+    limiter: std::sync::Mutex<Option<crate::limits::Limiter>>,
+    conditional_get: std::sync::Mutex<HashSet<String>>,
 }
 
 /// Durable acceptance response. Acceptance does not mean handler completion.
@@ -55,12 +57,12 @@ impl Api {
 
 /// Registers authenticated JSON ingress and its matching OpenAPI operations.
 pub struct ApiBuilder {
-    router: Router,
-    runtime: Runtime,
+    pub(crate) router: Router,
+    pub(crate) runtime: Runtime,
     shared: Arc<Shared>,
-    paths: Map<String, Value>,
-    schemas: Map<String, Value>,
-    registered: HashSet<(String, String)>,
+    pub(crate) paths: Map<String, Value>,
+    pub(crate) schemas: Map<String, Value>,
+    pub(crate) registered: HashSet<(String, String)>,
 }
 
 impl ApiBuilder {
@@ -75,11 +77,55 @@ impl ApiBuilder {
                 auth: Arc::new(authenticator),
                 requests: AtomicU64::new(0),
                 failures: AtomicU64::new(0),
+                limiter: std::sync::Mutex::new(None),
+                conditional_get: std::sync::Mutex::new(HashSet::new()),
             }),
             paths: Map::new(),
             schemas,
             registered: HashSet::new(),
         }
+    }
+
+    /// Opts into finite per-identity ingress limiting, shared by this API's routes.
+    /// Authentication still runs for each request, including denied attempts.
+    pub fn limits(&mut self, settings: crate::RequestLimits) -> Result<&mut Self, ApiError> {
+        *self
+            .shared
+            .limiter
+            .lock()
+            .map_err(|_| ApiError::unavailable())? = Some(crate::limits::Limiter::new(settings));
+        Ok(self)
+    }
+
+    /// Opts a registered JSON GET into private ETag revalidation (1 MiB maximum).
+    /// Authentication, binding, validation and the handler still execute on every
+    /// request. No cached result can bypass current resource authorization.
+    pub fn conditional_get(&mut self, path: &str) -> Result<&mut Self, ApiError> {
+        if !self
+            .registered
+            .contains(&(path.to_owned(), "get".to_owned()))
+        {
+            return Err(ApiError::invalid());
+        }
+        if !self
+            .shared
+            .conditional_get
+            .lock()
+            .map_err(|_| ApiError::unavailable())?
+            .insert(path.to_owned())
+        {
+            return Err(ApiError::invalid());
+        }
+        let operation = &mut self.paths[path]["get"];
+        if !operation["parameters"].is_array() {
+            operation["parameters"] = json!([]);
+        }
+        if let Some(parameters) = operation["parameters"].as_array_mut() {
+            parameters.push(json!({"name":"If-None-Match","in":"header","required":false,"schema":{"type":"string"}}));
+        }
+        operation["responses"]["304"] = json!({"description":"Unchanged representation after current authentication and handler execution","headers":{"ETag":{"schema":{"type":"string"}},"Cache-Control":{"schema":{"type":"string"}}}});
+        operation["responses"]["200"]["headers"] = json!({"ETag":{"schema":{"type":"string"}},"Cache-Control":{"schema":{"type":"string"}}});
+        Ok(self)
     }
 
     fn reserve(&mut self, path: &str, method: &str) -> Result<usize, ApiError> {
@@ -241,11 +287,14 @@ impl ApiBuilder {
             (replay_path.clone(), "post".to_owned()),
             (metrics_path.clone(), "get".to_owned()),
         ];
-        if keys.iter().any(|key| self.registered.contains(key)) {
-            return Err(ApiError::invalid());
-        }
         let index = self.registered.len() + 1;
-        self.registered.extend(keys);
+        let original = self.registered.clone();
+        for (path, method) in keys {
+            if let Err(error) = self.reserve_template(&path, &method) {
+                self.registered = original;
+                return Err(error);
+            }
+        }
         let view = specification::schema::<JobView>("Job", Contract::Serialize, &mut self.schemas);
         let request = specification::schema::<ReplayRequest>(
             "ReplayRequest",
@@ -408,7 +457,7 @@ struct ReplayResponse {
     replayed: bool,
 }
 
-fn json_error(error: JsonRejection) -> ApiError {
+pub(crate) fn json_error(error: JsonRejection) -> ApiError {
     match error.status() {
         StatusCode::PAYLOAD_TOO_LARGE => ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -430,6 +479,17 @@ async fn authenticate(
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
+    let conditional = request.method() == axum::http::Method::GET
+        && request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_some_and(|matched| {
+                shared
+                    .conditional_get
+                    .lock()
+                    .is_ok_and(|paths| paths.contains(matched.as_str()))
+            });
+    let condition = request.headers().get(header::IF_NONE_MATCH).cloned();
     shared.requests.fetch_add(1, Ordering::Relaxed);
     let identity = request
         .headers()
@@ -447,10 +507,25 @@ async fn authenticate(
     };
     let response = match principal {
         Ok(principal) => {
+            let admitted = match shared.limiter.lock() {
+                Ok(mut limiter) => limiter
+                    .as_mut()
+                    .map_or(Ok(()), |limiter| limiter.admit(&principal)),
+                Err(_) => Err(ApiError::unavailable()),
+            };
+            if let Err(error) = admitted {
+                shared.failures.fetch_add(1, Ordering::Relaxed);
+                return error.into_response();
+            }
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
         Err(_) => ApiError::unauthorized().into_response(),
+    };
+    let response = if conditional {
+        crate::caching::conditional(response, condition).await
+    } else {
+        response
     };
     if response.status().is_client_error() || response.status().is_server_error() {
         shared.failures.fetch_add(1, Ordering::Relaxed);

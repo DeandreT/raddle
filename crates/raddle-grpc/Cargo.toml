@@ -1,0 +1,34 @@
+[package]
+name = "raddle-grpc"
+description = "Authenticated typed raddle requests over standard protobuf gRPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+raddle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+http = "1"
+http-body = "1"
+tower-service = "0.3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[lints]
+workspace = true

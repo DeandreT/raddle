@@ -5,6 +5,12 @@ their handlers, state, tasks, and shutdown; raddle performs no runtime reflectio
 or automatic discovery. Requests have one typed result, while named event
 subscribers have independent outcomes.
 
+Typed async pipelines add ordered middleware and short-circuit validation.
+Explicit cascading replies execute bounded command/event effects only after
+parent admission is released. Owned retry decisions require an application
+rollback or idempotency assertion; ordinary handlers are never silently replayed.
+Typed route tables resolve stable wire contracts only to configured aliases.
+
 The local runtime is volatile. Durable execution belongs to the separate
 PostgreSQL and SQLite adapters; it is not implied by invoking a local handler.
 All crates are independently implemented and MIT licensed.
@@ -17,6 +23,7 @@ cargo run -p raddle --example local
 
 - [Runnable request/event example](https://github.com/DeandreT/raddle/blob/main/crates/raddle/examples/local.rs)
 - [Architecture and execution guarantees](https://github.com/DeandreT/raddle/blob/main/docs/architecture.md)
+- [Pipelines, cascades, retry policy, and typed routing](https://github.com/DeandreT/raddle/blob/main/docs/pipelines.md)
 - [Durable orchestration](https://github.com/DeandreT/raddle/blob/main/docs/orchestration.md)
 - [Workspace overview and contribution guidance](https://github.com/DeandreT/raddle)
 

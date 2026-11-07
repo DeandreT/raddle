@@ -17,6 +17,36 @@ pub struct Scope<'connection> {
     claim: Option<Claim>,
 }
 
+// A borrowed future can be dropped while SQLx still has a statement in flight.
+// Keep the surrounding transaction unusable unless the whole operation returns
+// success, rather than allowing its caller to commit a partially staged batch.
+struct StagingOperation<'scope, 'connection> {
+    scope: &'scope mut Scope<'connection>,
+    success: bool,
+}
+
+impl<'scope, 'connection> StagingOperation<'scope, 'connection> {
+    fn new(scope: &'scope mut Scope<'connection>) -> Self {
+        Self {
+            scope,
+            success: false,
+        }
+    }
+
+    fn finish<T>(mut self, result: Result<T, Error>) -> Result<T, Error> {
+        self.success = result.is_ok();
+        result
+    }
+}
+
+impl Drop for StagingOperation<'_, '_> {
+    fn drop(&mut self) {
+        if !self.success {
+            self.scope.mark_rollback_only();
+        }
+    }
+}
+
 impl<'connection> Scope<'connection> {
     /// Takes ownership of an existing application transaction; never opens another.
     ///
@@ -57,24 +87,22 @@ impl<'connection> Scope<'connection> {
         if self.poisoned {
             return Err(Error::RollbackOnly);
         }
+        let operation = StagingOperation::new(self);
         let result = async {
             if source.is_empty() || source.len() > 128 || tenant.is_empty() || tenant.len() > 128 || key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_graphic()) { return Err(Error::Invalid("invalid idempotency key")); }
             let fingerprint = Sha256::digest(envelope.content_bytes()?).to_vec();
             let inserted = sqlx::query("INSERT INTO raddle_idempotency(tenant,source,key,request_hash,message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
-                .bind(tenant).bind(source).bind(key).bind(&fingerprint).bind(envelope.id()).execute(self.connection()).await?;
+                .bind(tenant).bind(source).bind(key).bind(&fingerprint).bind(envelope.id()).execute(operation.scope.connection()).await?;
             if inserted.rows_affected() == 0 {
                 let row = sqlx::query("SELECT request_hash,message_id FROM raddle_idempotency WHERE tenant=$1 AND source=$2 AND key=$3")
-                    .bind(tenant).bind(source).bind(key).fetch_one(self.connection()).await?;
+                    .bind(tenant).bind(source).bind(key).fetch_one(operation.scope.connection()).await?;
                 if row.try_get::<Vec<u8>,_>("request_hash")? != fingerprint { return Err(Error::IdentityConflict); }
                 return Ok(row.try_get("message_id")?);
             }
-            self.stage(source, tenant, envelope, deliveries).await?;
+            operation.scope.stage(source, tenant, envelope, deliveries).await?;
             Ok(envelope.id())
         }.await;
-        if result.is_err() {
-            self.mark_rollback_only();
-        }
-        result
+        operation.finish(result)
     }
 
     /// Returns the authenticated tenant of the current delivery, if this is a worker scope.
@@ -107,11 +135,12 @@ impl<'connection> Scope<'connection> {
         if self.poisoned {
             return Err(Error::RollbackOnly);
         }
-        let result = self.stage_inner(source, tenant, envelope, deliveries).await;
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
+        let operation = StagingOperation::new(self);
+        let result = operation
+            .scope
+            .stage_inner(source, tenant, envelope, deliveries)
+            .await;
+        operation.finish(result)
     }
 
     async fn stage_inner(

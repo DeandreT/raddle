@@ -27,6 +27,8 @@ pub enum ErrorCode {
     UnsupportedMediaType,
     /// Application rejected the command.
     Rejected,
+    /// Authenticated ingress exceeded a configured finite request budget.
+    RateLimited,
     /// Runtime, queue, or backend is unavailable.
     Unavailable,
     /// Unexpected server failure.
@@ -72,7 +74,8 @@ impl ApiError {
             "permission denied",
         )
     }
-    pub(crate) fn invalid() -> Self {
+    /// Returns a fixed, payload-free 400 response for application input validation.
+    pub fn invalid() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidRequest,

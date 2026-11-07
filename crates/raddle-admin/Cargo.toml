@@ -1,0 +1,20 @@
+[package]
+name = "raddle-admin"
+description = "Payload-free diagnostics and explicitly confirmed audited replay for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+raddle-postgres.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+chrono.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

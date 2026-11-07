@@ -12,6 +12,10 @@ application's existing SQLx transaction. All repository queries use
 `scope.connection()`. `stage` inserts resolved local/remote deliveries into the
 same transaction. `commit` commits everything; dropping or rolling back the
 scope commits nothing. A staging failure makes the scope rollback-only.
+Once staging starts, dropping its borrowed future also makes the scope rollback-only.
+SQLx may still drain an already queued statement when its connection is reused; that does
+not restore permission to commit partially staged keys, jobs or skipped admission
+checks. Start a fresh transaction when retrying interrupted staging.
 
 Application-owned Read Committed, Repeatable Read, and Serializable transactions
 are supported. Admission writes the tenant's quota row before counting pending

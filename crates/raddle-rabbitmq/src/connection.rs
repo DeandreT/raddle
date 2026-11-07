@@ -11,7 +11,7 @@ use lapin::{BasicProperties, Channel, Confirmation, ConnectionProperties, Consum
 use raddle::transport::{Transport, TransportError};
 use raddle::wire::Envelope;
 
-use crate::{Error, HeldMessage};
+use crate::{Error, HeldMessage, Topology};
 
 /// A configured remote route; queue routing may use the empty default exchange.
 #[derive(Clone, Debug)]
@@ -30,6 +30,24 @@ pub struct Connection {
     inner: Arc<lapin::Connection>,
 }
 impl Connection {
+    /// Explicitly declares a fully validated application-owned topology.
+    /// Compatible redeclaration is idempotent; incompatible existing broker
+    /// properties fail. Broker failures may leave a partial plan: declarations
+    /// are not transactional and are never rolled back or deleted implicitly.
+    pub async fn declare_topology(&self, topology: &Topology) -> Result<(), Error> {
+        let channel = self
+            .inner
+            .create_channel()
+            .await
+            .map_err(|_| Error::Broker)?;
+        let declared = topology.declare(&channel).await;
+        let closed = channel
+            .close(200, "topology declared".into())
+            .await
+            .map_err(|_| Error::Broker);
+        declared.and(closed)
+    }
+
     /// Connects with automatic recovery. Plaintext is restricted to numeric loopback.
     pub async fn connect(uri: &str) -> Result<Self, Error> {
         let parsed = url::Url::parse(uri).map_err(|_| Error::Invalid("invalid URI"))?;

@@ -25,12 +25,17 @@
 //! ```
 
 mod builder;
+pub mod cascade;
 pub mod conversation;
 mod delivery;
 mod error;
+mod execution_context;
 mod handler;
 mod message;
+pub mod pipeline;
 mod publication;
+pub mod retry;
+pub mod routing;
 mod runtime;
 mod subscription_name;
 pub mod transport;
@@ -39,6 +44,7 @@ pub mod wire;
 pub use builder::RuntimeBuilder;
 pub use delivery::EventDelivery;
 pub use error::{ConfigurationError, ExecutionError, RegistrationError};
+pub use execution_context::ExecutionContext;
 pub use message::{Event, Request};
 pub use publication::{PublishReport, SubscriptionOutcome};
 pub use runtime::Runtime;

@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package raddle.v1;
+
+// Stable generic transport contract; application schemas use contract + version.
+service Dispatch {
+  rpc Invoke (InvokeRequest) returns (InvokeReply);
+}
+
+message InvokeRequest {
+  string contract = 1;
+  uint32 version = 2;
+  bytes json = 3;
+}
+
+message InvokeReply {
+  bytes json = 1;
+}

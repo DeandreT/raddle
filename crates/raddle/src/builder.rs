@@ -2,12 +2,15 @@ use std::any::{self, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
 use crate::handler::{ErasedRequest, Subscriber, TypedEvent, TypedRequest};
+use crate::pipeline::Pipeline;
 use crate::{
-    ConfigurationError, Event, EventDelivery, RegistrationError, Request, Runtime, SubscriptionName,
+    ConfigurationError, Event, EventDelivery, ExecutionContext, RegistrationError, Request,
+    Runtime, SubscriptionName,
 };
 
 /// Explicit registrations and the shared maximum number of active handlers.
@@ -83,6 +86,19 @@ impl RuntimeBuilder {
         F: Fn(M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<M::Reply, M::Error>> + Send + 'static,
     {
+        self.handle_with_context(move |message, _context| handler(message))
+    }
+
+    /// Registers a handler that receives explicit local execution context.
+    pub fn handle_with_context<M, F, Fut>(
+        &mut self,
+        handler: F,
+    ) -> Result<&mut Self, RegistrationError>
+    where
+        M: Request,
+        F: Fn(M, ExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<M::Reply, M::Error>> + Send + 'static,
+    {
         let message = TypeId::of::<M>();
         if self.requests.contains_key(&message) {
             return Err(RegistrationError::DuplicateRequest {
@@ -113,6 +129,20 @@ impl RuntimeBuilder {
         F: Fn(EventDelivery<E>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E::Error>> + Send + 'static,
     {
+        self.subscribe_with_context(name, move |delivery, _context| handler(delivery))
+    }
+
+    /// Registers an event subscriber that receives explicit execution context.
+    pub fn subscribe_with_context<E, F, Fut>(
+        &mut self,
+        name: SubscriptionName,
+        handler: F,
+    ) -> Result<&mut Self, RegistrationError>
+    where
+        E: Event,
+        F: Fn(EventDelivery<E>, ExecutionContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E::Error>> + Send + 'static,
+    {
         if self.subscriptions.contains(&name) {
             return Err(RegistrationError::DuplicateSubscription { name });
         }
@@ -128,6 +158,31 @@ impl RuntimeBuilder {
                 }),
             });
         Ok(self)
+    }
+
+    /// Registers a typed request pipeline under the shared admission limit.
+    pub fn handle_pipeline<M: Request>(
+        &mut self,
+        pipeline: Pipeline<M, M::Reply, M::Error>,
+    ) -> Result<&mut Self, RegistrationError> {
+        let pipeline = Arc::new(pipeline);
+        self.handle_with_context(move |message, context| {
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.execute(message, context).await }
+        })
+    }
+
+    /// Registers an independent event pipeline under the shared admission limit.
+    pub fn subscribe_pipeline<E: Event>(
+        &mut self,
+        name: SubscriptionName,
+        pipeline: Pipeline<EventDelivery<E>, (), E::Error>,
+    ) -> Result<&mut Self, RegistrationError> {
+        let pipeline = Arc::new(pipeline);
+        self.subscribe_with_context(name, move |delivery, context| {
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.execute(delivery, context).await }
+        })
     }
 
     /// Freezes the registry. Runtime clones share admission and registrations.
