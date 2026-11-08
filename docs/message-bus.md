@@ -58,6 +58,9 @@ remain caller-owned and must be joined by their listener/application. A handler 
 does not stop healthy siblings. Buffering is volatile and process exit can lose
 accepted work. A failed receiver is not silently rebuilt; host supervision
 reports failure rather than manufacturing a fresh empty queue.
+Closing buffered admission also waits for previously admitted channel reservations
+to send or release their slots. An empty buffer alone is not a completed drain;
+active work continues to be polled while those reservations are outstanding.
 Explicit cancellation is counted separately from successful jobs and handler
 failures; a message timeout does not cancel its host or healthy sibling attempts.
 
@@ -99,6 +102,11 @@ singleton dependencies are ordinary explicit fields. `dispose` asynchronously
 consumes resources. `MessageBus::execute` requires a separate buffered execution
 queue so the host, rather than an abandoned caller, drives Finally/disposal.
 Dropping the caller signals cancellation without dropping host-owned cleanup.
+Each scoped execution derives its own child cancellation signal. Caller/host
+cancellation flows down to every linked child, but completion, a domain failure,
+timeout or abandonment of one execution never cancels its parent or siblings.
+Normal completion disarms the abandoned-caller guard rather than cancelling an
+already completed execution's signal.
 Partially completed construction owns its own cleanup until it returns Resources.
 Process death or forced expiry of the host's shutdown grace cannot guarantee
 asynchronous cleanup; Rust Drop is the final fallback.
@@ -175,6 +183,10 @@ listener and passes independently authenticated replies into `accept_reply`.
 The expected tenant, responder, reply contract and fresh per-attempt nonce must
 all match. Dropping a wait releases capacity; late and duplicate replies are
 ignored. A new attempt gets a new nonce even if its business message ID is reused.
+Positive replies must also contain a valid inner envelope with the requested
+contract name before the waiter is consumed. Malformed or wrong-contract inner
+replies leave that waiter and its capacity reservation intact; a valid negative
+acknowledgement still completes the wait with `RemoteFailure`.
 
 `RemoteResponder<T>` explicitly registers typed request/reply pairs against a
 local runtime. It validates the request's reply alias against its configured
