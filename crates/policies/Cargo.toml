@@ -1,0 +1,25 @@
+[package]
+name = "raddle-policies"
+description = "Explicit executable failure policies for raddle endpoints"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+raddle.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+getrandom = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "test-util"] }
+
+[lints]
+workspace = true
