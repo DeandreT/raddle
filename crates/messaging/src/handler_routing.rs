@@ -304,6 +304,66 @@ where
         *builder = candidate;
         Ok(DispatchRegistration { global, owners })
     }
+
+    /// Atomically registers conventional-local bindings with the selected handlers.
+    /// All declared receiving targets are checked, including suppressed sources.
+    /// Legacy registrations and explicit pins remain unchanged. Configure routing
+    /// sources and their named endpoints before this operation.
+    pub fn register_routed(
+        self,
+        builder: &mut BusBuilder,
+        routing: &mut crate::routing::RoutingConfig,
+        default: &str,
+        store: Store,
+        flush: Arc<dyn Flush>,
+    ) -> Result<DispatchRegistration<M, C>, BusError> {
+        let mut candidate = builder.clone();
+        let mut config = routing.clone();
+        config.handled::<M>()?;
+        let original = candidate.route_names::<M>()?;
+        let preview = candidate.routing_preview(&config)?;
+        let key = (M::NAME.to_owned(), M::VERSION);
+        // Reuse the existing selected-chain preflight, but expose every raw
+        // candidate to it, not just the route source that currently wins.
+        for endpoint in preview.targets.get(&key).into_iter().flatten() {
+            candidate.ensure_route::<M>(endpoint)?;
+        }
+        let registration = self.register(&mut candidate, default, store, flush)?;
+        conventionalize::<M>(&mut candidate, &mut config, &original)?;
+        let resolver = candidate.routing_preview(&config)?;
+        candidate.validate_routing(&resolver)?;
+        *builder = candidate;
+        *routing = config;
+        Ok(registration)
+    }
+}
+
+fn conventionalize<M: WireMessage>(
+    builder: &mut BusBuilder,
+    config: &mut crate::routing::RoutingConfig,
+    original: &[String],
+) -> Result<(), BusError> {
+    let key = (M::NAME.to_owned(), M::VERSION);
+    let mut receivers = BTreeSet::new();
+    for endpoint in builder.route_names::<M>()? {
+        if !matches!(builder.endpoints.get(&endpoint), Some(Endpoint::Remote(_))) {
+            if !builder.has_endpoint_handler::<M>(&endpoint)? {
+                return Err(BusError::Invalid("routed receiving target is unbound"));
+            }
+            receivers.insert(endpoint.clone());
+            config.local_route::<M>(&endpoint)?;
+        }
+    }
+    // Only pins added by this operation are reclassified. Existing exact calls,
+    // including legacy handler-created pins, retain their historical fanout.
+    if let Some(routes) = builder.routes.get_mut(&key) {
+        routes.retain(|name| original.contains(name));
+        if routes.is_empty() {
+            builder.routes.remove(&key);
+        }
+    }
+    builder.routed_receivers.insert(key, receivers);
+    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<(), BusError> {
@@ -414,6 +474,31 @@ impl BusBuilder {
             &mut owners,
         )?;
         *self = candidate;
+        Ok(owners)
+    }
+
+    /// Routed pre-built endpoint-only override. Builder, metadata, provenance and
+    /// returned receiving owners are committed together, or remain unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sticky_handler_routed<M: WireMessage, H: ScopedHandler<M>>(
+        &mut self,
+        routing: &mut crate::routing::RoutingConfig,
+        endpoint: &str,
+        handler: Arc<H>,
+        store: Store,
+        flush: Arc<dyn Flush>,
+        options: EndpointOptions<H::Error>,
+    ) -> Result<DispatchOwners, BusError> {
+        let mut candidate = self.clone();
+        let mut config = routing.clone();
+        config.handled::<M>()?;
+        let original = candidate.route_names::<M>()?;
+        let owners = candidate.sticky_handler::<M, H>(endpoint, handler, store, flush, options)?;
+        conventionalize::<M>(&mut candidate, &mut config, &original)?;
+        let resolver = candidate.routing_preview(&config)?;
+        candidate.validate_routing(&resolver)?;
+        *self = candidate;
+        *routing = config;
         Ok(owners)
     }
 }

@@ -17,6 +17,7 @@ mod policy;
 mod policy_queue;
 mod queue;
 mod request_reply;
+pub mod routing;
 pub mod scoped;
 
 pub use bus::ScopedRegistration;
