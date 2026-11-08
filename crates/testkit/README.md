@@ -10,7 +10,7 @@ it never silently makes them successful. The shared custody contract checks
 deduplication, tenant separation, and immutable-content conflicts.
 
 - [Qualification and fuzzing procedures](https://github.com/DeandreT/raddle/blob/main/docs/qualification.md)
-- [Clock and fault-script examples](https://github.com/DeandreT/raddle/blob/main/crates/raddle-testkit/tests/faults.rs)
+- [Clock and fault-script examples](https://github.com/DeandreT/raddle/blob/main/crates/testkit/tests/faults.rs)
 - [Source repository and Git dependency usage](https://github.com/DeandreT/raddle)
 
 MIT licensed. Source versions are not evidence of a registry release.

@@ -15,9 +15,9 @@ fe2o3-amqp-management = { path = "../vendor/fe2o3-amqp-management" }
 fe2o3-amqp-cbs = { path = "../vendor/fe2o3-amqp-cbs" }
 
 [dependencies]
-raddle = { path = "../crates/raddle" }
-raddle-servicebus = { path = "../crates/raddle-servicebus", features = ["emulator"] }
-raddle-postgres = { path = "../crates/raddle-postgres" }
+raddle = { path = "../crates/core" }
+raddle-servicebus = { path = "../crates/servicebus", features = ["emulator"] }
+raddle-postgres = { path = "../crates/postgres" }
 chrono = "0.4.45"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "migrate", "macros"] }
 uuid = { version = "1", features = ["v4"] }
