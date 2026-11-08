@@ -2992,6 +2992,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "raddle-messaging"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "lapin",
+ "raddle",
+ "raddle-host",
+ "raddle-postgres",
+ "raddle-rabbitmq",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "raddle-postgres"
 version = "0.1.0"
 dependencies = [

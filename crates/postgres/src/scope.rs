@@ -138,7 +138,33 @@ impl<'connection> Scope<'connection> {
         let operation = StagingOperation::new(self);
         let result = operation
             .scope
-            .stage_inner(source, tenant, envelope, deliveries)
+            .stage_inner(source, tenant, envelope, deliveries, false)
+            .await;
+        operation.finish(result)
+    }
+
+    /// Accepts already decoded canonical ingress with a retry-independent receipt
+    /// time. Existing custody retains its original `available_at`; only this
+    /// arrival-time difference is ignored. Content and all other delivery options
+    /// still have to match (timestamps at PostgreSQL precision). Use `stage` for
+    /// immutable explicit scheduling intent.
+    ///
+    /// Decrypt/validate/upcast BEFORE calling this method. Ciphertext nonces and
+    /// rotated keys must never become the durable identity fingerprint.
+    pub async fn stage_received(
+        &mut self,
+        source: &str,
+        tenant: &str,
+        envelope: &Envelope,
+        deliveries: &[Delivery],
+    ) -> Result<Vec<Uuid>, Error> {
+        if self.poisoned {
+            return Err(Error::RollbackOnly);
+        }
+        let operation = StagingOperation::new(self);
+        let result = operation
+            .scope
+            .stage_inner(source, tenant, envelope, deliveries, true)
             .await;
         operation.finish(result)
     }
@@ -149,6 +175,7 @@ impl<'connection> Scope<'connection> {
         tenant: &str,
         envelope: &Envelope,
         deliveries: &[Delivery],
+        received: bool,
     ) -> Result<Vec<Uuid>, Error> {
         if source.is_empty()
             || source.len() > 128
@@ -176,6 +203,39 @@ impl<'connection> Scope<'connection> {
         let mut added = false;
         for delivery in deliveries {
             delivery.validate()?;
+            // The tenant quota lock above serializes concurrent initial custody.
+            // Compare canonical custody only after that lock, so a concurrent
+            // nonce/key retry cannot race the first insert with another receipt time.
+            let lookup = if received {
+                "SELECT id,fingerprint,envelope,expires_at,partition_key,max_attempts FROM raddle_jobs WHERE source=$1 AND tenant=$2 AND destination=$3 AND kind=$4 AND message_id=$5"
+            } else {
+                "SELECT id,fingerprint FROM raddle_jobs WHERE source=$1 AND tenant=$2 AND destination=$3 AND kind=$4 AND message_id=$5"
+            };
+            let existing = sqlx::query(lookup)
+                .bind(source)
+                .bind(tenant)
+                .bind(&delivery.destination)
+                .bind(delivery.kind.as_str())
+                .bind(envelope.id())
+                .fetch_optional(&mut *self.transaction)
+                .await?;
+            if received && let Some(existing) = &existing {
+                // Compare canonical content directly: PostgreSQL stores receipt
+                // timestamps at microsecond precision, so rebuilding the original
+                // full fingerprint from its stored time could lose nanoseconds.
+                let expiry: Option<DateTime<Utc>> = existing.try_get("expires_at")?;
+                if existing.try_get::<Vec<u8>, _>("envelope")? != bytes
+                    || expiry.map(|time| time.timestamp_micros())
+                        != delivery.expires_at.map(|time| time.timestamp_micros())
+                    || existing.try_get::<Option<String>, _>("partition_key")?
+                        != delivery.partition_key
+                    || existing.try_get::<i32, _>("max_attempts")? != delivery.max_attempts as i32
+                {
+                    return Err(Error::IdentityConflict);
+                }
+                ids.push(existing.try_get("id")?);
+                continue;
+            }
             let mut digest = Sha256::new();
             digest.update(&bytes);
             digest.update(
@@ -190,8 +250,6 @@ impl<'connection> Scope<'connection> {
             let fingerprint = digest.finalize().to_vec();
             // Fingerprints are immutable. Reading existing custody without a
             // row lock avoids a quota-lock/inbox-lock inversion with workers.
-            let existing = sqlx::query("SELECT id,fingerprint FROM raddle_jobs WHERE source=$1 AND tenant=$2 AND destination=$3 AND kind=$4 AND message_id=$5")
-                .bind(source).bind(tenant).bind(&delivery.destination).bind(delivery.kind.as_str()).bind(envelope.id()).fetch_optional(&mut *self.transaction).await?;
             if let Some(existing) = existing {
                 if existing.try_get::<Vec<u8>, _>("fingerprint")? != fingerprint {
                     return Err(Error::IdentityConflict);

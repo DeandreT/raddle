@@ -42,6 +42,12 @@ impl Runtime {
         }
     }
 
+    /// Tests registration without acquiring admission or executing user code.
+    /// Applications can choose local-first routing without consuming a request.
+    pub fn has_request<M: Request>(&self) -> bool {
+        self.registry.requests.contains_key(&TypeId::of::<M>())
+    }
+
     /// Executes one local handler, preserving its typed reply and domain error.
     ///
     /// Waits for shared admission. Dropping the future cancels unfinished
