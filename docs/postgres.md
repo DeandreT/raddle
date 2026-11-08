@@ -54,6 +54,13 @@ attempts, so legacy workers and managed durable endpoints can share one store.
 Claims are bounded to 256 rows and use `SKIP LOCKED`. Expired claims get a new
 generation. Before business writes, execution locks and validates the original
 claim. That database lock fences recovery even when the lease time passes.
+An execution waiting for a pool connection holds no row lock and can lose its
+lease to recovery. `Worker` and `OutboxWorker` treat a per-claim `StaleClaim` as
+local ownership loss: they join healthy siblings and return normally so polling
+can continue, without completing, failing, or changing the successor's claim.
+Other errors, including database failures, still propagate after the current
+batch joins. Batch return counts are observed claims, not successful business
+executions or publications.
 Workers apply a database statement timeout as well as a Rust future timeout.
 Execution timeouts range from one millisecond through one hour; positive
 sub-millisecond timeouts are rejected rather than disabling PostgreSQL's deadline
@@ -77,6 +84,8 @@ item later is an intentional operator action, not strict historical FIFO.
 `OutboxWorker` publishes outside database transactions and marks completion only
 after broker acceptance. A crash after acceptance but before completion causes
 republishing with the same message identity. Consumers must be idempotent.
+Lease loss after publication has the same redelivery possibility; an accepted
+publication is not proof that this owner completed the outbox record.
 After its batch futures finish, `outbox.into_transport()` returns the owned
 publisher so the application can close it explicitly before closing its broker
 connection. Consuming the worker does not abandon a hidden background task.

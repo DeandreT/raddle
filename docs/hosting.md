@@ -56,6 +56,12 @@ only after their first successful database batch. An idle outbox batch does not
 probe broker health; applications needing transport-readiness checks should own
 that startup check and readiness reporting explicitly.
 
+Per-claim ownership loss does not stop either PostgreSQL poller or consume the
+host's restart budget. Healthy work in the current batch and later arrivals can
+continue even with `RestartPolicy::NEVER`. Database errors still propagate through
+the existing transient-failure classification and finite restart policy. A
+successful batch counts observed claims; it does not certify every claim completed.
+
 The [executable PostgreSQL host example](../crates/host/examples/postgres_host.rs)
 actually uses both helpers, with an explicitly confirmed disposable database.
 Its intentionally unconfigured transport returns transient failure instead of
