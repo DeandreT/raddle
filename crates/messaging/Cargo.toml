@@ -24,12 +24,12 @@ chrono.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+sqlx.workspace = true
 
 [dev-dependencies]
 raddle-tcp = { path = "../tcp", version = "0.1.0" }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde_json.workspace = true
-sqlx.workspace = true
 raddle-rabbitmq = { path = "../rabbitmq", version = "0.1.0" }
 lapin = { version = "4.12.3", default-features = false, features = ["tokio", "rustls", "rustls--ring", "rustls-webpki-roots-certs"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util", "net", "io-util"] }

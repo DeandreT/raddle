@@ -163,8 +163,8 @@ impl AttemptFailure {
 }
 
 // These errors belong to this message only after run_strict joined a successful
-// rollback. A commit/rollback error uses UncertainDatabase instead and never
-// reaches this classifier, even when its SQLSTATE denotes a constraint failure.
+// rollback, or a PostgreSQL transaction rejection with a known aborted outcome.
+// Uncertain commit/rollback completion never reaches this classifier.
 fn order_failure(error: &raddle_postgres::Error) -> bool {
     match error {
         raddle_postgres::Error::Wire(_)

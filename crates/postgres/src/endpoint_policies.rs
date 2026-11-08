@@ -11,6 +11,14 @@ use uuid::Uuid;
 
 use crate::{Claim, Error, Scope, Store};
 
+mod clock;
+use clock::EffectiveNow;
+
+enum Fence {
+    Custody,
+    Execution,
+}
+
 /// Fenced post-rollback custody disposition.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
@@ -47,22 +55,23 @@ fn until(now: DateTime<Utc>, lease: Duration) -> Result<DateTime<Utc>, Error> {
 async fn fence(
     tx: &mut Transaction<'_, Postgres>,
     claim: &Claim,
-    now: DateTime<Utc>,
+    clock: &EffectiveNow,
+    kind: Fence,
 ) -> Result<(), Error> {
-    let held: Option<Uuid> = sqlx::query_scalar("SELECT id FROM raddle_jobs WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' FOR UPDATE")
+    let held = sqlx::query("SELECT lease_until,expires_at FROM raddle_jobs WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' FOR UPDATE")
         .bind(claim.id).bind(claim.owner).bind(claim.generation).fetch_optional(&mut **tx).await?;
-    if held.is_none() {
+    let held = held.ok_or(Error::StaleClaim)?;
+    // Sample after BOTH connection admission and the actual row-lock wait. The
+    // row remains locked until settlement or the original scoped transaction ends.
+    let now = clock.current()?;
+    let lease: Option<DateTime<Utc>> = held.try_get("lease_until")?;
+    let expiry: Option<DateTime<Utc>> = held.try_get("expires_at")?;
+    if lease.is_none_or(|until| until <= now)
+        || (matches!(kind, Fence::Execution) && expiry.is_some_and(|until| until <= now))
+    {
         return Err(Error::StaleClaim);
     }
-    // Check after any row-lock wait, not only in the predicate evaluated before it.
-    let live: bool = sqlx::query_scalar(
-        "SELECT lease_until>GREATEST($2,clock_timestamp()) FROM raddle_jobs WHERE id=$1",
-    )
-    .bind(claim.id)
-    .bind(now)
-    .fetch_one(&mut **tx)
-    .await?;
-    if live { Ok(()) } else { Err(Error::StaleClaim) }
+    Ok(())
 }
 
 impl Store {
@@ -76,17 +85,20 @@ impl Store {
         lease: Duration,
         now: DateTime<Utc>,
     ) -> Result<Vec<Claim>, Error> {
+        let clock = EffectiveNow::new(now);
         raddle::SubscriptionName::try_new(destination)
             .map_err(|_| Error::Invalid("invalid policy endpoint"))?;
         if !(1..=256).contains(&limit) {
             return Err(Error::Invalid("invalid policy batch"));
         }
-        let lease_until = until(now, lease)?;
+        until(now, lease)?;
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO raddle_endpoint_policy_pauses(destination,paused_until) VALUES($1,$2) ON CONFLICT DO NOTHING")
             .bind(destination).bind(now).execute(&mut *tx).await?;
         let paused: DateTime<Utc> = sqlx::query_scalar("SELECT paused_until FROM raddle_endpoint_policy_pauses WHERE destination=$1 FOR UPDATE")
             .bind(destination).fetch_one(&mut *tx).await?;
+        let now = clock.current()?;
+        let lease_until = until(now, lease)?;
         if paused > now {
             return Ok(Vec::new());
         }
@@ -119,16 +131,21 @@ impl Store {
     /// Renews only an unexpired matching lease; a stale owner cannot resurrect
     /// itself. Returns a 1-based count retained across requeue and operator replay.
     /// A crash between this call and handler entry can conservatively consume a slot.
+    /// Both lease and message expiry use caller time plus monotonic admission
+    /// elapsed time, including connection-pool and row-lock waits.
     pub async fn begin_policy_attempt(
         &self,
         claim: &Claim,
         lease: Duration,
         now: DateTime<Utc>,
     ) -> Result<u64, Error> {
-        let lease_until = until(now, lease)?;
+        let clock = EffectiveNow::new(now);
+        until(now, lease)?;
         let mut tx = self.pool.begin().await?;
-        fence(&mut tx, claim, now).await?;
-        let changed = sqlx::query("UPDATE raddle_jobs SET lease_until=$5,attempts=LEAST(attempts::bigint+1,2147483647)::integer WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until>GREATEST($4,clock_timestamp()) AND (expires_at IS NULL OR expires_at>GREATEST($4,clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM raddle_policy_attempts p WHERE p.job_id=raddle_jobs.id AND p.uncertain)")
+        fence(&mut tx, claim, &clock, Fence::Execution).await?;
+        let now = clock.current()?;
+        let lease_until = until(now, lease)?;
+        let changed = sqlx::query("UPDATE raddle_jobs SET lease_until=$5,attempts=LEAST(attempts::bigint+1,2147483647)::integer WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until>$4 AND (expires_at IS NULL OR expires_at>$4) AND NOT EXISTS (SELECT 1 FROM raddle_policy_attempts p WHERE p.job_id=raddle_jobs.id AND p.uncertain)")
             .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(now).bind(lease_until).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(Error::StaleClaim);
@@ -141,16 +158,17 @@ impl Store {
         Ok(count as u64)
     }
 
-    /// Acquires the original scoped transaction with a database-clock expiry
-    /// fence after pool admission. Waiting for a connection must not admit an
-    /// execution whose lease expired while it was waiting.
+    /// Acquires the original scoped transaction after checking lease AND message
+    /// expiry. Caller time advances by monotonic elapsed time through pool and
+    /// row-lock waits, before any scope or business execution is exposed.
     pub async fn policy_execution(
         &self,
         claim: &Claim,
         now: DateTime<Utc>,
     ) -> Result<Scope<'static>, Error> {
+        let clock = EffectiveNow::new(now);
         let mut tx = self.pool.begin().await?;
-        fence(&mut tx, claim, now).await?;
+        fence(&mut tx, claim, &clock, Fence::Execution).await?;
         Ok(Scope::enroll(tx).with_claim(claim.clone()))
     }
 
@@ -158,11 +176,12 @@ impl Store {
     /// scoped attempt has joined a successful rollback and its cleanup. A stale
     /// owner cannot authorize retry by a successor.
     pub async fn policy_rolled_back(&self, claim: &Claim, now: DateTime<Utc>) -> Result<(), Error> {
+        let clock = EffectiveNow::new(now);
         let mut tx = self.pool.begin().await?;
-        fence(&mut tx, claim, now).await?;
-        let changed = sqlx::query("UPDATE raddle_policy_attempts SET uncertain=false WHERE job_id=$1 AND EXISTS(SELECT 1 FROM raddle_jobs j WHERE j.id=$1 AND j.lease_until>GREATEST($2,clock_timestamp()))")
+        fence(&mut tx, claim, &clock, Fence::Custody).await?;
+        let changed = sqlx::query("UPDATE raddle_policy_attempts SET uncertain=false WHERE job_id=$1 AND EXISTS(SELECT 1 FROM raddle_jobs j WHERE j.id=$1 AND j.lease_until>$2)")
             .bind(claim.id)
-            .bind(now)
+            .bind(clock.current()?)
             .execute(&mut *tx)
             .await?;
         if changed.rows_affected() != 1 {
@@ -180,6 +199,7 @@ impl Store {
         settlement: PolicySettlement,
         now: DateTime<Utc>,
     ) -> Result<(), Error> {
+        let clock = EffectiveNow::new(now);
         let (status, due, code, tail) = match settlement {
             PolicySettlement::QueueAt(due) => ("ready", due, "policy-retry", true),
             PolicySettlement::Discard => ("completed", now, "policy-discard", false),
@@ -187,8 +207,9 @@ impl Store {
             PolicySettlement::ReplayDenied => ("dead", now, "policy-replay-denied", false),
         };
         let mut tx = self.pool.begin().await?;
-        fence(&mut tx, claim, now).await?;
-        let changed = sqlx::query("UPDATE raddle_jobs SET status=$4,available_at=$5,last_error=$6,sequence=CASE WHEN $7 THEN nextval('raddle_jobs_sequence_seq') ELSE sequence END,completed_at=CASE WHEN $4='completed' THEN $8 ELSE NULL END,owner=NULL,lease_until=NULL WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until>GREATEST($8,clock_timestamp())")
+        fence(&mut tx, claim, &clock, Fence::Custody).await?;
+        let now = clock.current()?;
+        let changed = sqlx::query("UPDATE raddle_jobs SET status=$4,available_at=$5,last_error=$6,sequence=CASE WHEN $7 THEN nextval('raddle_jobs_sequence_seq') ELSE sequence END,completed_at=CASE WHEN $4='completed' THEN $8 ELSE NULL END,owner=NULL,lease_until=NULL WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until>$8")
             .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(status).bind(due).bind(code).bind(tail).bind(now)
             .execute(&mut *tx).await?;
         if changed.rows_affected() == 1 {
@@ -213,6 +234,7 @@ impl Store {
         paused_until: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<(), Error> {
+        let clock = EffectiveNow::new(now);
         let mut tx = self.pool.begin().await?;
         // Match claim_policy_for's pause-row -> job-row lock order.
         sqlx::query(
@@ -221,9 +243,9 @@ impl Store {
         .bind(&claim.destination)
         .execute(&mut *tx)
         .await?;
-        fence(&mut tx, claim, now).await?;
-        let changed = sqlx::query("INSERT INTO raddle_endpoint_policy_pauses(destination,paused_until) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM raddle_jobs WHERE id=$3 AND lease_until>GREATEST($4,clock_timestamp())) ON CONFLICT(destination) DO UPDATE SET paused_until=GREATEST(raddle_endpoint_policy_pauses.paused_until,excluded.paused_until)")
-            .bind(&claim.destination).bind(paused_until).bind(claim.id).bind(now).execute(&mut *tx).await?;
+        fence(&mut tx, claim, &clock, Fence::Custody).await?;
+        let changed = sqlx::query("INSERT INTO raddle_endpoint_policy_pauses(destination,paused_until) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM raddle_jobs WHERE id=$3 AND lease_until>$4) ON CONFLICT(destination) DO UPDATE SET paused_until=GREATEST(raddle_endpoint_policy_pauses.paused_until,excluded.paused_until)")
+            .bind(&claim.destination).bind(paused_until).bind(claim.id).bind(clock.current()?).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(Error::StaleClaim);
         }

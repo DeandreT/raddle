@@ -24,6 +24,11 @@ use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
+#[path = "durable_policies/commit_rejection.rs"]
+mod commit_rejection;
+#[path = "durable_policies/policy_clock.rs"]
+mod policy_clock;
+
 #[derive(Serialize, Deserialize)]
 struct Work(i32);
 impl WireMessage for Work {
@@ -49,6 +54,8 @@ struct Handler {
     outgoing: bool,
     terminate_backend: bool,
     invalid_outgoing: Option<i32>,
+    commit_rejections: AtomicUsize,
+    uncertain_completions: AtomicUsize,
 }
 impl Handler {
     fn new(failed: i32) -> Self {
@@ -67,6 +74,8 @@ impl Handler {
             outgoing: false,
             terminate_backend: false,
             invalid_outgoing: None,
+            commit_rejections: AtomicUsize::new(0),
+            uncertain_completions: AtomicUsize::new(0),
         }
     }
 }
@@ -127,7 +136,10 @@ impl ScopedHandler<Work> for Handler {
                     .await;
                 return Err(TypedFailure);
             }
-            if self.duplicate_at_commit && work.0 == 42 {
+            if self.duplicate_at_commit
+                && work.0 == self.failed
+                && !self.corrected.load(Ordering::SeqCst)
+            {
                 sqlx::query("INSERT INTO business(id) VALUES($1)")
                     .bind(work.0)
                     .execute(scope.connection())
@@ -138,7 +150,10 @@ impl ScopedHandler<Work> for Handler {
             if self.block && !self.corrected.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
-            if work.0 == self.failed && !self.corrected.load(Ordering::SeqCst) {
+            if !self.duplicate_at_commit
+                && work.0 == self.failed
+                && !self.corrected.load(Ordering::SeqCst)
+            {
                 Err(TypedFailure)
             } else {
                 let mut output = HandlerOutput::reply(());
@@ -168,11 +183,23 @@ impl ScopedHandler<Work> for Handler {
     }
     fn on_exception<'a>(
         &'a self,
-        _: &'a Failure<TypedFailure>,
+        error: &'a Failure<TypedFailure>,
         _: &'a mut (),
         _: &'a MessageContext,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            match error {
+                Failure::Database(raddle_postgres::Error::Database(sqlx::Error::Database(
+                    error,
+                ))) => {
+                    assert_eq!(error.code().as_deref(), Some("23505"));
+                    self.commit_rejections.fetch_add(1, Ordering::SeqCst);
+                }
+                Failure::UncertainDatabase(_) => {
+                    self.uncertain_completions.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
             self.exceptions.fetch_add(1, Ordering::SeqCst);
             self.trace.lock().await.push("exception");
         })
@@ -511,14 +538,15 @@ async fn real_host_shutdown_joins_rollback_finally_and_does_not_trip_circuit(poo
 
 #[sqlx::test(migrations = "../postgres/migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-async fn commit_failure_retains_custody_reports_infrastructure_after_healthy_siblings(
+async fn commit_io_failure_retains_custody_reports_infrastructure_after_healthy_siblings(
     pool: PgPool,
 ) {
     schema(&pool).await;
     let store = Store::new(pool.clone());
-    let mut h = Handler::new(-1);
-    h.duplicate_at_commit = true;
-    let handler = Arc::new(h);
+    // A deferred trigger closes only this test transaction's own connection
+    // while COMMIT is in flight, rather than a deterministic integrity rejection.
+    sqlx::raw_sql("CREATE FUNCTION lose_commit_connection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id=42 THEN PERFORM pg_terminate_backend(pg_backend_pid()); END IF; RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER lose_commit_connection AFTER INSERT ON business DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION lose_commit_connection();").execute(&pool).await.unwrap();
+    let handler = Arc::new(Handler::new(-1));
     let endpoint = endpoint(
         &store,
         "uncertain",
@@ -541,6 +569,8 @@ async fn commit_failure_retains_custody_reports_infrastructure_after_healthy_sib
     assert_eq!(handler.calls.load(Ordering::SeqCst), 3);
     assert_eq!(handler.finalized.load(Ordering::SeqCst), 3);
     assert_eq!(handler.disposed.load(Ordering::SeqCst), 3);
+    assert_eq!(handler.uncertain_completions.load(Ordering::SeqCst), 1);
+    assert_eq!(handler.commit_rejections.load(Ordering::SeqCst), 0);
     assert_eq!(
         store
             .inspect("tenant", first)
@@ -799,7 +829,7 @@ async fn refused_replay_and_lost_terminal_transition_never_open_automatic_retry_
 
 #[sqlx::test(migrations = "../postgres/migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-async fn policy_settlement_rechecks_database_clock_after_row_lock_wait(pool: PgPool) {
+async fn policy_settlement_rechecks_elapsed_caller_clock_after_row_lock_wait(pool: PgPool) {
     let store = Store::new(pool.clone());
     let id = stage(&store, "expiry", 1).await;
     let now = Utc::now();
@@ -832,7 +862,7 @@ async fn policy_settlement_rechecks_database_clock_after_row_lock_wait(pool: PgP
             .await
     });
     tokio::time::timeout(Duration::from_secs(5), async { loop {
-        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT id FROM raddle_jobs%FOR UPDATE')").fetch_one(&pool).await.unwrap();
+        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT lease_until,expires_at FROM raddle_jobs%FOR UPDATE')").fetch_one(&pool).await.unwrap();
         if waiting { break; } tokio::task::yield_now().await;
     }}).await.unwrap();
     sqlx::query("SELECT pg_sleep(3.1)")
@@ -852,7 +882,7 @@ async fn policy_settlement_rechecks_database_clock_after_row_lock_wait(pool: PgP
 
 #[sqlx::test(migrations = "../postgres/migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-async fn policy_execution_rechecks_database_clock_after_pool_wait(pool: PgPool) {
+async fn policy_execution_rechecks_elapsed_caller_clock_after_pool_wait(pool: PgPool) {
     let store = Store::new(pool.clone());
     let id = stage(&store, "pool-expiry", 1).await;
     let single = sqlx::postgres::PgPoolOptions::new()

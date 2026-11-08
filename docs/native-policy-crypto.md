@@ -226,8 +226,14 @@ Concrete `H::Error` values reach policy filters directly. Other scoped failures
 retain their typed `Failure<H::Error>` classification. Every attempt constructs
 fresh resources and runs the original pipeline, including cleanup. Post-commit
 flush/callback/cleanup errors remain committed successes and never replay a parent.
-Strict execution tags commit/rollback failures as `UncertainDatabase`, which
-bypasses handler recovery. After a successful pre-commit rollback, invalid
+Strict execution distinguishes a PostgreSQL transaction rejection from uncertain
+completion. A server `ERROR` with integrity SQLSTATE class `23`, serialization
+failure `40001`, or deadlock `40P01` from the fenced completion/COMMIT path cannot
+have committed the root. It remains an order-local `Failure::Database`, allowing
+policy disposition without terminating the receiving service. Other commit
+errors, including connection loss and statement-completion-unknown `40003`, and
+all failed rollback attempts use `UncertainDatabase` and bypass handler recovery.
+After a successful pre-commit rollback, invalid
 returned intent, identity conflict, capacity refusal and SQL data/integrity/
 transaction-rollback errors remain order-local policy failures. Genuine backend
 or schema failures still propagate as infrastructure errors; one malformed
@@ -256,7 +262,8 @@ does not authorize repeating external effects, OnException or cleanup effects.
 `Never` refuses recovery rather than replaying an arbitrary operation. Sending-only
 `AtLeastOnceSend` is rejected when registering a handling endpoint. Durable
 attempt entry records a conservative uncertainty marker before business work;
-only joined, successful rollback authorizes ordinary retry. Commit/rollback I/O
+only a proven failed transaction (joined rollback or known server rejection)
+authorizes policy recovery, still subject to explicit replay safety. Commit/rollback I/O
 failure or a crash during an attempt leaves recovery blocked, even after lease
 expiry. An operator must reconcile and explicitly call the tenant-scoped audited
 `Store::recover_policy_uncertain` with `PolicyRecovery` before retrying. This is
@@ -270,6 +277,17 @@ signal or healthy siblings. The owner cannot extend an expired lease or clear a
 successor's uncertainty marker. Database failures propagate after the already
 claimed healthy siblings finish. A locally uncertain in-memory scoped attempt is
 retained Interrupted and causes its Host service to fail rather than retrying.
+
+Policy custody operations preserve the supplied caller clock and advance it by
+monotonic elapsed time from method entry through connection-pool and row-lock
+waits. They do not substitute the database wall clock or take the maximum of two
+unrelated clock domains. Comparisons use PostgreSQL microsecond precision.
+Attempt admission and `policy_execution` check both the live lease and the whole
+message's `Delivery::expires_at` after actual waits, before exposing a scope for
+business work. Expired input is not acknowledged as success: custody remains
+recoverable or is quarantined by normal expiry handling. Settlement may still
+dispose of an expired message under a live claim; it never authorizes new business
+execution after message expiry.
 
 Both queue owners support independent `UnknownMessageHandler` configuration.
 Unknown input defaults to discard and runs missing-handler observers, bypassing

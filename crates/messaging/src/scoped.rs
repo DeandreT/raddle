@@ -326,7 +326,7 @@ where
                         post_commit,
                     })
                 }
-                Err(error) => Err(if strict_rollback {
+                Err(error) => Err(if strict_rollback && !known_commit_rejection(&error) {
                     Failure::UncertainDatabase(error)
                 } else {
                     Failure::Database(error)
@@ -371,6 +371,23 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+// PostgreSQL ERROR responses for these SQLSTATEs reject the transaction: a
+// deferred integrity check or serialization/deadlock abort cannot commit any
+// root writes. Scope::commit issues only its fenced completion UPDATE and COMMIT;
+// neither path can report these errors after a successful COMMIT. Do not infer
+// this from text or a generic driver error (notably 40003 means outcome unknown).
+fn known_commit_rejection(error: &raddle_postgres::Error) -> bool {
+    let raddle_postgres::Error::Database(sqlx::Error::Database(error)) = error else {
+        return false;
+    };
+    error
+        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+        .is_some_and(|error| {
+            error.severity() == sqlx::postgres::PgSeverity::Error
+                && (error.code().starts_with("23") || matches!(error.code(), "40001" | "40P01"))
+        })
 }
 
 async fn bounded<T, E: StdError + 'static>(
