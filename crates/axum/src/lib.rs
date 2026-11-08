@@ -7,6 +7,7 @@ mod caching;
 mod error;
 mod health;
 mod limits;
+pub mod native;
 mod specification;
 mod streaming;
 

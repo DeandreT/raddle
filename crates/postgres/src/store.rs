@@ -82,6 +82,44 @@ impl Store {
         lease: Duration,
         now: DateTime<Utc>,
     ) -> Result<Vec<Claim>, Error> {
+        self.claim_inner(kind, None, limit, lease, now).await
+    }
+
+    /// Claims only one named endpoint. Other queues' leases and retry state are
+    /// untouched, including their expiry sweep. This separates endpoint admission.
+    pub async fn claim_for(
+        &self,
+        kind: DeliveryKind,
+        destination: &str,
+        limit: u32,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Claim>, Error> {
+        raddle::SubscriptionName::try_new(destination)
+            .map_err(|_| Error::Invalid("invalid destination alias"))?;
+        self.claim_inner(kind, Some(&[destination]), limit, lease, now)
+            .await
+    }
+
+    pub(crate) async fn claim_registered(
+        &self,
+        destinations: &[&str],
+        limit: u32,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Claim>, Error> {
+        self.claim_inner(DeliveryKind::Local, Some(destinations), limit, lease, now)
+            .await
+    }
+
+    async fn claim_inner(
+        &self,
+        kind: DeliveryKind,
+        destinations: Option<&[&str]>,
+        limit: u32,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Claim>, Error> {
         if !(1..=256).contains(&limit)
             || !(Duration::from_millis(1)..=Duration::from_secs(7200)).contains(&lease)
         {
@@ -93,11 +131,11 @@ impl Store {
             )
             .ok_or(Error::Invalid("lease timestamp overflow"))?;
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("WITH expired AS (SELECT id FROM raddle_jobs WHERE kind=$1 AND (expires_at <= $2 OR attempts >= max_attempts) AND (status='ready' OR (status='active' AND lease_until <= $2)) FOR UPDATE SKIP LOCKED) UPDATE raddle_jobs j SET status='dead',last_error=CASE WHEN j.expires_at <= $2 THEN 'expired' ELSE 'attempts-exhausted' END,owner=NULL,lease_until=NULL FROM expired e WHERE j.id=e.id")
-            .bind(kind.as_str()).bind(now).execute(&mut *transaction).await?;
+        sqlx::query("WITH expired AS (SELECT id FROM raddle_jobs WHERE kind=$1 AND ($3::text[] IS NULL OR destination=ANY($3)) AND (expires_at <= $2 OR attempts >= max_attempts) AND (status='ready' OR (status='active' AND lease_until <= $2)) FOR UPDATE SKIP LOCKED) UPDATE raddle_jobs j SET status='dead',last_error=CASE WHEN j.expires_at <= $2 THEN 'expired' ELSE 'attempts-exhausted' END,owner=NULL,lease_until=NULL FROM expired e WHERE j.id=e.id")
+            .bind(kind.as_str()).bind(now).bind(destinations).execute(&mut *transaction).await?;
         let rows = sqlx::query(
-            "WITH candidates AS (SELECT j.id FROM raddle_jobs j WHERE j.kind=$1 AND j.available_at <= $2 AND j.attempts < j.max_attempts AND (j.expires_at IS NULL OR j.expires_at > $2) AND (j.status='ready' OR (j.status='active' AND j.lease_until <= $2)) AND NOT EXISTS (SELECT 1 FROM raddle_jobs previous WHERE j.partition_key IS NOT NULL AND previous.tenant=j.tenant AND previous.kind=j.kind AND previous.destination=j.destination AND previous.partition_key=j.partition_key AND previous.sequence < j.sequence AND previous.status NOT IN ('completed','dead')) ORDER BY j.sequence LIMIT $3 FOR UPDATE OF j SKIP LOCKED) UPDATE raddle_jobs j SET status='active',owner=$4,lease_until=$5,generation=generation+1,attempts=attempts+1 FROM candidates c WHERE j.id=c.id RETURNING j.id,j.owner,j.generation,j.envelope,j.tenant,j.destination,j.attempts,j.max_attempts"
-        ).bind(kind.as_str()).bind(now).bind(i64::from(limit)).bind(Uuid::new_v4()).bind(until).fetch_all(&mut *transaction).await?;
+            "WITH candidates AS (SELECT j.id FROM raddle_jobs j WHERE j.kind=$1 AND ($6::text[] IS NULL OR j.destination=ANY($6)) AND j.available_at <= $2 AND j.attempts < j.max_attempts AND (j.expires_at IS NULL OR j.expires_at > $2) AND (j.status='ready' OR (j.status='active' AND j.lease_until <= $2)) AND NOT EXISTS (SELECT 1 FROM raddle_jobs previous WHERE j.partition_key IS NOT NULL AND previous.tenant=j.tenant AND previous.kind=j.kind AND previous.destination=j.destination AND previous.partition_key=j.partition_key AND previous.sequence < j.sequence AND previous.status NOT IN ('completed','dead')) ORDER BY j.sequence LIMIT $3 FOR UPDATE OF j SKIP LOCKED) UPDATE raddle_jobs j SET status='active',owner=$4,lease_until=$5,generation=generation+1,attempts=attempts+1 FROM candidates c WHERE j.id=c.id RETURNING j.id,j.owner,j.generation,j.envelope,j.source,j.tenant,j.destination,j.attempts,j.max_attempts"
+        ).bind(kind.as_str()).bind(now).bind(i64::from(limit)).bind(Uuid::new_v4()).bind(until).bind(destinations).fetch_all(&mut *transaction).await?;
         let claims = rows
             .into_iter()
             .map(|row| {
@@ -107,6 +145,7 @@ impl Store {
                     generation: row.try_get("generation")?,
                     envelope: row.try_get("envelope")?,
                     tenant: row.try_get("tenant")?,
+                    source: row.try_get("source")?,
                     destination: row.try_get("destination")?,
                     attempts: row.try_get("attempts")?,
                     max_attempts: row.try_get("max_attempts")?,
@@ -145,6 +184,7 @@ impl Store {
     }
 
     /// Records a classified failure or reschedules with deterministic bounded jitter.
+    /// An expired lease cannot settle or release work, even before its next takeover.
     pub async fn fail(
         &self,
         claim: &Claim,
@@ -164,8 +204,8 @@ impl Store {
             )
             .ok_or(Error::Invalid("retry timestamp overflow"))?
         };
-        let changed = sqlx::query("UPDATE raddle_jobs SET status=$4,available_at=$5,owner=NULL,lease_until=NULL,last_error=$6 WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active'")
-            .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(if terminal { "dead" } else { "ready" }).bind(due).bind(code).execute(&self.pool).await?;
+        let changed = sqlx::query("UPDATE raddle_jobs SET status=$4,available_at=$5,owner=NULL,lease_until=NULL,last_error=$6 WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until > $7")
+            .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(if terminal { "dead" } else { "ready" }).bind(due).bind(code).bind(now).execute(&self.pool).await?;
         if changed.rows_affected() == 1 {
             Ok(())
         } else {

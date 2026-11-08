@@ -119,6 +119,7 @@ pub struct Claim {
     pub(crate) generation: i64,
     pub(crate) envelope: Vec<u8>,
     pub(crate) tenant: String,
+    pub(crate) source: String,
     pub(crate) destination: String,
     pub(crate) attempts: i32,
     pub(crate) max_attempts: i32,
@@ -142,6 +143,10 @@ impl Claim {
     /// Authenticated tenant supplied at custody, never inferred from envelope headers.
     pub fn tenant(&self) -> &str {
         &self.tenant
+    }
+    /// Authenticated source recorded when custody was accepted.
+    pub fn source(&self) -> &str {
+        &self.source
     }
     /// Resolved destination alias.
     pub fn destination(&self) -> &str {
