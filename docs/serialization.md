@@ -68,6 +68,19 @@ after decoding/projection. Crypto key/nonce rotation likewise must return canoni
 plaintext before custody; codec registration does not silently compose encryption
 with serialization. Applications choose that order through `IngressDecoder`.
 
+### Framework request/reply boundary
+
+Application-body registrations do not automatically register the private framework
+reply wrapper used by `RemoteResponder` and `ReplyHubInvoker`. Selecting a body
+profile on that reply publisher can reject the wrapper after the handler has run.
+Configure the existing JSON-based reply path separately, with its normal trusted
+ingress and decryption policy where required; reject an unsupported selected-body
+reply-publisher configuration during application startup.
+
+Selected request-body TCP handling does not establish selected application-reply
+serialization through the framework wrapper. The bare TCP request/reply hooks and
+the framework's correlated reply protocol are different composition boundaries.
+
 ### Encryption composition is explicitly unsupported
 
 The selected-body profile is **plaintext only**. Existing `EncryptionCodec` v2
