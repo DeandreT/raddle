@@ -221,6 +221,304 @@ async fn invalid_first_middle_last_preserve_success_and_confirm_dlq_before_ack()
 }
 
 #[tokio::test]
+#[ignore = "requires disposable real Redis 8.2+ fixture"]
+async fn oversized_dlq_first_middle_last_preserves_custody_and_healthy_work() {
+    let mut raw = peer().await;
+    for acknowledgement in [AckMode::Retain, AckMode::DeleteWhenAcknowledged] {
+        for failed_index in 0..3 {
+            let prefix = format!("{{t{}}}", uuid::Uuid::new_v4().simple());
+            let stream = format!("{prefix}:orders");
+            let dlq = format!("{prefix}:dead");
+            let mut limits = config();
+            limits.acknowledgement = acknowledgement;
+            limits.envelope.max_bytes = 1024;
+            let routes = vec![
+                route("orders", &stream),
+                route("same", &stream),
+                route("dead", &dlq),
+            ];
+            let bus = Broker::connect(
+                &std::env::var("RADDLE_REDIS_URL").unwrap(),
+                limits.clone(),
+                routes.clone(),
+            )
+            .await
+            .unwrap();
+            let mut receiver = bus
+                .receiver(
+                    "orders",
+                    "workers",
+                    source(),
+                    Ownership::Owned,
+                    GroupStart::Beginning,
+                )
+                .await
+                .unwrap();
+            let messages: Vec<_> = (0..3)
+                .map(|i| Envelope::encode(&Order(i)).unwrap())
+                .collect();
+            let oversized = vec![b'x'; 2048];
+            let mut failed_id = String::new();
+            for (index, message) in messages.iter().enumerate() {
+                if index == failed_index {
+                    failed_id = redis::cmd("XADD")
+                        .arg(&stream)
+                        .arg("*")
+                        .arg("body")
+                        .arg(&oversized)
+                        .query_async(&mut raw)
+                        .await
+                        .unwrap();
+                } else {
+                    bus.send("orders", message).await.unwrap();
+                }
+            }
+            let received = receiver
+                .receive(3, Duration::from_secs(2), Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(received.len(), 3);
+            let mut failed = None;
+            let mut success = Vec::new();
+            for mut held in received {
+                assert_eq!(held.source(), &source());
+                if held.id() == failed_id {
+                    assert!(held.body().is_err());
+                    assert!(held.decode().is_err());
+                    for (alias, reason, error) in [
+                        ("unknown", "oversize", "DLQ alias"),
+                        ("same", "oversize", "DLQ must differ from source"),
+                        ("dead", "bad reason", "name"),
+                        ("dead", "oversize", "DLQ body limit"),
+                    ] {
+                        assert!(matches!(held.dead_letter(alias, reason).await,
+                            Err(Error::Invalid(actual)) if actual == error));
+                        held.progress().await.unwrap();
+                    }
+                    failed = Some(held);
+                } else {
+                    success.push(held.decode().unwrap().id());
+                    held.complete().await.unwrap();
+                }
+            }
+            let mut failed = failed.unwrap();
+            assert_eq!(success.len(), 2);
+            let pending = receiver.pending(8).await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, failed_id);
+            assert_eq!(pending[0].owner, receiver.consumer_id());
+            assert_eq!(pending[0].deliveries, failed.attempt());
+            let length: usize = redis::cmd("XLEN")
+                .arg(&dlq)
+                .query_async(&mut raw)
+                .await
+                .unwrap();
+            assert_eq!(length, 0, "preflight failure must not publish a DLQ copy");
+
+            // New work continues even while the failed receipt still owns its permit.
+            let later = Envelope::encode(&Order(3)).unwrap();
+            bus.send("orders", &later).await.unwrap();
+            let mut healthy = receiver
+                .receive(1, Duration::from_secs(2), Duration::from_secs(60))
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(healthy.decode().unwrap().id(), later.id());
+            healthy.complete().await.unwrap();
+            success.push(later.id());
+            failed.progress().await.unwrap();
+
+            // Explicit operator disposition: after inspection, permit this known
+            // 2048-byte raw body on a separate receiver for retained-copy custody.
+            // This does not silently raise the ordinary listener's envelope bound.
+            limits.envelope.max_bytes = oversized.len();
+            let operator =
+                Broker::connect(&std::env::var("RADDLE_REDIS_URL").unwrap(), limits, routes)
+                    .await
+                    .unwrap();
+            let mut recovery = operator
+                .receiver(
+                    "orders",
+                    "workers",
+                    source(),
+                    Ownership::External,
+                    GroupStart::Beginning,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let mut reclaimed = recovery
+                .receive(1, Duration::from_secs(2), Duration::from_millis(1))
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(reclaimed.id(), failed_id);
+            assert!(reclaimed.attempt() > failed.attempt());
+            assert!(matches!(failed.progress().await, Err(Error::Lost)));
+            assert_eq!(reclaimed.body().unwrap(), oversized);
+            let copy = reclaimed
+                .dead_letter("dead", "operator-reviewed")
+                .await
+                .unwrap();
+            assert!(matches!(failed.complete().await, Err(Error::Lost)));
+            let retained: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+                .arg(&dlq)
+                .arg(&copy)
+                .arg(&copy)
+                .query_async(&mut raw)
+                .await
+                .unwrap();
+            assert_eq!(retained.ids.len(), 1);
+            let entry = &retained.ids[0];
+            assert_eq!(entry.map.len(), 5);
+            assert_eq!(entry.get::<Vec<u8>>("body").unwrap(), oversized);
+            assert_eq!(entry.get::<String>("source-stream").unwrap(), stream);
+            assert_eq!(entry.get::<String>("source-id").unwrap(), failed_id);
+            assert_eq!(entry.get::<usize>("attempt").unwrap(), reclaimed.attempt());
+            assert_eq!(entry.get::<String>("reason").unwrap(), "operator-reviewed");
+            assert!(recovery.pending(8).await.unwrap().is_empty());
+
+            bus.send("orders", &messages[failed_index]).await.unwrap();
+            let mut corrected = receiver
+                .receive(1, Duration::from_secs(2), Duration::from_secs(60))
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let id = corrected.decode().unwrap().id();
+            assert_eq!(id, messages[failed_index].id());
+            assert!(!success.contains(&id));
+            corrected.complete().await.unwrap();
+            assert!(receiver.pending(8).await.unwrap().is_empty());
+            assert!(
+                receiver
+                    .receive(1, Duration::from_millis(100), Duration::from_secs(60))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable real Redis fixture"]
+async fn dlq_retains_raw_body_without_relaxing_decode_metadata_limits() {
+    let prefix = format!("{{t{}}}", uuid::Uuid::new_v4().simple());
+    let stream = format!("{prefix}:orders");
+    let dlq = format!("{prefix}:dead");
+    let mut limits = config();
+    limits.envelope.max_bytes = 1024;
+    limits.envelope.max_headers = 0;
+    let bus = Broker::connect(
+        &std::env::var("RADDLE_REDIS_URL").unwrap(),
+        limits,
+        vec![route("orders", &stream), route("dead", &dlq)],
+    )
+    .await
+    .unwrap();
+    let clients =
+        raddle_redis::Clients::new(vec![("fixture".into(), "trusted".into(), bus.clone())])
+            .unwrap();
+    assert!(clients.get("fixture", "trusted").is_ok());
+    assert!(matches!(
+        clients.get("fixture", "untrusted"),
+        Err(Error::Invalid("unknown tenant/client"))
+    ));
+    assert!(matches!(
+        raddle_redis::Clients::new(vec![])
+            .unwrap()
+            .get("fixture", "trusted"),
+        Err(Error::Invalid("unknown tenant/client"))
+    ));
+    let mut raw = peer().await;
+    let mut receiver = bus
+        .receiver(
+            "orders",
+            "workers",
+            source(),
+            Ownership::Owned,
+            GroupStart::Beginning,
+        )
+        .await
+        .unwrap();
+    let untrusted_headers = Envelope::encode(&Order(1))
+        .unwrap()
+        .with_header("tenant".into(), "untrusted".into())
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    for (body, metadata) in [
+        (vec![], vec![b'x'; 2049]),
+        (vec![0xff; 1024], vec![b'x'; 2049]),
+        (untrusted_headers, b"valid".to_vec()),
+    ] {
+        let id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("body")
+            .arg(&body)
+            .arg("metadata")
+            .arg(&metadata)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        let mut held = receiver
+            .receive(1, Duration::from_secs(2), Duration::from_secs(60))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(held.id(), id);
+        if metadata.len() > 2048 {
+            assert!(held.body().is_err());
+        } else {
+            assert_eq!(held.body().unwrap(), body);
+        }
+        assert!(held.decode().is_err());
+        assert_eq!(held.source(), &source());
+        let copy = held.dead_letter("dead", "invalid-metadata").await.unwrap();
+        let retained: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+            .arg(&dlq)
+            .arg(&copy)
+            .arg(&copy)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert_eq!(retained.ids[0].get::<Vec<u8>>("body").unwrap(), body);
+        assert!(receiver.pending(8).await.unwrap().is_empty());
+    }
+    let _: String = redis::cmd("XADD")
+        .arg(&stream)
+        .arg("*")
+        .arg("not-body")
+        .arg("invalid")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let mut missing = receiver
+        .receive(1, Duration::from_secs(2), Duration::from_secs(60))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(matches!(
+        missing.dead_letter("dead", "missing-body").await,
+        Err(Error::Invalid("missing body"))
+    ));
+    missing.progress().await.unwrap();
+    assert_eq!(receiver.pending(8).await.unwrap().len(), 1);
+    let length: usize = redis::cmd("XLEN")
+        .arg(&dlq)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(length, 3, "missing body never creates another copy");
+}
+
+#[tokio::test]
 #[ignore = "requires disposable real Redis fixture"]
 async fn scheduler_bad_target_first_middle_last_retains_only_failures() {
     let mut raw = peer().await;
@@ -412,12 +710,10 @@ async fn failed_dlq_pending_entry_does_not_starve_new_one_member_pages() {
         .pop()
         .unwrap();
     assert!(failed.decode().is_err());
-    assert!(
-        failed
-            .dead_letter("dead", "invalid-envelope")
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        failed.dead_letter("dead", "invalid-envelope").await,
+        Err(Error::Uncertain)
+    ));
     drop(failed);
     let valid_a = Envelope::encode(&Order(2)).unwrap();
     let valid_b = Envelope::encode(&Order(3)).unwrap();
