@@ -238,8 +238,20 @@ impl OutputCache {
             || response.headers().contains_key(header::SET_COOKIE)
             || response
                 .headers()
-                .get(header::CACHE_CONTROL)
-                .is_some_and(|v| v.to_str().is_ok_and(|v| v.contains("no-store")))
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .any(|value| {
+                    // Directive names are tokens, not case-sensitive substrings.
+                    // Unreadable controls conservatively bypass storage as well.
+                    value.to_str().map_or(true, |value| {
+                        value.split(',').any(|directive| {
+                            directive
+                                .split('=')
+                                .next()
+                                .is_some_and(|name| name.trim().eq_ignore_ascii_case("no-store"))
+                        })
+                    })
+                })
         {
             return Ok((response, None));
         }

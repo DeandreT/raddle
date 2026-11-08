@@ -66,6 +66,9 @@ acceptance are not silently switched to native defaults.
   `EndpointContract::link` percent-encodes values and omits missing optional segments.
   OpenAPI uses a standard `{rest}` placeholder for a catch-all, retaining the actual
   `{*rest}` template and catch-all semantics in native extensions.
+  Concrete optional/version path expansions have distinct stable operation IDs.
+  Schema bundles reserve collision-free component names before rewriting their
+  references, so another route's root cannot replace a nested definition.
 - `Parameters::path<T>` / `required_path<T>` use `FromStr`, including handwritten
   strong IDs. Exact argument-name casing matters. Malformed native route values
   default to 404; `RouteParseFailure::BadRequest` explicitly selects 400.
@@ -154,6 +157,8 @@ bounded keys and headers. Saturation and unknown-length/oversized streaming bodi
 bypass storage. Per-key locks coalesce concurrent misses. `evict_tag` invalidates
 both matching stored entries and pending fills. Apply invalidation only after the
 application's successful commit; there is no automatic store-change subscription.
+Responses carrying `no-store` bypass storage regardless of directive casing or
+which Cache-Control field contains it; directive names are matched as tokens.
 
 `RatePolicy` attaches a named finite partition table to a route. Omitting it is an
 explicit exemption. Fixed-window, exact rolling-window, continuously replenished
@@ -180,7 +185,9 @@ resolved version, never a raw caller-supplied version/tenant hint. Keys
 are bounded. Fingerprints SHA-256 exact length-framed method/path/raw-query/body
 bytes, not a normalized DTO. Missing required key is 400; in-flight is 409; changed
 fingerprint is 422. Completed responses persist status/body/Location only, with a
-1 MiB body limit. JSON Content-Type is reconstructed, not an arbitrary saved header.
+1 MiB body limit and 8192-byte Location limit. All persisted-response bounds are
+checked before business commit. JSON Content-Type is reconstructed, not an
+arbitrary saved header.
 
 The migration `202611080007_http_responses.sql` adds independent response storage;
 existing custody/idempotency tables and acceptance behavior are untouched.
@@ -188,8 +195,9 @@ existing custody/idempotency tables and acceptance behavior are untouched.
 - `SeparateClaim`: claim commits before work. Business writes/effects use the
   explicit scope from `EndpointContext::scope`. Serialization is checked before
   business commit. The business commit precedes separate response recording. Normal
-  precommit failure rolls back work and compensates the fenced claim. Cancellation/
-  process crash can leave unanswered 409; postcommit failure must never release a
+  precommit failure rolls back work and compensates the fenced claim, including
+  failure to open the business transaction after a confirmed claim commit.
+  Cancellation/process crash can leave unanswered 409; postcommit failure must never release a
   claim and repeat committed work. `after_commit` runs in this recording window.
 - `SameTransaction`: claim, business writes/effects and response recording use the
   **same Scope and PostgreSQL transaction**, without a hidden second transaction.
@@ -198,8 +206,9 @@ existing custody/idempotency tables and acceptance behavior are untouched.
   transaction-owned advisory guard. This is deliberately not Wolverine's optimistic
   two-handlers-execute/loser-rolls-back Marten algorithm.
 - A 400+ returned response is a precommit refusal: business changes roll back and
-  the key is released. Unsupported dynamic text/started arms commit an unanswered
-  claim and warn rather than rerunning work. Always-unsupported declarations,
+  the key is released. Optional-key requests without a key use that same refusal
+  boundary; redirects commit their enrolled work too. Unsupported dynamic
+  text/started arms commit an unanswered claim and warn rather than rerunning work. Always-unsupported declarations,
   custom writers and form/multipart replay combinations are rejected at startup.
   Combining output caching with replay on one endpoint is also rejected: a cache
   hit must not bypass required keys or raw-fingerprint mismatch checks.

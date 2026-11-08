@@ -564,7 +564,7 @@ async fn start_replay(
         ClaimResult::Claimed(claim) => {
             if policy.mode == ReplayMode::SeparateClaim {
                 scope.commit(Utc::now()).await.map_err(store_error)?;
-                scope = policy.store.begin().await.map_err(store_error)?;
+                scope = begin_claimed_work(&policy.store, &claim, policy.store.begin()).await?;
             }
             context.scope = Some(scope);
             Ok(ReplayStart::Run(Some(ReplayState {
@@ -574,6 +574,25 @@ async fn start_replay(
             })))
         }
         _ => Err(Problem::internal()),
+    }
+}
+
+// Only this boundary knows a committed claim has not reached business work.
+// Supplying the opening future keeps acquisition failure directly testable.
+async fn begin_claimed_work(
+    store: &Store,
+    claim: &ResponseClaim,
+    opening: impl std::future::Future<Output = Result<Scope<'static>, raddle_postgres::Error>>,
+) -> Result<Scope<'static>, Problem> {
+    match opening.await {
+        Ok(scope) => Ok(scope),
+        Err(error) => {
+            store
+                .release_http_response(claim)
+                .await
+                .map_err(store_error)?;
+            Err(store_error(error))
+        }
     }
 }
 
@@ -613,7 +632,7 @@ async fn execute_work<E: Endpoint>(
             .extend(context.response_headers.clone());
         let Some(replay) = replay.as_mut() else {
             if let Some(scope) = context.scope.take()
-                && rendered.response.status().is_success()
+                && rendered.response.status().as_u16() < 400
             {
                 scope.commit(Utc::now()).await.map_err(store_error)?;
                 endpoint.after_commit(context).await?;
@@ -711,9 +730,11 @@ async fn capture_response(
         location: parts
             .headers
             .get(header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|_| Problem::internal())?,
     };
+    stored.validate().map_err(store_error)?;
     Ok((Response::from_parts(parts, Body::from(bytes)), Some(stored)))
 }
 
@@ -739,3 +760,7 @@ fn replayed(stored: StoredResponse) -> Result<Response, Problem> {
 fn store_error(_error: raddle_postgres::Error) -> Problem {
     Problem::new(StatusCode::SERVICE_UNAVAILABLE)
 }
+
+#[cfg(test)]
+#[path = "replay_tests.rs"]
+mod replay_tests;
