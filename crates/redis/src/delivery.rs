@@ -192,6 +192,13 @@ impl HeldMessage {
             return Err(Error::Invalid("DLQ must differ from source"));
         }
         crate::config::name(reason)?;
+        // Inspect SDK-owned native bytes before `get` makes an owning copy.
+        // Keep the conversion and final guard for its other accepted representations.
+        if let Some(redis::Value::BulkString(body)) = self.entry.map.get("body")
+            && body.len() > self.broker.config.envelope.max_bytes
+        {
+            return Err(Error::Invalid("DLQ body limit"));
+        }
         let body: Vec<u8> = self
             .entry
             .get("body")

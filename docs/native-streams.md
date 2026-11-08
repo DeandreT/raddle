@@ -179,6 +179,10 @@ JUSTID and has a one-hour extension ceiling. Dropping/retrying an entry leaves i
 pending for reclamation. `pending` exposes native identity/owner/idle/attempt views.
 DLQ copying records raw body/source/attempt/reason and succeeds before source
 acknowledgement in the same script; a failed copy cannot acknowledge the source.
+DLQ preflight checks the borrowed SDK bulk-string length before converting the
+body to owned bytes. Oversized native bodies are rejected before that additional
+body-sized copy, without surrendering the receipt. This does not bound the Redis
+SDK's earlier parsing allocations or relax the separate decode metadata limits.
 Redis scripts are atomic against concurrent clients, but do not roll back earlier
 writes if a later command errors. An uncertain DLQ retry can duplicate a copy.
 
