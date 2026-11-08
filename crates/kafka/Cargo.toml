@@ -1,0 +1,29 @@
+[package]
+name = "raddle-kafka"
+description = "Native Kafka publishing and partition-safe custody for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+raddle.workspace = true
+rdkafka = { version = "=0.39.0", default-features = false, features = ["cmake-build", "tokio", "ssl", "libz"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+raddle-postgres.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true
