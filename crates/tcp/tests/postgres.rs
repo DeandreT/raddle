@@ -37,9 +37,10 @@ impl Inbox {
         // Source and tenant are configured on the receiver, not selected by the
         // envelope's untrusted headers or remote socket address.
         scope
-            .stage(
+            .stage_idempotent(
                 "tcp.orders",
                 "configured-tenant",
+                &envelope.id().to_string(),
                 envelope,
                 &[StoredDelivery::new(
                     DeliveryKind::Local,

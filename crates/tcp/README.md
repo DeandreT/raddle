@@ -17,6 +17,12 @@ through the ordinary bounded raddle runtime. The opt-in PostgreSQL integration
 test demonstrates returning custody only after inbox commit and retaining one
 durable job per identity on corrected retries.
 
+For PostgreSQL ingress, `Scope::stage_idempotent` can use the original message
+UUID as its source-and-tenant-scoped key. It retains the first delivery plan even
+when a retry arrives later. `Scope::stage` instead compares immutable routing and
+schedule metadata as well as content; recomputing its due time on every retry is
+an identity conflict, not equivalent repeated custody.
+
 `publish_batch` retains independent item results, including successes before a
 later failure. Per-message refusal and malformed bounded envelopes do not stop
 subsequent messages. Invalid lengths or protocol framing close the connection.
