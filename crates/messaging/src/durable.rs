@@ -17,9 +17,18 @@ type Handler = Box<
         + Send
         + Sync,
 >;
+type PolicyHandler = Box<
+    dyn Fn(
+            Scope<'static>,
+            MessageContext,
+            tokio::time::Instant,
+        ) -> BoxFuture<'static, Result<(), crate::policy::AttemptFailure>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Eq, PartialEq)]
-enum ClaimOutcome {
+pub(crate) enum ClaimOutcome {
     Completed,
     Quarantined,
     FailureRecorded,
@@ -49,16 +58,21 @@ impl DurableControl {
 /// never steal each other's leases. All business writes, inbox completion and
 /// returned outbox/local child intents commit on the same SQLx connection.
 pub struct DurableEndpoint {
-    store: Store,
-    name: String,
+    pub(crate) store: Store,
+    pub(crate) name: String,
     handlers: BTreeMap<(String, u32), Handler>,
     policy: RetryPolicy,
     timeout: Duration,
-    lease_timeout: Duration,
+    pub(crate) lease_timeout: Duration,
     parallelism: u32,
-    control: DurableControl,
+    pub(crate) control: DurableControl,
     receiving: Mutex<()>,
-    bus: Option<crate::MessageBus>,
+    pub(crate) bus: Option<crate::MessageBus>,
+    pub(crate) policies: Option<crate::EndpointPolicies>,
+    pub(crate) policy_handlers:
+        BTreeMap<(String, u32), (PolicyHandler, raddle_policies::ReplaySafety)>,
+    pub(crate) started: tokio::time::Instant,
+    pub(crate) unknown: Mutex<raddle_policies::UnknownMessageHandler>,
 }
 
 impl DurableEndpoint {
@@ -86,11 +100,19 @@ impl DurableEndpoint {
             control: DurableControl(watch::channel(false).0),
             receiving: Mutex::new(()),
             bus: None,
+            policies: None,
+            policy_handlers: BTreeMap::new(),
+            started: tokio::time::Instant::now(),
+            unknown: Mutex::new(
+                raddle_policies::UnknownMessageHandler::new(Default::default(), Default::default())
+                    .map_err(|_| Error::Invalid("invalid unknown-message options"))?,
+            ),
         })
     }
     /// Sets the global pre-commit budget before typed handlers are registered.
     pub fn timeout(&mut self, timeout: Duration) -> Result<(), Error> {
         if !self.handlers.is_empty()
+            || !self.policy_handlers.is_empty()
             || timeout < Duration::from_millis(1)
             || timeout > Duration::from_secs(3600)
         {
@@ -109,6 +131,80 @@ impl DurableEndpoint {
     /// Handlers can return `context.returned(...)` instead of assembling aliases.
     pub fn message_bus(&mut self, bus: crate::MessageBus) {
         self.bus = Some(bus);
+    }
+
+    /// Opts this subscription into policy-owned retry budgets, instead of the
+    /// legacy Delivery maximum/backoff. Configure before registering handlers;
+    /// never run a legacy worker against the same subscription.
+    /// Receive circuits require parallelism one; unsupported concurrent probe
+    /// ownership is rejected rather than approximated.
+    pub fn policies(&mut self, mut policies: crate::EndpointPolicies) -> Result<(), Error> {
+        if !self.handlers.is_empty() || self.policies.is_some() {
+            return Err(Error::Invalid("late or duplicate endpoint policies"));
+        }
+        if self.parallelism > 1 && policies.admission.get_mut().circuit.is_some() {
+            return Err(Error::Invalid(
+                "durable receive circuit requires sequential endpoint",
+            ));
+        }
+        self.policies = Some(policies);
+        Ok(())
+    }
+    /// Configures policy-endpoint missing-handler observers and terminal
+    /// disposition. Legacy endpoints keep their existing quarantine behavior.
+    pub fn unknown_messages(
+        &mut self,
+        unknown: raddle_policies::UnknownMessageHandler,
+    ) -> Result<(), Error> {
+        if self.policies.is_none() {
+            return Err(Error::Invalid(
+                "unknown-message options require policy endpoint",
+            ));
+        }
+        *self.unknown.get_mut() = unknown;
+        Ok(())
+    }
+
+    /// Registers a concrete error type for policy filtering. Every failed
+    /// attempt rolls SQL back and joins OnException/Finally/disposal before any
+    /// retry decision. Explicit replay safety must also cover external effects.
+    pub fn handle_policy<M, H>(
+        &mut self,
+        handler: Arc<H>,
+        flush: Arc<dyn Flush>,
+        replay: raddle_policies::ReplaySafety,
+    ) -> Result<(), Error>
+    where
+        M: WireMessage,
+        H: ScopedHandler<M>,
+    {
+        let key = (M::NAME.to_owned(), M::VERSION);
+        raddle::routing::WireMessageType::of::<M>()
+            .map_err(|_| Error::Invalid("invalid wire contract"))?;
+        if self.policies.is_none()
+            || replay == raddle_policies::ReplaySafety::AtLeastOnceSend
+            || self.policy_handlers.contains_key(&key)
+            || self.policy_handlers.len() >= 1024
+        {
+            return Err(Error::Invalid("missing policies or duplicate handler"));
+        }
+        self.policy_handlers.insert(
+            key,
+            (
+                Box::new(move |scope, context, deadline| {
+                    let handler = Arc::clone(&handler);
+                    let flush = Arc::clone(&flush);
+                    Box::pin(async move {
+                        scoped::run_strict::<M, H>(handler, scope, context, deadline, flush)
+                            .await
+                            .map(|_| ())
+                            .map_err(crate::policy::AttemptFailure::scoped)
+                    })
+                }),
+                replay,
+            ),
+        );
+        Ok(())
     }
 
     /// Registers a scoped handler with default root failure classification.
@@ -142,6 +238,9 @@ impl DurableEndpoint {
         H: ScopedHandler<M>,
         F: Fn(&Failure<H::Error>) -> FailureDisposition + Send + Sync + 'static,
     {
+        if self.policies.is_some() {
+            return Err(Error::Invalid("use typed policy registration"));
+        }
         let key = (M::NAME.to_owned(), M::VERSION);
         raddle::routing::WireMessageType::of::<M>()
             .map_err(|_| Error::Invalid("invalid wire contract"))?;
@@ -191,16 +290,26 @@ impl DurableEndpoint {
         if self.control.is_paused() || cancellation.is_cancelled() {
             return Ok(0);
         }
-        let claims = self
-            .store
-            .claim_for(
-                DeliveryKind::Local,
-                &self.name,
-                self.parallelism,
-                self.lease_timeout + Duration::from_secs(5),
-                Utc::now(),
-            )
-            .await?;
+        let claims = if self.policies.is_some() {
+            self.store
+                .claim_policy_for(
+                    &self.name,
+                    self.parallelism,
+                    self.lease_timeout + Duration::from_secs(5),
+                    Utc::now(),
+                )
+                .await?
+        } else {
+            self.store
+                .claim_for(
+                    DeliveryKind::Local,
+                    &self.name,
+                    self.parallelism,
+                    self.lease_timeout + Duration::from_secs(5),
+                    Utc::now(),
+                )
+                .await?
+        };
         let count = claims.len();
         let results = stream::iter(claims)
             .map(|claim| self.process_claim(claim, cancellation.clone()))
@@ -218,6 +327,9 @@ impl DurableEndpoint {
         claim: Claim,
         shutdown: Cancellation,
     ) -> Result<ClaimOutcome, Error> {
+        if self.policies.is_some() {
+            return self.process_policy_claim(claim, shutdown).await;
+        }
         let envelope = match claim.envelope() {
             Ok(envelope) => envelope,
             Err(Error::Wire(_)) => {

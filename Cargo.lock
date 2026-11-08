@@ -3312,6 +3312,7 @@ dependencies = [
  "raddle",
  "raddle-crypto",
  "raddle-host",
+ "raddle-policies",
  "raddle-postgres",
  "raddle-rabbitmq",
  "raddle-tcp",

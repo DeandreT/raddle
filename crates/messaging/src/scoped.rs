@@ -52,6 +52,10 @@ pub enum Failure<E: StdError + 'static> {
     /// Commit/staging failed. A commit I/O failure can have an uncertain outcome.
     #[error("root transaction failed")]
     Database(#[from] raddle_postgres::Error),
+    /// Strict managed execution could not establish commit/rollback completion.
+    /// Bypasses ordinary retry rules until custody is reconciled.
+    #[error("strict transaction completion or rollback is uncertain")]
+    UncertainDatabase(#[source] raddle_postgres::Error),
     /// Wire input did not match the explicitly registered type.
     #[error("input contract is invalid")]
     Wire(#[from] raddle::wire::WireError),
@@ -234,6 +238,36 @@ where
     M: WireMessage,
     H: ScopedHandler<M>,
 {
+    run_inner::<M, H>(handler, scope, context, deadline, flush, false).await
+}
+
+// Policy retries must never hide a rollback failure as an ordinary domain error.
+pub(crate) async fn run_strict<M, H>(
+    handler: Arc<H>,
+    scope: Scope<'static>,
+    context: MessageContext,
+    deadline: Instant,
+    flush: Arc<dyn Flush>,
+) -> Result<Committed<H::Reply>, Failure<H::Error>>
+where
+    M: WireMessage,
+    H: ScopedHandler<M>,
+{
+    run_inner::<M, H>(handler, scope, context, deadline, flush, true).await
+}
+
+async fn run_inner<M, H>(
+    handler: Arc<H>,
+    scope: Scope<'static>,
+    context: MessageContext,
+    deadline: Instant,
+    flush: Arc<dyn Flush>,
+    strict_rollback: bool,
+) -> Result<Committed<H::Reply>, Failure<H::Error>>
+where
+    M: WireMessage,
+    H: ScopedHandler<M>,
+{
     let message = context.envelope().decode::<M>()?;
     let mut scope = scope;
     let mut resources = match bounded(deadline, &context, async {
@@ -246,7 +280,13 @@ where
     {
         Ok(resources) => resources,
         Err(error) => {
-            scope.rollback().await?;
+            if let Err(rollback) = scope.rollback().await {
+                return Err(if strict_rollback {
+                    Failure::UncertainDatabase(rollback)
+                } else {
+                    Failure::Database(rollback)
+                });
+            }
             return Err(error);
         }
     };
@@ -286,14 +326,20 @@ where
                         post_commit,
                     })
                 }
-                Err(error) => Err(Failure::Database(error)),
+                Err(error) => Err(if strict_rollback {
+                    Failure::UncertainDatabase(error)
+                } else {
+                    Failure::Database(error)
+                }),
             }
         }
         Err(error) => {
             // Keep the original failure if rollback also fails; the connection's
             // drop still prevents it being reused as a successful transaction.
-            let _ = scope.rollback().await;
-            Err(error)
+            match scope.rollback().await {
+                Err(rollback) if strict_rollback => Err(Failure::UncertainDatabase(rollback)),
+                _ => Err(error),
+            }
         }
     };
     if let Err(error) = &result {

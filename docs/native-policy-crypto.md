@@ -1,8 +1,10 @@
 # Explicit endpoint policies and payload encryption
 
-`raddle-policies` and `raddle-crypto` are opt-in native Rust components. Neither
-crate installs behavior into `Runtime`, `MessageBus`, or the PostgreSQL workers.
-An application must connect their driver and receiver boundaries explicitly.
+`raddle-policies` and `raddle-crypto` are opt-in native Rust components.
+`raddle-messaging` binds policies to actual Host-owned local queues and durable
+endpoints through explicit registration. Neither component changes the legacy
+`Runtime` or PostgreSQL `Worker` defaults. Encryption still requires an explicit
+ingress/transport boundary.
 These contracts are not a claim of complete Wolverine parity or .NET wire
 compatibility.
 
@@ -198,6 +200,92 @@ it receives repeated confirmed publications through the actual broker adapter.
 
 ## Integration boundaries
 
+### Application-owned policy execution
+
+`PolicyQueueBuilder::handle::<M, E, _, _>` registers a local typed handler/error;
+`scoped::<M, H>` uses the complete existing scoped pipeline against PostgreSQL.
+Build the queue, register its sending handle with `BusBuilder::policy_queue`,
+route messages to its configured name, and attach its sole runner to `Host`.
+Send/Publish acknowledge bounded volatile custody, not handler completion.
+Each queue is sequential. Independent named queues provide independent owners.
+Capacity includes retained terminal identities; no implicit eviction weakens
+failed-only replay or duplicate protection. Identity reuse with different
+canonical input or trusted origin is refused. A matching duplicate is a no-op.
+Shutdown joins pre-commit cancellation/rollback/Finally/disposal and retains the
+interrupted state; process death still loses the entire volatile queue.
+Queue-tail recovery merges custody accepted while the prior handler was running
+before choosing the recovered item's tail position. Newly accepted siblings do
+not get overtaken merely because they were still in the receiving buffer.
+
+For durable execution, call `DurableEndpoint::policies(EndpointPolicies)` before
+registering `handle_policy::<M, H>`. Apply migration 009 explicitly first. Do not
+mix legacy and policy workers against the same subscription. This opt-in retry
+budget replaces `Delivery::max_attempts` and legacy backoff for that subscription;
+expiry, trusted source/tenant, partition fencing and inbox/outbox atomicity remain.
+Concrete `H::Error` values reach policy filters directly. Other scoped failures
+retain their typed `Failure<H::Error>` classification. Every attempt constructs
+fresh resources and runs the original pipeline, including cleanup. Post-commit
+flush/callback/cleanup errors remain committed successes and never replay a parent.
+Strict execution tags commit/rollback failures as `UncertainDatabase`, which
+bypasses handler recovery. After a successful pre-commit rollback, invalid
+returned intent, identity conflict, capacity refusal and SQL data/integrity/
+transaction-rollback errors remain order-local policy failures. Genuine backend
+or schema failures still propagate as infrastructure errors; one malformed
+outgoing intent does not stop unrelated orders or receiving owners.
+
+Immediate/cooldown retain the live claim; requeue/schedule release it at the SQL
+queue tail with the same identity and counters; discard retains a completed
+tombstone, while dead-letter retains quarantine. Pauses are endpoint-local and
+durably recorded. Every actual attempt reacquires quota and circuit admission;
+quota refusal does not consume a handler attempt or circuit sample. Quotas and
+circuit observations are process-local, not distributed limits. Existing in-flight
+attempts are not retroactively cancelled when a pause is selected.
+Durable receive circuits currently require sequential execution: combining a
+circuit with endpoint parallelism greater than one is rejected at registration.
+This prevents late concurrent observations from resolving another attempt's
+half-open probe. Parallel durable queues without circuits remain supported.
+Managed quota admission uses one quota-owned monotonic clock shared across quota
+clones, including endpoints started at different times. Clock sampling and
+admission are serialized together; retry delays are translated into the receiving
+endpoint's scheduling clock. Direct explicit-clock `Quota::acquire` remains
+caller-controlled; do not mix that clock domain with managed `acquire_current`
+calls on the same quota state.
+
+All retry registration requires an explicit `ReplaySafety`. A SQL scope alone
+does not authorize repeating external effects, OnException or cleanup effects.
+`Never` refuses recovery rather than replaying an arbitrary operation. Sending-only
+`AtLeastOnceSend` is rejected when registering a handling endpoint. Durable
+attempt entry records a conservative uncertainty marker before business work;
+only joined, successful rollback authorizes ordinary retry. Commit/rollback I/O
+failure or a crash during an attempt leaves recovery blocked, even after lease
+expiry. An operator must reconcile and explicitly call the tenant-scoped audited
+`Store::recover_policy_uncertain` with `PolicyRecovery` before retrying. This is
+deliberately conservative even for SQL-only crashes. A small crash window between
+attempt recording and handler entry can consume a policy slot. Inspection's
+legacy attempt field is separate from the persisted policy handling counter.
+
+Lease expiry during cooldown or asynchronous cleanup can end this owner's retry
+permission. Stale ownership affects only that claim, never the Host's cancellation
+signal or healthy siblings. The owner cannot extend an expired lease or clear a
+successor's uncertainty marker. Database failures propagate after the already
+claimed healthy siblings finish. A locally uncertain in-memory scoped attempt is
+retained Interrupted and causes its Host service to fail rather than retrying.
+
+Both queue owners support independent `UnknownMessageHandler` configuration.
+Unknown input defaults to discard and runs missing-handler observers, bypassing
+ordinary handler retries/counters. Invalid known bodies are quarantined; ingress
+cryptography remains a pre-custody boundary. Trusted attribution comes from the
+independently supplied `TrustedOrigin`, never envelope headers. Unknown tracking
+at this canonical application boundary retains canonical envelope bytes, not the
+original encrypted/framing bytes.
+
+These registrations do not apply policies to ordinary Invoke, remote sends,
+the legacy `LocalQueue` or the legacy SQL worker. They do not add broker-native
+custody, distributed quotas/circuit observations, automatic terminal fault
+publication, resumable AfterCommit callbacks or arbitrary custom recovery actions.
+Terminal `Fault<M>` remains an explicit separate post-settlement publication
+boundary. No full error-policy/runtime family parity is claimed.
+
 A bus adapter must retain one active delivery across `RetryInline`, advance the
 appropriate counter only when actual execution starts, preserve counters across
 scheduled/requeued work, and honor endpoint-local pauses. It must select
@@ -205,11 +293,12 @@ fault/unknown/crypto bypass paths before ordinary handler policy application.
 After confirmed sends it must settle only that delivery. A cancellation is not
 a send failure or a receive-circuit observation.
 
-The existing PostgreSQL `Store::fail` implements its own bounded backoff and
+The legacy PostgreSQL `Store::fail` implements its own bounded backoff and
 `Scope::commit` completes its active claim. These public methods do not express
 exact scheduled times, queue-tail movement, indefinite retry, independent
 persisted counters or endpoint pause state. A faithful durable driver needs
-coordinated fenced Store operations; it must not emulate those guarantees with
+coordinated fenced Store operations. The application durable endpoint uses the
+dedicated `endpoint_policies` operations; it never emulates those guarantees with
 unfenced direct SQL or by completing an unsent delivery.
 
 The opt-in `rabbitmq-tests` feature enables a disposable-broker test using an

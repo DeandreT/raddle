@@ -6,8 +6,11 @@
 mod bus;
 mod context;
 mod durable;
+mod durable_policy;
 pub mod effects;
 mod ingress;
+mod policy;
+mod policy_queue;
 mod queue;
 mod request_reply;
 pub mod scoped;
@@ -17,6 +20,8 @@ pub use bus::{BusBuilder, BusError, InvokeError, InvokeOptions, MessageBus, Remo
 pub use context::{Cancellation, HeaderError, MessageContext, TrustedOrigin};
 pub use durable::{DurableControl, DurableEndpoint};
 pub use ingress::{IngressDecoder, IngressError, JsonIngress};
+pub use policy::EndpointPolicies;
+pub use policy_queue::{PolicyQueue, PolicyQueueBuilder, PolicyQueueRunner, PolicyTimeout};
 pub use queue::{LocalQueue, QueueError, QueueMode, QueueRunner, QueueSettings, QueueSnapshot};
 pub use request_reply::{RemoteResponder, ReplyHubInvoker};
 
