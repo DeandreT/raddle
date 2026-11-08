@@ -108,6 +108,22 @@ class FixtureContracts(unittest.TestCase):
                 lock.assert_called_once()
                 up.assert_not_called()
 
+    def test_broker_diagnostics_receive_only_the_verified_owned_container(self):
+        state = {'containers': ['a' * 64], 'bootstrap': '127.0.0.1:29092'}
+        inherited = {'INHERITED': 'preserved'}
+        with mock.patch.object(fixture, 'load', return_value=state), \
+                mock.patch.object(fixture.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(fixture.test(Path('verified-state'), ['cargo', 'test'], inherited), 0)
+            env = run.call_args.kwargs['env']
+            self.assertEqual(env['RADDLE_KAFKA_TEST_CONTAINER'], 'a' * 64)
+            self.assertEqual(env['RADDLE_KAFKA_TEST_BROKERS'], state['bootstrap'])
+            self.assertEqual(inherited, {'INHERITED': 'preserved'})
+        with mock.patch.object(fixture, 'load', return_value={'containers': []}), \
+                mock.patch.object(fixture.subprocess, 'run') as run:
+            with self.assertRaises(RuntimeError):
+                fixture.test(Path('verified-state'), ['cargo', 'test'], inherited)
+            run.assert_not_called()
+
     def test_one_shot_owns_lease_before_build_and_fixture_lifecycle(self):
         events = []
         with tempfile.TemporaryDirectory() as temporary:

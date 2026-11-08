@@ -43,13 +43,14 @@ struct Record<T> {
     retained: T,
 }
 
-/// `T` retains admission until a positive commit confirmation or assignment loss.
+/// `T` retains admission until safe local store, commit confirmation or assignment loss.
 /// It must not be business-success state: durable consumers own that separately.
 pub(crate) struct Ledger<T> {
     owner: Uuid,
     capacity: usize,
     observed: Option<i64>,
     confirmed: Option<i64>,
+    stored: Option<i64>,
     records: BTreeMap<i64, Record<T>>,
     committing: Option<Commit>,
 }
@@ -64,6 +65,7 @@ impl<T> Ledger<T> {
             capacity,
             observed: None,
             confirmed: None,
+            stored: None,
             records: BTreeMap::new(),
             committing: None,
         })
@@ -75,6 +77,10 @@ impl<T> Ledger<T> {
 
     pub(crate) fn confirmed_offset(&self) -> Option<i64> {
         self.confirmed
+    }
+
+    pub(crate) fn stored_offset(&self) -> Option<i64> {
+        self.stored
     }
 
     pub(crate) fn observe(&mut self, offset: i64, retained: T) -> Result<Token, Error> {
@@ -98,16 +104,23 @@ impl<T> Ledger<T> {
         })
     }
 
-    pub(crate) fn complete(&mut self, token: Token) -> Result<(), Error> {
+    /// Whether this is a new custody completion, rather than an idempotent repeat.
+    pub(crate) fn complete(&mut self, token: Token) -> Result<bool, Error> {
         if token.owner != self.owner {
             return Err(Error::Stale);
         }
-        if self.confirmed.is_some_and(|offset| token.offset < offset) {
-            return Ok(());
+        if self
+            .confirmed
+            .into_iter()
+            .chain(self.stored)
+            .any(|offset| token.offset < offset)
+        {
+            return Ok(false);
         }
         let record = self.records.get_mut(&token.offset).ok_or(Error::Unknown)?;
+        let new = !record.completed;
         record.completed = true;
-        Ok(())
+        Ok(new)
     }
 
     pub(crate) fn ready_offset(&self) -> Option<i64> {
@@ -127,13 +140,25 @@ impl<T> Ledger<T> {
     }
 
     pub(crate) fn begin_commit(&mut self) -> Option<Commit> {
+        let next = self.ready_offset().into_iter().chain(self.stored).max()?;
+        if self.confirmed.is_some_and(|confirmed| next <= confirmed) {
+            return None;
+        }
+        self.begin(next)
+    }
+
+    pub(crate) fn begin_store(&mut self) -> Option<Commit> {
+        self.begin(self.ready_offset()?)
+    }
+
+    fn begin(&mut self, next: i64) -> Option<Commit> {
         if self.committing.is_some() {
             return None;
         }
         let commit = Commit {
             owner: self.owner,
             attempt: Uuid::new_v4(),
-            next: self.ready_offset()?,
+            next,
         };
         self.committing = Some(commit);
         Some(commit)
@@ -144,6 +169,22 @@ impl<T> Ledger<T> {
         commit: Commit,
         confirmed: bool,
     ) -> Result<Vec<T>, Error> {
+        let retained = self.finish(commit, confirmed)?;
+        if confirmed {
+            self.confirmed = Some(commit.next);
+        }
+        Ok(retained)
+    }
+
+    pub(crate) fn finish_store(&mut self, commit: Commit, stored: bool) -> Result<Vec<T>, Error> {
+        let retained = self.finish(commit, stored)?;
+        if stored {
+            self.stored = Some(commit.next);
+        }
+        Ok(retained)
+    }
+
+    fn finish(&mut self, commit: Commit, succeeded: bool) -> Result<Vec<T>, Error> {
         if commit.owner != self.owner {
             return Err(Error::Stale);
         }
@@ -151,13 +192,12 @@ impl<T> Ledger<T> {
             return Err(Error::Commit);
         }
         self.committing = None;
-        if !confirmed {
+        if !succeeded {
             // Uncertainty never releases admission or forgets completed members.
             return Ok(Vec::new());
         }
         let remaining = self.records.split_off(&commit.next);
         let completed = std::mem::replace(&mut self.records, remaining);
-        self.confirmed = Some(commit.next);
         Ok(completed
             .into_values()
             .map(|record| record.retained)
@@ -169,6 +209,7 @@ impl<T> Ledger<T> {
         self.owner = Uuid::new_v4();
         self.observed = None;
         self.confirmed = None;
+        self.stored = None;
         self.committing = None;
         std::mem::take(&mut self.records)
             .into_values()
@@ -181,6 +222,38 @@ impl<T> Ledger<T> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{Error, Ledger};
+
+    #[test]
+    fn safe_store_releases_admission_without_claiming_broker_confirmation() {
+        let mut ledger = Ledger::new(2).unwrap();
+        let first = ledger.observe(0, "first").unwrap();
+        let last = ledger.observe(3, "last").unwrap();
+        assert!(ledger.complete(first).unwrap());
+        assert!(!ledger.complete(first).unwrap());
+        let store = ledger.begin_store().unwrap();
+        assert_eq!(store.next_offset(), 3);
+        assert!(ledger.finish_store(store, false).unwrap().is_empty());
+        assert_eq!(ledger.len(), 2);
+        let store = ledger.begin_store().unwrap();
+        assert_eq!(ledger.finish_store(store, true).unwrap(), ["first"]);
+        assert_eq!(ledger.confirmed_offset(), None);
+        assert_eq!(ledger.stored_offset(), Some(3));
+        assert_eq!(ledger.len(), 1);
+        ledger.complete(first).unwrap();
+        assert!(ledger.begin_store().is_none());
+        let commit = ledger.begin_commit().unwrap();
+        assert_eq!(commit.next_offset(), 3);
+        ledger.finish_commit(commit, true).unwrap();
+        assert_eq!(ledger.confirmed_offset(), Some(3));
+        assert!(ledger.begin_commit().is_none());
+        ledger.complete(last).unwrap();
+        let store = ledger.begin_store().unwrap();
+        assert_eq!(ledger.finish_store(store, true).unwrap(), ["last"]);
+        let commit = ledger.begin_commit().unwrap();
+        assert_eq!(commit.next_offset(), 4);
+        ledger.finish_commit(commit, true).unwrap();
+        assert_eq!(ledger.confirmed_offset(), Some(4));
+    }
 
     #[test]
     fn out_of_order_completions_and_numeric_gaps_do_not_skip_earlier_work() {

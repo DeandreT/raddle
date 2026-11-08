@@ -32,3 +32,15 @@ For an explicitly retained development fixture, run `up`, retain its printed
 state-file path, then use `test --state <path>` and finally `down --state <path>`.
 Teardown verifies run ownership and does not select containers by shared image.
 The fixture sends synthetic test data only; do not point this runner at production.
+
+The socket suite covers all four custody strategies, count saturation, idle and
+graceful flush, and aborted/open transactions under both isolation settings. The
+runner also passes its verified container ID for read-only Kafka 4 CLI group-type
+and assignor checks; cooperative rebalancing alone does not establish KIP-848.
+Two native clients join each membership mode, with eager reacquisition or
+incremental preservation of unaffected work and stale revoked handles checked.
+These in-process joins do not establish static-ID fencing, coordinator loss,
+multi-process recovery, replicated failover or the full membership contract.
+`tests/sdk_mock.rs` separately
+injects native commit denial/delay to exercise uncertain retries and cancellation;
+mock results are not broker interoperability evidence.

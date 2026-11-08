@@ -13,11 +13,19 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::offsets::{Commit, Ledger, Token};
-use crate::{ClientSettings, CommitStrategy, ConsumerSettings, Error, Limits};
+use crate::{
+    ClientSettings, CommitStrategy, ConfigurationWarning, ConsumerSettings, Error, Limits,
+};
 
 type Partition = (String, i32);
 type PollTask = JoinHandle<Result<Option<OwnedMessage>, Error>>;
-type CommitTask = JoinHandle<Result<(), Error>>;
+type CommitTask = JoinHandle<Vec<Result<(), Error>>>;
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Store,
+    Commit,
+}
 
 #[derive(Default)]
 struct Ownership {
@@ -108,9 +116,11 @@ impl ConsumerContext for Context {
 struct PartitionState {
     generation: Uuid,
     ledger: Ledger<()>,
+    completions: usize,
 }
 struct PendingCommit {
     entries: Vec<(Partition, Uuid, Commit)>,
+    operation: Operation,
     task: CommitTask,
 }
 
@@ -140,9 +150,13 @@ impl Received {
 
 /// Observed settlement, not an assertion of exactly-once business execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Settlement {
-    /// Custody completed, but an earlier observed record blocks offset commit.
+    /// Custody completed, but an earlier record or the flush policy defers commit.
     Deferred,
+    /// A safe next-read position was stored locally, not broker-confirmed.
+    /// Auto-commit may subsequently persist it; call flush for confirmation.
+    Stored,
     /// The broker confirmed a safe prefix covering this original record.
     Committed,
 }
@@ -159,23 +173,24 @@ pub struct Receiver {
     poll: Option<PollTask>,
     commit: Option<PendingCommit>,
     incidental: Option<Received>,
+    strategy: CommitStrategy,
+    last_flush: Instant,
+    warnings: Vec<ConfigurationWarning>,
 }
 
 impl Receiver {
     /// Connects to configured subscriptions without provisioning topics. This
-    /// receiver currently requires PerMessage settlement; other provider offset
-    /// strategies are rejected rather than silently approximated.
+    /// All strategies disable automatic storage of fetched records. Only safe
+    /// custody prefixes can enter the native local store or broker commit.
     pub async fn connect(
         settings: ClientSettings,
         subscription: ConsumerSettings,
     ) -> Result<Self, Error> {
-        if subscription.strategy != CommitStrategy::PerMessage {
-            return Err(Error::Configuration);
-        }
-        let native = subscription.native_config(&settings)?;
+        let resolved = subscription.resolve(&settings)?;
         tokio::task::spawn_blocking(move || {
             let ownership = Arc::new(Ownership::default());
-            let consumer: BaseConsumer<Context> = native
+            let consumer: BaseConsumer<Context> = resolved
+                .native
                 .create_with_context(Context(Arc::clone(&ownership)))
                 .map_err(|_| Error::Configuration)?;
             let topics: Vec<_> = subscription
@@ -195,6 +210,9 @@ impl Receiver {
                 poll: None,
                 commit: None,
                 incidental: None,
+                strategy: subscription.strategy,
+                last_flush: Instant::now(),
+                warnings: resolved.warnings,
             })
         })
         .await
@@ -207,6 +225,12 @@ impl Receiver {
             .values()
             .map(|state| state.ledger.len())
             .sum()
+    }
+
+    /// KIP-848 normalization warnings for application diagnostics. Each removed
+    /// explicit classic setting appears once; values/credentials are not exposed.
+    pub fn configuration_warnings(&self) -> &[ConfigurationWarning] {
+        &self.warnings
     }
 
     fn synchronize(&mut self) -> Result<(), Error> {
@@ -269,6 +293,7 @@ impl Receiver {
                 generation,
                 ledger: Ledger::new(self.limits.max_pending + 1)
                     .map_err(|_| Error::Configuration)?,
+                completions: 0,
             }),
         };
         let token = state
@@ -313,6 +338,7 @@ impl Receiver {
         self.finish_commit().await?;
         self.harvest_poll().await?;
         self.synchronize()?;
+        self.flush_if_due().await?;
         if self.incidental.is_some() {
             if self.pending() > self.limits.max_pending {
                 return Err(Error::Capacity);
@@ -350,6 +376,7 @@ impl Receiver {
             }
         }));
         self.harvest_poll().await?;
+        self.flush_if_due().await?;
         if full {
             return Err(Error::Capacity);
         }
@@ -357,8 +384,8 @@ impl Receiver {
     }
 
     /// Call only after application processing or durable inbox commit. Marks one
-    /// observed record, then confirms the safe completed prefix, never a later
-    /// offset past unfinished work. Repeating this call does not rerun business work.
+    /// observed record, then applies the configured store/commit policy, never a
+    /// later offset past unfinished work. Repeating it does not rerun business work.
     pub async fn complete(&mut self, record: &Received) -> Result<Settlement, Error> {
         self.harvest_poll().await?;
         self.finish_commit().await?;
@@ -373,11 +400,17 @@ impl Receiver {
         if state.generation != record.generation {
             return Err(Error::Stale);
         }
-        state
+        let new = state
             .ledger
             .complete(record.token)
             .map_err(|_| Error::Stale)?;
-        self.flush().await?;
+        if new && !matches!(self.strategy, CommitStrategy::StoreThenAutoFlush(_)) {
+            state.completions = state.completions.saturating_add(1);
+        }
+        match self.strategy {
+            CommitStrategy::StoreThenAutoFlush(_) => self.settle(Operation::Store).await?,
+            _ => self.flush_if_due().await?,
+        }
         let state = self.partitions.get(&record.partition).ok_or(Error::Stale)?;
         if state.generation != record.generation {
             return Err(Error::Stale);
@@ -389,6 +422,12 @@ impl Receiver {
                 .is_some_and(|offset| offset > record.message.offset())
             {
                 Settlement::Committed
+            } else if state
+                .ledger
+                .stored_offset()
+                .is_some_and(|offset| offset > record.message.offset())
+            {
+                Settlement::Stored
             } else {
                 Settlement::Deferred
             },
@@ -396,22 +435,40 @@ impl Receiver {
     }
 
     /// Retries uncertain offset commits without resubmitting successful handlers.
-    /// Automatic native offset storing and automatic commits remain disabled.
+    /// Explicitly confirms all safe positions, including locally stored ones,
+    /// regardless of the configured count/interval. Never commits fetched state.
     pub async fn flush(&mut self) -> Result<(), Error> {
+        self.settle(Operation::Commit).await
+    }
+
+    async fn flush_if_due(&mut self) -> Result<(), Error> {
+        let completed = self
+            .partitions
+            .values()
+            .map(|state| state.completions)
+            .fold(0usize, usize::saturating_add);
+        if commit_due(
+            self.strategy,
+            completed,
+            self.pending() >= self.limits.max_pending,
+            self.last_flush.elapsed(),
+        ) {
+            self.settle(Operation::Commit).await?;
+        }
+        Ok(())
+    }
+
+    async fn settle(&mut self, operation: Operation) -> Result<(), Error> {
         self.harvest_poll().await?;
         self.finish_commit().await?;
         self.synchronize()?;
-        let mut offsets = TopicPartitionList::new();
         let mut entries = Vec::new();
         for (partition, state) in &mut self.partitions {
-            if let Some(commit) = state.ledger.begin_commit() {
-                offsets
-                    .add_partition_offset(
-                        &partition.0,
-                        partition.1,
-                        Offset::Offset(commit.next_offset()),
-                    )
-                    .map_err(|_| Error::Native)?;
+            let commit = match operation {
+                Operation::Store => state.ledger.begin_store(),
+                Operation::Commit => state.ledger.begin_commit(),
+            };
+            if let Some(commit) = commit {
                 entries.push((partition.clone(), state.generation, commit));
             }
         }
@@ -419,23 +476,70 @@ impl Receiver {
             return Ok(());
         }
         let consumer = Arc::clone(&self.consumer);
+        let ownership = Arc::clone(&self.ownership);
+        // The blocking worker owns only an immutable operation snapshot. The
+        // original attempts and their handle stay in self across cancellation.
+        let auto_store = matches!(self.strategy, CommitStrategy::StoreThenAutoFlush(_));
+        let requests = entries
+            .iter()
+            .map(|(partition, generation, commit)| {
+                (partition.clone(), *generation, commit.next_offset())
+            })
+            .collect::<Vec<_>>();
         self.commit = Some(PendingCommit {
             entries,
+            operation,
             task: tokio::task::spawn_blocking(move || {
-                if consumer.assignment_lost() {
-                    return Err(Error::Stale);
-                }
-                consumer
-                    .commit(&offsets, CommitMode::Sync)
-                    .map_err(|_| Error::Uncertain)?;
-                if offsets
-                    .elements()
-                    .iter()
-                    .any(|entry| entry.error().is_err())
-                {
-                    return Err(Error::Uncertain);
-                }
-                Ok(())
+                requests
+                    .into_iter()
+                    .map(|(partition, generation, offset)| {
+                        ownership.ensure_live()?;
+                        if consumer.assignment_lost()
+                            || ownership
+                                .generations
+                                .lock()
+                                .map_err(|_| Error::Native)?
+                                .get(&partition)
+                                != Some(&generation)
+                        {
+                            return Err(Error::Stale);
+                        }
+                        let mut offsets = TopicPartitionList::new();
+                        offsets
+                            .add_partition_offset(&partition.0, partition.1, Offset::Offset(offset))
+                            .map_err(|_| Error::Native)?;
+                        // One partition per Sync request: the safe wrapper does not
+                        // expose a multi-partition broker result on the input TPL.
+                        // Partial successes must not acknowledge failing partitions.
+                        if auto_store && matches!(operation, Operation::Commit) {
+                            // Keep the auto-committer's local position at least as
+                            // recent as this explicit safe-prefix commit.
+                            consumer
+                                .store_offsets(&offsets)
+                                .map_err(|_| Error::Uncertain)?;
+                            if offsets
+                                .elements()
+                                .iter()
+                                .any(|entry| entry.error().is_err())
+                            {
+                                return Err(Error::Uncertain);
+                            }
+                        }
+                        match operation {
+                            Operation::Store => consumer.store_offsets(&offsets),
+                            Operation::Commit => consumer.commit(&offsets, CommitMode::Sync),
+                        }
+                        .map_err(|_| Error::Uncertain)?;
+                        if offsets
+                            .elements()
+                            .iter()
+                            .any(|entry| entry.error().is_err())
+                        {
+                            return Err(Error::Uncertain);
+                        }
+                        Ok(())
+                    })
+                    .collect()
             }),
         });
         self.finish_commit().await
@@ -449,34 +553,54 @@ impl Receiver {
         let Some(pending) = self.commit.take() else {
             return Err(Error::Native);
         };
-        let outcome = outcome.map_err(|_| {
+        let outcomes = outcome.map_err(|_| {
             self.ownership.failed.store(true, Ordering::Release);
             Error::Native
         })?;
         self.synchronize()?;
-        let mut stale = false;
-        for (partition, generation, commit) in pending.entries {
+        if outcomes.len() != pending.entries.len() {
+            self.ownership.failed.store(true, Ordering::Release);
+            return Err(Error::ReceiverFenced);
+        }
+        let mut failure = None;
+        let mut confirmed = false;
+        for ((partition, generation, commit), outcome) in pending.entries.into_iter().zip(outcomes)
+        {
             if let Some(state) = self.partitions.get_mut(&partition)
                 && state.generation == generation
             {
-                state
-                    .ledger
-                    .finish_commit(commit, outcome.is_ok())
-                    .map_err(|_| Error::Native)?;
+                match pending.operation {
+                    Operation::Store => state.ledger.finish_store(commit, outcome.is_ok()),
+                    Operation::Commit => state.ledger.finish_commit(commit, outcome.is_ok()),
+                }
+                .map_err(|_| Error::Native)?;
+                confirmed |= outcome.is_ok();
+                if let Err(error) = outcome {
+                    failure.get_or_insert(error);
+                }
             } else {
-                stale = true;
+                failure.get_or_insert(Error::Stale);
             }
         }
-        outcome?;
-        if stale {
-            return Err(Error::Stale);
+        if confirmed && matches!(pending.operation, Operation::Commit) {
+            self.last_flush = Instant::now();
+            if failure.is_none() {
+                // The count measures new custody completions since a successful
+                // flush, not completed records still held behind another record.
+                // Uncertain attempts keep the count eligible for offset-only retry.
+                for state in self.partitions.values_mut() {
+                    state.completions = 0;
+                }
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     /// Joins outstanding native work and leaves unfinished records uncommitted.
     /// Native close/Drop is performed off the async worker. Destruction itself
-    /// is not hard-deadline-cancellable; dropping this future does not cancel it.
+    /// is not hard-deadline-cancellable. Await this method fully: cancellation
+    /// during its preliminary flush can drop self on the caller's thread;
+    /// cancellation after the close worker starts does not stop that worker.
     pub async fn shutdown(mut self) -> Result<(), Error> {
         let settlement = self.flush().await;
         tokio::task::spawn_blocking(move || {
@@ -497,6 +621,21 @@ impl Receiver {
         .map_err(|_| Error::Native)?
     }
 }
+
+fn commit_due(strategy: CommitStrategy, completed: usize, full: bool, elapsed: Duration) -> bool {
+    match strategy {
+        CommitStrategy::PerMessage => completed > 0,
+        CommitStrategy::BatchCount(count) => {
+            completed >= usize::from(count) || (full && completed > 0)
+        }
+        CommitStrategy::Interval(interval) => elapsed >= interval,
+        CommitStrategy::StoreThenAutoFlush(_) => false,
+    }
+}
+
+#[cfg(test)]
+#[path = "receiver_contracts.rs"]
+mod contracts;
 
 #[cfg(test)]
 mod tests {

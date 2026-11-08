@@ -15,7 +15,9 @@ mod record;
 mod topology;
 
 pub use config::{ClientSettings, Limits, Topic};
-pub use consumer_config::{CommitStrategy, ConsumerSettings, Membership};
+pub use consumer_config::{
+    CommitStrategy, ConfigurationWarning, ConsumerSettings, Membership, ResolvedConsumerConfig,
+};
 pub use error::Error;
 pub use publisher::{Publication, Publisher};
 pub use receiver::{Received, Receiver, Settlement};

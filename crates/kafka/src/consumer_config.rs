@@ -15,6 +15,33 @@ pub enum Membership {
     Consumer,
 }
 
+/// One credential-free final-resolution diagnostic per removed option.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConfigurationWarning {
+    /// KIP-848 delegates this classic-only option to the broker instead.
+    RemovedClassicSetting(&'static str),
+}
+
+/// Final native configuration and the warnings that its caller should report.
+/// Native configuration is deliberately not formatted: it may hold credentials.
+pub struct ResolvedConsumerConfig {
+    pub(crate) native: ClientConfig,
+    pub(crate) warnings: Vec<ConfigurationWarning>,
+}
+
+impl ResolvedConsumerConfig {
+    /// Final client settings, without opening a native connection.
+    pub fn native(&self) -> &ClientConfig {
+        &self.native
+    }
+
+    /// One warning for each explicitly configured classic-only option removed.
+    pub fn warnings(&self) -> &[ConfigurationWarning] {
+        &self.warnings
+    }
+}
+
 /// Offset custody strategies never enable automatic storing of fetched records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitStrategy {
@@ -22,7 +49,8 @@ pub enum CommitStrategy {
     StoreThenAutoFlush(Duration),
     /// Confirm each newly completed safe prefix synchronously with the broker.
     PerMessage,
-    /// Commit after a bounded number of completed records. A full admission
+    /// Commit after a bounded number of new completions since a successful flush.
+    /// Retained completed records do not count again. A full admission
     /// window must also flush so an oversized batch cannot deadlock progress.
     BatchCount(u16),
     /// Flush safe completed prefixes periodically, without waiting for new input.
@@ -89,9 +117,17 @@ impl ConsumerSettings {
     }
 
     /// Builds the exact provider settings without connecting or starting tasks.
-    /// Unsupported protocol combinations fail explicitly instead of being ignored.
+    /// Use resolve to also retain KIP-848 normalization warnings.
     pub fn native_config(&self, settings: &ClientSettings) -> Result<ClientConfig, Error> {
+        Ok(self.resolve(settings)?.native)
+    }
+
+    /// Resolves explicit membership, preserving static identity and unrelated
+    /// native options. KIP-848 removes incompatible classic settings with one
+    /// typed warning per removal; contradictory explicit protocols still fail.
+    pub fn resolve(&self, settings: &ClientSettings) -> Result<ResolvedConsumerConfig, Error> {
         let mut native = settings.native.clone();
+        let mut warnings = Vec::new();
         let expected = if self.membership == Membership::Consumer {
             "consumer"
         } else {
@@ -103,9 +139,13 @@ impl ConsumerSettings {
             || native
                 .get("group.id")
                 .is_some_and(|value| value != self.group)
-            || native
-                .get("group.instance.id")
-                .is_some_and(|value| Some(value) != self.instance.as_deref())
+            || native.get("group.instance.id").is_some_and(|value| {
+                !identifier(value)
+                    || self
+                        .instance
+                        .as_deref()
+                        .is_some_and(|instance| value != instance)
+            })
         {
             return Err(Error::Configuration);
         }
@@ -114,9 +154,11 @@ impl ConsumerSettings {
                 "partition.assignment.strategy",
                 "session.timeout.ms",
                 "heartbeat.interval.ms",
+                "group.protocol.type",
             ] {
                 if native.get(unsupported).is_some() {
-                    return Err(Error::Configuration);
+                    native.remove(unsupported);
+                    warnings.push(ConfigurationWarning::RemovedClassicSetting(unsupported));
                 }
             }
         } else if native.get("group.remote.assignor").is_some() {
@@ -161,10 +203,10 @@ impl ConsumerSettings {
                 native.set("enable.auto.commit", "false");
             }
         }
-        // Native librdkafka's default is read_uncommitted; choose the released
-        // adapter's read_committed default explicitly unless the app overrides it.
+        // Wolverine defaults to read_uncommitted, whereas bundled librdkafka
+        // 2.12.1 defaults to read_committed. Preserve the explicit opt-in.
         if native.get("isolation.level").is_none() {
-            native.set("isolation.level", "read_committed");
+            native.set("isolation.level", "read_uncommitted");
         }
         native
             .set(
@@ -183,7 +225,7 @@ impl ConsumerSettings {
                     .max(1)
                     .to_string(),
             );
-        Ok(native)
+        Ok(ResolvedConsumerConfig { native, warnings })
     }
 
     /// Configured subscription; no application-message metadata is inspected.
@@ -199,13 +241,14 @@ fn identifier(value: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{CommitStrategy, ConsumerSettings, Membership};
+    use super::{CommitStrategy, ConfigurationWarning, ConsumerSettings, Membership};
     use crate::{ClientSettings, Limits, Topic};
     use rdkafka::client::ClientContext;
     use rdkafka::config::ClientConfig;
     use rdkafka::config::RDKafkaLogLevel;
     use rdkafka::consumer::{BaseConsumer, ConsumerContext};
     use rdkafka::error::KafkaError;
+    use std::time::Duration;
 
     struct ConstructionContext;
     impl ClientContext for ConstructionContext {
@@ -267,24 +310,113 @@ mod tests {
         assert_eq!(consumer.get("partition.assignment.strategy"), None);
         assert_eq!(consumer.get("enable.auto.offset.store"), Some("false"));
         assert_eq!(consumer.get("enable.auto.commit"), Some("false"));
-        assert_eq!(consumer.get("isolation.level"), Some("read_committed"));
+        assert_eq!(consumer.get("isolation.level"), Some("read_uncommitted"));
         assert_eq!(consumer.get("allow.auto.create.topics"), Some("false"));
     }
     #[test]
-    fn incompatible_membership_settings_are_not_silently_ignored() {
-        for key in [
+    fn isolation_defaults_to_uncommitted_and_preserves_committed_opt_in() {
+        let subscription = subscription(Membership::Classic);
+        assert_eq!(
+            subscription
+                .native_config(&client(|_| {}))
+                .unwrap()
+                .get("isolation.level"),
+            Some("read_uncommitted")
+        );
+        assert_eq!(
+            subscription
+                .native_config(&client(|native| {
+                    native.set("isolation.level", "read_committed");
+                }))
+                .unwrap()
+                .get("isolation.level"),
+            Some("read_committed")
+        );
+    }
+    #[test]
+    fn every_strategy_disables_fetched_offset_storage_and_only_store_enables_auto_commit() {
+        for strategy in [
+            CommitStrategy::StoreThenAutoFlush(Duration::from_secs(1)),
+            CommitStrategy::PerMessage,
+            CommitStrategy::BatchCount(10),
+            CommitStrategy::Interval(Duration::from_secs(1)),
+        ] {
+            let subscription = ConsumerSettings::try_new(
+                "safe-group",
+                vec![Topic::try_new("safe-topic").unwrap()],
+                Membership::Classic,
+                None,
+                strategy,
+            )
+            .unwrap();
+            let config = subscription
+                .native_config(&client(|native| {
+                    native.set("enable.auto.offset.store", "true");
+                    native.set("enable.auto.commit", "true");
+                }))
+                .unwrap();
+            assert_eq!(config.get("enable.auto.offset.store"), Some("false"));
+            assert_eq!(
+                config.get("enable.auto.commit"),
+                Some(
+                    if matches!(strategy, CommitStrategy::StoreThenAutoFlush(_)) {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                )
+            );
+        }
+    }
+    #[test]
+    fn consumer_protocol_normalizes_classic_options_once_and_preserves_identity() {
+        let removed = [
             "partition.assignment.strategy",
             "session.timeout.ms",
             "heartbeat.interval.ms",
-        ] {
-            assert!(
-                subscription(Membership::Consumer)
-                    .native_config(&client(|native| {
-                        native.set(key, "42");
-                    }))
-                    .is_err()
-            );
+            "group.protocol.type",
+        ];
+        let settings = client(|native| {
+            for key in removed {
+                native.set(key, "42");
+            }
+            native.set("group.instance.id", "stable-member");
+            native.set("fetch.min.bytes", "17");
+        });
+        let resolved = subscription(Membership::Consumer)
+            .resolve(&settings)
+            .unwrap();
+        assert_eq!(
+            resolved.warnings(),
+            removed.map(ConfigurationWarning::RemovedClassicSetting)
+        );
+        for key in removed {
+            assert_eq!(resolved.native().get(key), None);
         }
+        assert_eq!(
+            resolved.native().get("group.instance.id"),
+            Some("stable-member")
+        );
+        assert_eq!(resolved.native().get("fetch.min.bytes"), Some("17"));
+        assert_eq!(settings.native.get("group.protocol.type"), Some("42"));
+        let classic = subscription(Membership::Classic)
+            .resolve(&client(|native| {
+                native.set("group.protocol", "classic");
+                native.set("session.timeout.ms", "45000");
+                native.set("heartbeat.interval.ms", "3000");
+                native.set("group.protocol.type", "consumer");
+            }))
+            .unwrap();
+        assert!(classic.warnings().is_empty());
+        assert_eq!(classic.native().get("session.timeout.ms"), Some("45000"));
+        assert_eq!(classic.native().get("heartbeat.interval.ms"), Some("3000"));
+        assert_eq!(
+            classic.native().get("group.protocol.type"),
+            Some("consumer")
+        );
+    }
+    #[test]
+    fn contradictory_explicit_protocols_and_assignors_fail() {
         assert!(
             subscription(Membership::Classic)
                 .native_config(&client(|native| {

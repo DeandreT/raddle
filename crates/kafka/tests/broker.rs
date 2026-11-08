@@ -16,6 +16,13 @@ use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[path = "broker/custody.rs"]
+mod custody;
+#[path = "broker/membership.rs"]
+mod membership;
+#[path = "broker/transactions.rs"]
+mod transactions;
+
 fn config() -> ClientConfig {
     let servers = std::env::var("RADDLE_KAFKA_TEST_BROKERS").unwrap();
     // The fixture is an explicit synthetic loopback broker; these tests never

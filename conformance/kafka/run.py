@@ -173,9 +173,12 @@ def build_inputs(target):
 
 def test(path, command, env):
     state = load(path)
+    if len(state['containers']) != 1:
+        raise RuntimeError('Expected one owned Kafka fixture container for broker diagnostics')
     env = env.copy()
     env['RADDLE_KAFKA_TEST_BROKERS'] = state['bootstrap']
-    return subprocess.run([*command, '--', '--ignored', '--test-threads=1'], cwd=ROOT, env=env).returncode
+    env['RADDLE_KAFKA_TEST_CONTAINER'] = state['containers'][0]
+    return subprocess.run([*command, '--', '--ignored', '--test-threads=1', '--show-output'], cwd=ROOT, env=env).returncode
 
 
 def main():

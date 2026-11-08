@@ -20,11 +20,45 @@ separate so abandoned caller futures cannot build an unbounded native backlog.
 
 ## Caller-polled receiving
 
-`Receiver` subscribes to configured topics with an explicit group. Its current
-settlement profile is `CommitStrategy::PerMessage`; other offset strategies are
-rejected by this receiver rather than approximated. `ConsumerSettings::native_config`
-can independently construct provider options, but is not proof that every group
-mode or broker profile has been qualified.
+`Receiver` subscribes to configured topics with an explicit group and custody
+strategy. All four strategies disable native automatic storage of fetched
+positions, including when the supplied native config requested it:
+
+- `StoreThenAutoFlush`: store only a safe next-read watermark using plural
+  `store_offsets`, enable native auto-commit at the supplied interval, and release
+  local admission on successful safe storage. This returns `Stored`, **not**
+  `Committed`; a later uncorrelated SDK callback never settles a new assignment.
+- `PerMessage`: synchronously confirm the eligible completed prefix with Kafka.
+- `BatchCount`: flush after the configured number of new custody completions since
+  a successful flush, without recounting completed records left behind a barrier;
+  also flushing safe progress at a full admission window so a threshold larger
+  than capacity cannot stall indefinitely.
+- `Interval`: flush after elapsed time, serviced by regular caller `receive`
+  calls even on an idle topic or while admission is full. There is no independent
+  application timer task; the caller must keep polling.
+
+`flush` explicitly confirms all safe positions regardless of the count/interval,
+including locally stored positions. Graceful `shutdown` performs this same flush.
+An incomplete record always remains a barrier. Explicit commits use one partition
+per native synchronous request so a partial failure cannot falsely acknowledge a
+different partition. An uncertain result retains completed state for offset-only
+retry; no handler is resubmitted by the receiver.
+
+Isolation defaults explicitly to `read_uncommitted`, matching the released
+Wolverine contract rather than bundled librdkafka 2.12.1's `read_committed` default.
+Set native `isolation.level=read_committed` to exclude aborted transactions and
+wait behind open transactions. Kafka transactional producers are used only in
+fixtures; no transactional consume-transform-produce/offset EOS engine is implied.
+
+`ConsumerSettings::resolve` returns final provider options and typed warnings.
+KIP-848 removes `partition.assignment.strategy`, `session.timeout.ms`,
+`heartbeat.interval.ms` and `group.protocol.type`, one warning per explicit
+removal, retaining static identity and unrelated options. Report these through
+the application's diagnostics (`Receiver::configuration_warnings` retains them
+after connection). Explicit classic/cooperative selection preserves compatible
+classic settings; contradictory explicit protocols/assignors still fail. This
+explicit membership API does not implement transport-to-endpoint inheritance or
+automatic instance-ID discovery.
 
 Poll `receive()` regularly while processing to service rebalance callbacks. It
 returns one native record or `None` after a short poll, not an end-of-stream marker.
@@ -34,7 +68,8 @@ envelope header authenticates a source, tenant or group.
 
 Call `complete` only after successful handling or durable inbox commit. Concurrent
 completion order is independent of native offset order: a later record returns
-`Deferred` until all earlier observed records have custody. Numeric offset gaps
+`Deferred` until all earlier observed records have custody and the policy flushes.
+Numeric offset gaps
 do not require nonexistent records. A broker-confirmed safe prefix returns
 `Committed`. Failed commits retain completed state; `flush` retries settlement
 without repeating business work. Another receiver's or assignment's handles cannot
@@ -47,6 +82,12 @@ has one additional bounded slot for incidental records around pause/rebalance.
 At capacity, complete existing records before requesting more; this caller-polled
 profile is not a continuously pumping, host-owned handler runner. Keep processing
 within Kafka's configured maximum poll interval.
+
+Application ownership generations fence stale/foreign completion and preserve
+unaffected partitions during incremental revocation. They are not broker member
+epochs or leader epochs. The safe SDK does not expose consumed leader-epoch
+propagation for computed watermark TPLs; no full KIP-320/log-truncation guarantee
+is claimed.
 
 An opaque native polling failure returns `ReceiverFenced` and prevents subsequent
 offset settlement. For example, a CRC failure can skip a native batch without
@@ -66,7 +107,9 @@ allocation risk.
 
 Call `Receiver::shutdown` to join pending native calls and close the consumer off
 an async worker. Unfinished records remain uncommitted. Native shutdown/Drop itself
-is not a hard-deadline guarantee. This native profile does not establish durable
+is not a hard-deadline guarantee. Await shutdown to completion: cancelling during
+its preliminary flush or simply dropping a Receiver is not graceful close and can
+run native destruction on the dropping thread. This native profile does not establish durable
 key scheduling, replay/hot-tail, retry/DLQ topic workflows or schema interoperability.
 
 The SDK owns native worker threads. Call `Publisher::shutdown().await` to flush
