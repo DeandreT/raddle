@@ -475,3 +475,79 @@ async fn caller_diagnostic_context_reaches_the_actual_output_handler() {
         6
     );
 }
+
+type WakingSource = Pin<Box<dyn Stream<Item = Result<u32, Failed>> + Send>>;
+
+struct Waking(oneshot::Receiver<u32>);
+
+impl Request for Waking {
+    type Reply = WakingSource;
+    type Error = Failed;
+}
+
+#[tokio::test]
+async fn pending_output_source_wakes_and_delivers_its_next_item() {
+    let mut runtime = RuntimeBuilder::default();
+    runtime
+        .handle(|request: Waking| async move {
+            Ok(Box::pin(stream::once(
+                async move { request.0.await.map_err(|_| Failed) },
+            )) as WakingSource)
+        })
+        .unwrap();
+    let bus = BusBuilder::new(runtime.build()).build();
+    let (send, receive) = oneshot::channel();
+    let mut output = bus.stream(Waking(receive), StreamOptions::default());
+    let mut next = Box::pin(output.next());
+    assert!(futures_util::poll!(&mut next).is_pending());
+    send.send(42).unwrap();
+    assert_eq!(next.await.unwrap().unwrap(), 42);
+    assert!(output.next().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_and_cancellation_while_waiting_admission_never_poll_source() {
+    let bus = bus();
+    let (held, _, held_drops) = probe(vec![Ok(1)], false);
+    let (_release, gate) = oneshot::channel();
+    let mut held = output(held);
+    held.gate = Some(gate);
+    let mut busy = bus.stream(held, StreamOptions::default());
+    let mut busy_next = Box::pin(busy.next());
+    assert!(futures_util::poll!(&mut busy_next).is_pending());
+
+    let (late, polls, drops) = probe(vec![Ok(2)], false);
+    let options = StreamOptions {
+        timeout: Duration::from_secs(1),
+        ..StreamOptions::default()
+    };
+    assert!(matches!(
+        bus.stream(output(late), options).next().await,
+        Some(Err(StreamError::TimedOut))
+    ));
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    let (input, polls, drops) = probe(vec![Ok(3)], false);
+    let options = StreamOptions::default();
+    let cancel = options.cancellation.clone();
+    let mut waiting = Box::pin(bus.invoke_stream(InputStream::<_, u32, _>::new(input), options));
+    assert!(futures_util::poll!(&mut waiting).is_pending());
+    cancel.cancel();
+    assert!(matches!(waiting.await, Err(StreamError::Cancelled)));
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    drop(busy_next);
+    drop(busy);
+    assert_eq!(held_drops.load(Ordering::SeqCst), 1);
+    let (healthy, _, _) = probe(vec![Ok(4)], false);
+    assert_eq!(
+        bus.stream(output(healthy), StreamOptions::default())
+            .next()
+            .await
+            .unwrap()
+            .unwrap(),
+        4
+    );
+}
