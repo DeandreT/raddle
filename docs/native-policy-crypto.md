@@ -34,6 +34,11 @@ custody; a false notification is not cancellation.
 
 The memory driver supplies OS-random rule jitter samples by default;
 `with_jitter_source` installs a deterministic application-owned sampler.
+One sample is drawn per failed attempt. The rule independently jitters each
+original cooldown/scheduled delay and listener pause once with that same sample;
+it never jitters their sum or a duration already jittered by another component.
+Pause and recovery delays retain their separate clocks/effects rather than
+becoming an additional sequential wait.
 
 `ReplaySafety::Never` is the default. `Idempotent` means the application guards
 effects with a stable key; `Transactional` means all failed-attempt effects
@@ -67,9 +72,17 @@ and cancellation releases the probe without sampling it.
 windows and RAII concurrency permits. Clones share atomic in-process admission.
 `ScopedQuotas` uses endpoint configuration before message fallback, and never
 allocates per attacker-supplied header or endpoint. `with_quotas` checks before
-attempts, retains limited work and pauses/reschedules until the next known
+every actual execution, including inline retries and after cooldown, retains
+limited work and pauses/reschedules until the next known
 eligibility time. These are not a distributed store, timezone calendar policies,
 or a SQL Server provider.
+
+Concurrency admission is held only for the actual operation and released before
+recovery/cooldown, cancellation or future drop. A retry must acquire its own
+permit, never a second permit while holding the previous one. Time quota refusal
+does not advance attempts or enter receive-circuit observations. A quota-denied
+half-open probe is released; interrupted probes remain explicitly recoverable
+without being treated as failed samples.
 
 ## Terminal and unknown-message paths
 
@@ -108,6 +121,16 @@ and no implicit global cache or background task exists. `SecretKey` is private,
 nonserializable, redacted in Debug and zeroized on Drop. Expanded AES and hash
 state zeroization is explicitly enabled in the RustCrypto dependencies. The
 application must clear any key-byte copies it imported.
+
+Retired IDs remain permanently reserved for the ring's lifetime, including
+across clones, even if reinsertion proposes identical bytes. Retirement frees
+live-key capacity but not the finite ID history. `RotatingKeys::new` permits up
+to 4096 successful lifetime IDs; `with_lifetime_id_budget` configures a budget
+between live capacity and 65536. Exhaustion refuses new insertions without
+replacing active keys or evicting reservations. Rejected insertions spend no ID
+budget. The metadata is therefore bounded, not an unbounded tombstone set.
+Applications replacing a ring or implementing an external provider must retain
+key-ID uniqueness across provider lifetimes while historical ciphertext exists.
 
 Encryption uses RustCrypto AES-256-GCM with a fresh 96-bit nonce from the OS
 CSPRNG for every encode. Random nonce uniqueness is probabilistic, not a global

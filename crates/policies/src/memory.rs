@@ -98,6 +98,12 @@ pub struct InMemoryEndpoint {
     quotas: Option<Arc<crate::ScopedQuotas>>,
     jitter: Box<dyn FnMut() -> Result<u64, DriverError> + Send>,
 }
+
+enum AttemptOutcome {
+    Completed(Result<(), PolicyError>),
+    Limited(Option<Duration>),
+    Cancelled,
+}
 impl InMemoryEndpoint {
     /// Capacity bounds queued and retained terminal deliveries together.
     pub fn new(
@@ -289,44 +295,80 @@ impl InMemoryEndpoint {
         else {
             return Ok(false);
         };
-        let index = self.queue[position];
-        let _permit = if let Some(quota) = self.quotas.as_ref().and_then(|quotas| {
-            quotas.select(&self.name, self.deliveries[index].envelope.contract())
-        }) {
-            match quota.acquire(now).map_err(|_| DriverError::Invalid)? {
-                crate::QuotaAdmission::Granted(permit) => Some(permit),
-                crate::QuotaAdmission::Limited { retry_at } => {
-                    if let Some(due) = retry_at {
-                        self.deliveries[index].due = due;
-                        self.paused_until = self.paused_until.max(due);
-                    }
-                    return Ok(false);
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(circuit) = &mut self.circuit
-            && matches!(circuit.admission(now), CircuitAdmission::Paused(_))
-        {
-            return Ok(false);
-        }
         let index = self.queue.remove(position).ok_or(DriverError::Custody)?;
         self.active = Some(index);
         self.deliveries[index].status = MemoryStatus::Active;
+        let quota = self
+            .quotas
+            .as_ref()
+            .and_then(|quotas| {
+                quotas.select(&self.name, self.deliveries[index].envelope.contract())
+            })
+            .cloned();
         let started = tokio::time::Instant::now();
+        let mut executed = false;
         loop {
-            self.deliveries[index]
-                .attempts
-                .begin(self.direction)
-                .map_err(|_| DriverError::Invalid)?;
-            let result = tokio::select! {
-                biased;
-                _ = driver::wait_for_stop(stop) => {
-                    if let Some(circuit) = &mut self.circuit { circuit.record(now, None, true).map_err(|_| DriverError::Invalid)?; }
-                    self.transition(Transition::Retain).await?; return Ok(true);
+            let current = now
+                .checked_add(started.elapsed())
+                .ok_or(DriverError::Invalid)?;
+            if driver::stopped(stop) {
+                if let Some(circuit) = &mut self.circuit {
+                    circuit.cancel_probe();
                 }
-                result = operation(self.deliveries[index].envelope.clone()) => result,
+                self.transition(Transition::Retain).await?;
+                return Ok(executed);
+            }
+            if current < self.paused_until {
+                self.transition(Transition::QueueAt(self.paused_until))
+                    .await?;
+                return Ok(executed);
+            }
+            if let Some(circuit) = &mut self.circuit
+                && let CircuitAdmission::Paused(until) = circuit.admission(current)
+            {
+                self.transition(Transition::QueueAt(until)).await?;
+                return Ok(executed);
+            }
+            let outcome = tokio::select! {
+                biased;
+                _ = driver::wait_for_stop(stop) => AttemptOutcome::Cancelled,
+                outcome = async {
+                    // Admission belongs to each actual call, not to the outer
+                    // delivery/retry loop. Release concurrency admission before
+                    // recovery/cooldown; never acquire a second permit while
+                    // retaining the first one.
+                    let _permit = match &quota {
+                        Some(quota) => match quota.acquire(current).map_err(|_| DriverError::Invalid)? {
+                            crate::QuotaAdmission::Granted(permit) => Some(permit),
+                            crate::QuotaAdmission::Limited { retry_at } => return Ok(AttemptOutcome::Limited(retry_at)),
+                        },
+                        None => None,
+                    };
+                    self.deliveries[index].attempts.begin(self.direction).map_err(|_| DriverError::Invalid)?;
+                    executed = true;
+                    Ok::<_, DriverError>(AttemptOutcome::Completed(operation(self.deliveries[index].envelope.clone()).await))
+                } => outcome?,
+            };
+            let result = match outcome {
+                AttemptOutcome::Completed(result) => result,
+                AttemptOutcome::Limited(retry_at) => {
+                    if let Some(circuit) = &mut self.circuit {
+                        circuit.cancel_probe();
+                    }
+                    let due = retry_at.unwrap_or(current);
+                    if retry_at.is_some() {
+                        self.paused_until = self.paused_until.max(due);
+                    }
+                    self.transition(Transition::QueueAt(due)).await?;
+                    return Ok(executed);
+                }
+                AttemptOutcome::Cancelled => {
+                    if let Some(circuit) = &mut self.circuit {
+                        circuit.cancel_probe();
+                    }
+                    self.transition(Transition::Retain).await?;
+                    return Ok(executed);
+                }
             };
             let current = now
                 .checked_add(started.elapsed())
@@ -366,11 +408,6 @@ impl InMemoryEndpoint {
                     };
                     let transition = executor.failed(self, context, &*error, stop).await?;
                     if transition != Transition::RetryInline {
-                        return Ok(true);
-                    }
-                    if self.paused_until > current {
-                        self.transition(Transition::QueueAt(self.paused_until))
-                            .await?;
                         return Ok(true);
                     }
                     // An explicitly indefinite immediate policy still yields

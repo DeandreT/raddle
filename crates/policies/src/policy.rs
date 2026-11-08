@@ -168,7 +168,9 @@ impl Plan {
             jitter,
         })
     }
-    /// Returns the slot for a 1-based actual attempt; zero is invalid.
+    /// Returns the slot for a 1-based actual attempt; zero is invalid. The same
+    /// sample independently scales each original action/pause delay once. A
+    /// composite step never jitters an already-jittered duration or their sum.
     pub fn step(&self, attempt: u64, sample: u64) -> Result<Step, PolicyErrorCode> {
         let index = attempt.checked_sub(1).ok_or(PolicyErrorCode)?;
         let mut step = usize::try_from(index)
@@ -184,6 +186,9 @@ impl Plan {
             Action::Schedule(d) => Action::Schedule(self.jitter.delay(d, attempt, sample)),
             action => action,
         };
+        step.pause = step
+            .pause
+            .map(|delay| self.jitter.delay(delay, attempt, sample));
         Ok(step)
     }
 }
