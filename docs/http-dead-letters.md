@@ -4,8 +4,8 @@
 management at `/dead-letters`. `dead_letters_at(prefix, store, authorizer)` selects
 an absolute nonempty ASCII prefix without a trailing slash, parameters, query or
 fragment or dot-path segments. Neither registration starts a listener. The existing
-business API,
-payload-free `operations` routes and explicitly confirmed CLI remain unchanged.
+business API, payload-free `operations` routes and explicitly confirmed CLI remain
+unchanged.
 Apply the versioned PostgreSQL migrations in a controlled migration step first.
 
 The registered contracts and OpenAPI operations come from the same types:
@@ -56,17 +56,34 @@ strings up to 128 bytes; classified error filters are exact up to 64 bytes.
 Unknown fields and empty/control-character filter strings are rejected. There
 are no SQL expressions, wildcard scans or unrestricted exception-message searches.
 
-The response contains `items` and `next_after`. Each item carries delivery `id`,
+The response contains `items`, `unavailable` and `next_after`. Each readable item
+carries delivery `id`,
 original `message_id`, durable `sequence`, destination and the validated canonical
 raddle `envelope` (including actual failed payload, correlation and bounded
 headers). Envelopes are limited to 1 MiB and 32 validated headers, so no query can
-return more than ten bounded canonical envelopes. Storage-protected or corrupt
-framing is not decrypted or returned as raw data by this slice; it yields a fixed
-payload-free failure instead. Do not log successful private response bodies.
+return more than ten bounded canonical envelopes. Do not log successful private
+response bodies.
+
+Unreadable candidates appear in `unavailable`, containing only the trusted
+persisted delivery `id`, `sequence` and the fixed outcome `payload_unavailable`.
+Invalid canonical framing, a mismatch with the persisted message identity, and
+reserved `raddle-aes*` protected payload framing all use that same outcome. No
+claimed envelope identity, parser explanation, protected bytes, or partial payload
+is returned; this slice does not decrypt. A bad candidate cannot prevent readable
+neighbors from appearing in the same page or later pages. Search leaves the stored
+bytes, custody state, fencing and audits unchanged: it does not acknowledge,
+publish, replay or discard a candidate merely because its payload is unavailable.
+Database, schema and query failures remain real HTTP errors, not row outcomes.
 
 Destination/error filtering runs in PostgreSQL. Contract matching validates only
-the bounded candidate page, rather than reading every failed payload. Follow
-`next_after` even when `items` is empty; null means the scan reached the end.
+the bounded candidate page, rather than reading every failed payload. The combined
+number of `items` and `unavailable` entries never exceeds `limit`. An unavailable
+candidate cannot establish a contract match, so its marker remains visible even
+when a contract filter is supplied; it is not asserted to match that contract.
+Follow `next_after` even when `items` is empty; the cursor advances past every
+fetched candidate, including unreadable and nonmatching candidates. Null means
+the scan reached the end. No caller-side cursor guessing or database access is
+needed to continue beyond an unavailable payload.
 Concurrent mutations can change later pages: pagination is not a cross-request
 snapshot, and no unbounded total-count scan is performed. Query transactions are
 explicitly read-only with a two-second statement and HTTP execution budget.
@@ -163,6 +180,7 @@ permission, then run `cargo test -p raddle-axum --test dead_letters -- --include
 The package-local migration upgrade test runs with
 `cargo test -p raddle-postgres --test dead_letters -- --include-ignored`.
 They exercise default/custom routes and generated contracts, roles and tenant
-isolation, payload search/filter/cursors, bounds, audit rollback, invalid/stale/audit
+isolation, payload search/filter/cursors, unreadable first/middle/last candidates
+and protected framing, bounds, audit rollback, invalid/stale/audit
 failures at the beginning/middle/end, corrected failed-only retries, deadline
 cancellation, retained discard identity/deduplication and partition progress.

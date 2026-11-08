@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use raddle::wire::Envelope;
+use serde_json::Value;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -35,16 +36,47 @@ pub struct DeadLetter {
     pub envelope: Envelope,
 }
 
+/// An unreadable candidate identified only by trusted persisted custody metadata.
+/// No unvalidated envelope fields, protected bytes, or parser errors are returned.
+pub struct UnavailableDeadLetter {
+    /// Persisted delivery identity within the caller's authorized tenant.
+    pub id: Uuid,
+    /// Persisted sequence; pagination advances past this candidate.
+    pub sequence: i64,
+}
+
 /// Bounded matching page; follow the cursor even if this scan found no matches.
 pub struct DeadLetterScan {
     /// Matching data, no more than the requested limit.
     pub items: Vec<DeadLetter>,
+    /// Unreadable candidates, including protected framing and identity mismatches.
+    /// Together with `items`, never exceeds the candidate limit. These entries
+    /// cannot establish a contract match and remain visible with a contract filter.
+    pub unavailable: Vec<UnavailableDeadLetter>,
     /// Exclusive continuation cursor or null when the bounded scan reached the end.
     pub next_after: Option<i64>,
 }
 
 fn bounded(value: &str, maximum: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn readable_envelope(bytes: &[u8], message_id: Uuid) -> Option<Envelope> {
+    let envelope = Envelope::from_slice(bytes, Default::default()).ok()?;
+    if envelope.id() != message_id {
+        return None;
+    }
+    // Native encryption keeps a canonical outer envelope, so canonical parsing
+    // alone is insufficient to identify its protected body. Recognize
+    // the codec's reserved framing namespace without decrypting or exposing it.
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    if value["payload"]["format"]
+        .as_str()
+        .is_some_and(|format| format.starts_with("raddle-aes"))
+    {
+        return None;
+    }
+    Some(envelope)
 }
 
 impl Store {
@@ -69,8 +101,11 @@ impl Store {
     /// Destination/error filters run in SQL; contract filtering validates canonical
     /// envelopes within the bounded candidate page. This may return an empty page
     /// with a continuation cursor, avoiding an unbounded payload scan. Each envelope
-    /// is limited to 1 MiB with at most 32 bounded headers. Corrupt or protected
-    /// framing is rejected, never returned as raw unvalidated data.
+    /// is limited to 1 MiB with at most 32 bounded headers. Corrupt framing,
+    /// mismatched envelope identities and reserved protected payloads produce
+    /// payload-free `unavailable` entries without blocking healthy candidates.
+    /// The cursor advances past every candidate, even unreadable or filtered rows.
+    /// Database/query failures remain errors, not per-row payload classifications.
     /// The caller must independently authorize private payload access and the tenant.
     pub async fn search_dead_letters(
         &self,
@@ -101,21 +136,27 @@ impl Store {
             .bind(tenant).bind(query.after).bind(&query.destination).bind(&query.error_code)
             .bind(i64::from(query.limit)).fetch_all(&mut *transaction).await?;
         let mut items = Vec::with_capacity(rows.len());
+        let mut unavailable = Vec::new();
         let mut after = query.after;
         for row in rows {
             after = row.try_get("sequence")?;
-            let envelope =
-                Envelope::from_slice(&row.try_get::<Vec<u8>, _>("envelope")?, Default::default())?;
-            if envelope.id() != row.try_get::<Uuid, _>("message_id")? {
-                return Err(Error::Invalid("corrupt persisted identity"));
-            }
+            let id = row.try_get("id")?;
+            let message_id = row.try_get("message_id")?;
+            let bytes: Vec<u8> = row.try_get("envelope")?;
+            let Some(envelope) = readable_envelope(&bytes, message_id) else {
+                unavailable.push(UnavailableDeadLetter {
+                    id,
+                    sequence: after,
+                });
+                continue;
+            };
             if query
                 .contract
                 .as_deref()
                 .is_none_or(|name| envelope.contract() == name)
             {
                 items.push(DeadLetter {
-                    id: row.try_get("id")?,
+                    id,
                     sequence: after,
                     destination: row.try_get("destination")?,
                     envelope,
@@ -128,6 +169,7 @@ impl Store {
         transaction.commit().await?;
         Ok(DeadLetterScan {
             items,
+            unavailable,
             next_after: more.then_some(after),
         })
     }

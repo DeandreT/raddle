@@ -84,11 +84,34 @@ pub struct DeadLetterView {
     pub envelope: Value,
 }
 
+/// Fixed read outcome, without exposing the kind of protected or corrupt content.
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DeadLetterReadOutcome {
+    /// The candidate's payload cannot safely be returned by this management view.
+    PayloadUnavailable,
+}
+
+/// An unreadable candidate represented only by trusted persisted custody metadata.
+#[derive(Serialize, JsonSchema)]
+pub struct DeadLetterUnavailableView {
+    /// Persisted delivery ID within the authenticated tenant, not an envelope claim.
+    pub id: Uuid,
+    /// Persisted sequence; pagination advances past this candidate.
+    pub sequence: i64,
+    /// Fixed classification, with no payload bytes, claimed identity or parser text.
+    pub outcome: DeadLetterReadOutcome,
+}
+
 /// A bounded scan page. An empty page may still have a continuation cursor.
 #[derive(Serialize, JsonSchema)]
 pub struct DeadLetterPage {
     /// Matching canonical messages, at most the requested limit.
     pub items: Vec<DeadLetterView>,
+    /// Payload-free unreadable candidates. Combined with `items`, bounded by the
+    /// requested candidate limit. Their contract cannot be verified by this view.
+    pub unavailable: Vec<DeadLetterUnavailableView>,
     /// Continue here, or stop when null. This is not a snapshot across requests.
     pub next_after: Option<i64>,
 }
@@ -239,7 +262,10 @@ impl ApiBuilder {
                             envelope: serde_json::to_value(item.envelope).map_err(|_| ApiError::unavailable())?,
                         })
                     }).collect::<Result<_, ApiError>>()?;
-                    Ok::<_, ApiError>(Json(DeadLetterPage { items, next_after: page.next_after }))
+                    let unavailable = page.unavailable.into_iter().map(|item| DeadLetterUnavailableView {
+                        id: item.id, sequence: item.sequence, outcome: DeadLetterReadOutcome::PayloadUnavailable,
+                    }).collect();
+                    Ok::<_, ApiError>(Json(DeadLetterPage { items, unavailable, next_after: page.next_after }))
                 }
             }
         ).delete(move |Extension(principal): Extension<Principal>, body: Result<Json<DeadLetterMutation>, JsonRejection>| {

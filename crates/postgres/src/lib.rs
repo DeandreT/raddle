@@ -18,7 +18,7 @@ mod worker;
 pub use conversation::{
     Cancellation, Conversation, ConversationStatus, ReplyDisposition, RequestOptions,
 };
-pub use dead_letters::{DeadLetter, DeadLetterQuery, DeadLetterScan};
+pub use dead_letters::{DeadLetter, DeadLetterQuery, DeadLetterScan, UnavailableDeadLetter};
 pub use error::Error;
 pub use job::{Claim, Delivery, DeliveryKind, FailureDisposition, Job, JobStatus, RetryPolicy};
 pub use recurring::{

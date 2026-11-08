@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 #[path = "dead_letters/cancellation.rs"]
 mod cancellation;
+#[path = "dead_letters/isolation.rs"]
+mod isolation;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct Failed {
