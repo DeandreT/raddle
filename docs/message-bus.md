@@ -1,5 +1,8 @@
 # Application message bus
 
+See [native handler dispatch](handler-dispatch.md) for opt-in ordered classic
+composition, independent subscriptions and endpoint-specific sticky selections.
+
 `raddle-messaging` is an explicit application layer above the low-level runtime.
 It does not change `Runtime::invoke`, `Runtime::publish`, or the caller-driven
 `cascade` API. In particular, an ordinary low-level invocation still returns
