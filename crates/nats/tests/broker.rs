@@ -490,6 +490,74 @@ async fn native_schedules_scope_equal_uuids_and_unscoped_controls_never_replace(
 
 #[tokio::test]
 #[ignore = "requires disposable real NATS JetStream fixture"]
+async fn delayed_first_arrival_and_sparse_pages_keep_conservative_usable_leases() {
+    let prefix = format!("t{}", uuid::Uuid::new_v4().simple());
+    let subject = format!("{prefix}.orders");
+    let bus = core(vec![route("orders", &subject)]).await;
+    let jet = JetStream::new(bus.clone(), None).unwrap();
+    jet.provision_stream(
+        StreamConfig {
+            name: prefix.clone(),
+            subjects: vec![subject.clone()],
+            ..StreamConfig::default()
+        },
+        Provision::Create,
+    )
+    .await
+    .unwrap();
+    let mut config = consumer("workers", &subject);
+    config.ack_wait = Duration::from_secs(1);
+    let mut receiver = jet
+        .receiver(
+            &prefix,
+            config,
+            Provision::Create,
+            source(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let delayed = Envelope::encode(&Order(1)).unwrap();
+    let (received, published) = tokio::join!(receiver.receive(1, Duration::from_secs(5)), async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        jet.send("orders", &delayed, PublishOptions::default())
+            .await
+    });
+    published.unwrap();
+    let mut held = received
+        .unwrap()
+        .pop()
+        .expect("arrival after two AckWait periods");
+    assert!(held.is_owned());
+    assert_eq!(held.decode().unwrap().id(), delayed.id());
+    held.progress().await.unwrap();
+    held.complete().await.unwrap();
+    let sparse = Envelope::encode(&Order(2)).unwrap();
+    jet.send("orders", &sparse, PublishOptions::default())
+        .await
+        .unwrap();
+    // Two missing members must not hold the first for the caller's five-second wait.
+    let mut page = receiver.receive(3, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(page.len(), 1);
+    let mut held = page.pop().unwrap();
+    assert!(held.is_owned());
+    assert_eq!(held.decode().unwrap().id(), sparse.id());
+    held.progress().await.unwrap();
+    held.complete().await.unwrap();
+    assert!(
+        receiver
+            .receive(1, Duration::from_millis(100))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(receiver);
+    drop(jet);
+    bus.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable real NATS JetStream fixture"]
 async fn deleted_consumer_and_expired_queued_receipts_cannot_admit_or_ack_work() {
     let prefix = format!("t{}", uuid::Uuid::new_v4().simple());
     let subject = format!("{prefix}.orders");

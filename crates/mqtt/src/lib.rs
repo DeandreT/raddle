@@ -5,6 +5,7 @@ mod config;
 mod delivery;
 mod publisher;
 mod session;
+mod snapshot;
 
 pub use clients::Clients;
 pub use config::{Bounds, Error, PublishOptions, Route, Source, validate_topic};
@@ -14,3 +15,4 @@ pub use rumqttc::v5::MqttOptions;
 pub use rumqttc::v5::mqttbytes::QoS;
 pub use rumqttc::{TlsConfiguration, Transport as NetworkTransport};
 pub use session::{Acceptance, Session};
+pub use snapshot::QuarantineSnapshot;

@@ -111,3 +111,140 @@ async fn negative_puback_first_middle_last_does_not_confirm_or_block_other_order
         );
     }
 }
+
+async fn accept_subscription(listener: &TcpListener) -> TcpStream {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    assert_eq!(packet(&mut socket).await.0 >> 4, 1);
+    // A fresh native broker session, explicitly without session continuity.
+    socket.write_all(&[0x20, 3, 0, 0, 0]).await.unwrap();
+    let (header, subscribe) = packet(&mut socket).await;
+    assert_eq!(header, 0x82);
+    socket
+        .write_all(&[0x90, 4, subscribe[0], subscribe[1], 0, 1])
+        .await
+        .unwrap();
+    socket
+}
+
+async fn incoming_packet_one(socket: &mut TcpStream, envelope: &Envelope) {
+    let mut body = vec![0, 6];
+    body.extend_from_slice(b"orders");
+    body.extend_from_slice(&[0, 1, 0]); // packet ID 1; no MQTT5 properties
+    body.extend_from_slice(&envelope.to_vec().unwrap());
+    let mut bytes = vec![0x32];
+    let mut remaining = body.len();
+    loop {
+        let mut digit = (remaining % 128) as u8;
+        remaining /= 128;
+        if remaining != 0 {
+            digit |= 128;
+        }
+        bytes.push(digit);
+        if remaining == 0 {
+            break;
+        }
+    }
+    bytes.extend_from_slice(&body);
+    socket.write_all(&bytes).await.unwrap();
+}
+
+#[tokio::test]
+async fn receive_disconnect_fails_closed_and_old_receipt_cannot_ack_reused_packet_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (held_ready, held_ready_rx) = tokio::sync::oneshot::channel();
+    let (old_attempted, old_attempted_rx) = tokio::sync::oneshot::channel();
+    let (no_stale_ack, no_stale_ack_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut old = accept_subscription(&listener).await;
+        incoming_packet_one(&mut old, &Envelope::encode(&Order(1)).unwrap()).await;
+        held_ready_rx.await.unwrap();
+        old.shutdown().await.unwrap();
+        drop(old);
+        let mut fresh = accept_subscription(&listener).await;
+        incoming_packet_one(&mut fresh, &Envelope::encode(&Order(2)).unwrap()).await;
+        old_attempted_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), packet(&mut fresh))
+                .await
+                .is_err(),
+            "old receipt acknowledged a new unprocessed packet"
+        );
+        no_stale_ack.send(()).unwrap();
+        let (header, body) = packet(&mut fresh).await;
+        assert_eq!(header, 0x40);
+        assert_eq!(&body[..2], &[0, 1]);
+    });
+    let new_session = || {
+        Session::new(
+            MqttOptions::new("reused-packet-id", "127.0.0.1", port),
+            Source {
+                client: "peer".into(),
+                tenant: "trusted".into(),
+                endpoint: "orders".into(),
+            },
+            vec![Route {
+                alias: "orders".into(),
+                topic: "orders".into(),
+            }],
+            Bounds {
+                timeout: Duration::from_secs(3),
+                ..Bounds::default()
+            },
+        )
+        .unwrap()
+    };
+    let mut original = new_session();
+    original
+        .subscribe("orders", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let mut old = original
+        .receive(1, Duration::from_secs(3))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(old.decode().unwrap().decode::<Order>().unwrap().0, 1);
+    held_ready.send(()).unwrap();
+    assert!(matches!(
+        original.receive(1, Duration::from_secs(3)).await,
+        Err(Error::Uncertain)
+    ));
+    assert!(original.is_unresolved());
+    assert!(matches!(
+        original.complete(&mut old).await,
+        Err(Error::Unresolved)
+    ));
+    assert!(matches!(
+        original.receive(1, Duration::from_secs(1)).await,
+        Err(Error::Unresolved)
+    ));
+    let mut replacement = new_session();
+    replacement
+        .subscribe("orders", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let mut fresh = replacement
+        .receive(1, Duration::from_secs(3))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(fresh.decode().unwrap().decode::<Order>().unwrap().0, 2);
+    assert!(matches!(
+        replacement.complete(&mut old).await,
+        Err(Error::Lost)
+    ));
+    old_attempted.send(()).unwrap();
+    no_stale_ack_rx.await.unwrap();
+    replacement.complete(&mut fresh).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(fresh);
+    drop(old);
+    drop(replacement);
+    drop(original);
+}

@@ -40,6 +40,7 @@ pub struct Session {
     incoming: VecDeque<Publish>,
     outstanding: Arc<AtomicUsize>,
     unresolved: bool,
+    connected: bool,
 }
 impl Session {
     /// Builds a caller-polled client. TLS/WebSocket/auth properties stay on the caller's
@@ -104,6 +105,7 @@ impl Session {
             incoming: VecDeque::new(),
             outstanding: Arc::new(AtomicUsize::new(0)),
             unresolved: false,
+            connected: false,
         })
     }
     /// Current client ID without exposing passwords, certificates or token material.
@@ -351,7 +353,11 @@ impl Session {
             match self.poll(deadline).await {
                 Ok(Event::Incoming(Packet::Publish(p))) => self.buffer(p)?,
                 Ok(_) => {}
-                Err(Error::Uncertain) if tokio::time::Instant::now() >= deadline => break,
+                Err(Error::Uncertain)
+                    if !self.unresolved && tokio::time::Instant::now() >= deadline =>
+                {
+                    break;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -421,10 +427,11 @@ impl Session {
         };
         self.publish(reply_alias, envelope, qos, options).await
     }
-    /// Retains a raw poison snapshot under a unique child of a trusted route before
+    /// Retains a version-framed poison snapshot under a unique child of a trusted route before
     /// acknowledging its source. Returns the retained topic for inspection/replay/clear.
     /// This is broker-retained state, not an end-consumer completion or database commit.
-    /// MQTT has no cross-topic transaction: crash/redelivery can create duplicate snapshots.
+    /// `QuarantineSnapshot` recovers exact bytes, including empty input. MQTT has no
+    /// cross-topic transaction: crash/redelivery can create duplicate snapshots.
     pub async fn quarantine(
         &mut self,
         message: &mut HeldMessage,
@@ -453,11 +460,12 @@ impl Session {
         config::validate_topic(&topic, false)?;
         let properties = PublishProperties {
             user_properties: vec![("raddle-quarantine-reason".into(), reason.into())],
+            content_type: Some("application/vnd.raddle.mqtt-quarantine.v1".into()),
             ..PublishProperties::default()
         };
         self.send(
             &topic,
-            message.publish.payload.to_vec(),
+            crate::QuarantineSnapshot::encode(&message.publish.payload),
             QoS::AtLeastOnce,
             properties,
             true,
@@ -485,10 +493,15 @@ impl Session {
             .set_credentials(username, token)
             .set_authentication_method(authentication_method);
         self.eventloop.clean();
+        self.connected = false;
+        self.id = uuid::Uuid::new_v4();
         Ok(())
     }
     /// Explicitly disconnects and drops the caller-owned socket/eventloop. No worker survives.
     pub async fn close(mut self) -> Result<(), Error> {
+        // Dropping a poisoned session is safe; polling it to send Disconnect could
+        // reconnect and flush stale queued requests into a different native session.
+        self.ready()?;
         self.client.try_disconnect().map_err(|_| Error::Uncertain)?;
         let deadline = tokio::time::Instant::now() + self.bounds.timeout;
         loop {
@@ -508,10 +521,27 @@ impl Session {
         }
     }
     async fn poll(&mut self, deadline: tokio::time::Instant) -> Result<Event, Error> {
-        tokio::time::timeout_at(deadline, self.eventloop.poll())
-            .await
-            .map_err(|_| Error::Uncertain)?
-            .map_err(|_| Error::Uncertain)
+        match tokio::time::timeout_at(deadline, self.eventloop.poll()).await {
+            // An ordinary idle receive deadline does not change the native session.
+            Err(_) => Err(Error::Uncertain),
+            Ok(Err(_)) | Ok(Ok(Event::Incoming(Packet::Disconnect(_)))) => {
+                self.unresolved = true;
+                Err(Error::Uncertain)
+            }
+            Ok(Ok(event)) => {
+                if matches!(&event, Event::Incoming(Packet::ConnAck(_))) {
+                    // Packet IDs are only meaningful in one native connection/session.
+                    // Even an apparently resumed reconnect is not allowed to reuse held
+                    // receipts: require replacement rather than guessing continuity.
+                    if self.connected {
+                        self.unresolved = true;
+                        return Err(Error::Uncertain);
+                    }
+                    self.connected = true;
+                }
+                Ok(event)
+            }
+        }
     }
     fn buffer(&mut self, publish: Publish) -> Result<(), Error> {
         if self.incoming.len() + self.outstanding.load(Ordering::Relaxed)

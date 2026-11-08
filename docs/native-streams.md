@@ -89,6 +89,14 @@ double-acknowledges **after** the application commits inbox custody or handling.
 A crash between copy and TERM can duplicate the copy; its deterministic native
 dedup key only protects the broker's configured deduplication window.
 
+Each pull uses a fresh SDK inbox and collects for at most half AckWait. Its
+receipt deadlines start conservatively before that request, not when an SDK
+buffer happens to be read. Empty pulls repeat within the caller's total wait;
+a nonempty partial page does not wait through another pull. Thus a long wait for
+the first arrival does not consume that delivery's entire lease, and sparse pages
+return before their earliest possible expiry. A scheduler/OS stall may still leave
+no usable members; expired copies stay unacknowledged for broker redelivery.
+
 `progress` requests an AckProgress confirmation before extending the local deadline,
 bounded by the original extension ceiling. Applications must renew queued **and**
 running receipts. No-responder/status replies, cancellation and uncertainty invalidate
@@ -162,6 +170,12 @@ Failures receive a bounded retry delay so even one-member passes cannot keep
 selecting the same poison entry ahead of unrelated due work.
 Identity/content/time/target conflicts are refused; completed scheduling identities
 remain indexed so uncertain scheduling retries do not duplicate completed work.
+The five-key format includes a `:state` hash with registering/scheduled/complete
+phases. A failed registration repairs missing membership on an identical retry;
+metadata alone is never proof of scheduling or completion. Release records the
+completion phase before removing membership. Unmarked legacy metadata is refused
+as ambiguous rather than silently replayed or accepted; use a fresh trusted namespace
+or an application-owned migration that verifies outstanding and completed identities.
 The application owns index retention. On Redis Cluster, all scheduling keys and
 target streams must share the caller-selected hash slot. No hidden scheduler
 task, broad cleanup policy, or cluster-wide cross-slot transaction is implied.
@@ -189,6 +203,11 @@ also invalidates the current client exchange state, unlike an ordinary negative
 QoS1 PubAck which permits unrelated follow-on publications. Replace an unresolved session;
 do not let stale packet IDs confirm another publication. Reuse the original
 envelope identity when retrying an uncertain publication.
+Receive-side native connection errors, server Disconnect and unexpected repeat
+ConnAck also fail closed. The session must be replaced; an old held receipt can
+never be carried into an automatically reconnected broker session with reused
+packet IDs. Ordinary idle receive deadlines do not poison a healthy connection.
+Explicit drained credential refresh rotates the local receipt namespace as well.
 
 Static aliases, explicit application-trusted dynamic topics, wildcard subscriptions,
 bounded MQTT user properties, reply-topic aliases/correlation, native expiry and
@@ -203,7 +222,11 @@ QoS0 cannot offer such an acknowledgement and is refused. Private handles can be
 completed only by their originating session. `quarantine` confirms a retained raw
 snapshot under `<trusted-route>/.quarantine/<receipt-token>` before source
 acknowledgement and returns that topic. No existing subscriber is required: a
-later wildcard subscriber can inspect/replay the raw poison. The application owns
+later wildcard subscriber can inspect/replay the poison. Snapshots carry a nonempty
+versioned binary frame (`application/vnd.raddle.mqtt-quarantine.v1`), even for an
+empty original payload: publishing zero retained bytes would delete the evidence.
+`QuarantineSnapshot::from_slice` bounds and exposes the exact original bytes for
+inspection/replay; do not replay the frame itself. The application owns
 replay and retention cleanup using `clear_retained_topic` with the trusted returned
 topic; received topic claims do not authorize clearing. Repeated attempts on one
 held receipt use the same topic, while crash/redelivery can create another snapshot.

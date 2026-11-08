@@ -68,9 +68,16 @@ fn session(prefix: &str, tenant: &str) -> Session {
     .unwrap()
 }
 async fn raw_publish(client: &AsyncClient, eventloop: &mut EventLoop, topic: &str, body: Vec<u8>) {
-    client
-        .try_publish(topic, QoS::AtLeastOnce, false, body)
-        .unwrap();
+    raw_publish_qos(client, eventloop, topic, body, QoS::AtLeastOnce).await;
+}
+async fn raw_publish_qos(
+    client: &AsyncClient,
+    eventloop: &mut EventLoop,
+    topic: &str,
+    body: Vec<u8>,
+    qos: QoS,
+) {
+    client.try_publish(topic, qos, false, body).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut packet = None;
     loop {
@@ -80,7 +87,16 @@ async fn raw_publish(client: &AsyncClient, eventloop: &mut EventLoop, topic: &st
             .unwrap()
         {
             Event::Outgoing(Outgoing::Publish(id)) => packet = Some(id),
-            Event::Incoming(Packet::PubAck(ack)) if packet == Some(ack.pkid) => break,
+            Event::Incoming(Packet::PubAck(ack))
+                if qos == QoS::AtLeastOnce && packet == Some(ack.pkid) =>
+            {
+                break;
+            }
+            Event::Incoming(Packet::PubComp(ack))
+                if qos == QoS::ExactlyOnce && packet == Some(ack.pkid) =>
+            {
+                break;
+            }
             _ => {}
         }
     }
@@ -321,7 +337,9 @@ async fn malformed_first_middle_last_quarantine_then_correct_only_failed() {
         assert!(snapshot.decode().is_err());
         let mut expected = serde_json::to_value(&messages[failed]).unwrap();
         expected["version"] = 0.into();
-        assert_eq!(snapshot.raw(), serde_json::to_vec(&expected).unwrap());
+        let decoded =
+            raddle_mqtt::QuarantineSnapshot::from_slice(snapshot.raw(), 1_048_576).unwrap();
+        assert_eq!(decoded.payload(), serde_json::to_vec(&expected).unwrap());
         audit.complete(&mut snapshot).await.unwrap();
         drop(snapshot);
         audit.close().await.unwrap();
@@ -489,4 +507,89 @@ async fn named_tenant_clients_do_not_treat_envelope_uuid_as_global_protocol_dedu
             .all(|result| result.is_ok())
     );
     audit.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable real Mosquitto MQTT5 fixture"]
+async fn empty_poison_retains_recoverable_evidence_before_source_completion() {
+    for qos in [QoS::AtLeastOnce, QoS::ExactlyOnce] {
+        let prefix = format!("t{}", uuid::Uuid::new_v4().simple());
+        let mut receiver = session(&prefix, "trusted");
+        receiver
+            .subscribe(&format!("{prefix}/orders"), qos)
+            .await
+            .unwrap();
+        let (peer, mut eventloop) = AsyncClient::new(options(), 8);
+        raw_publish_qos(
+            &peer,
+            &mut eventloop,
+            &format!("{prefix}/orders"),
+            Vec::new(),
+            qos,
+        )
+        .await;
+        let mut poison = receiver
+            .receive(1, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(poison.raw().is_empty());
+        assert!(poison.decode().is_err());
+        let retained_topic = receiver
+            .quarantine(&mut poison, "dead", "empty-input")
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.complete(&mut poison).await,
+            Err(Error::Lost)
+        ));
+        // This subscriber did not exist at publication time. A nonempty frame must be
+        // retained, not interpreted as MQTT's zero-byte retained deletion operation.
+        let mut audit = session(&prefix, "trusted-audit");
+        audit
+            .subscribe(&format!("{prefix}/dead/#"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+        let mut snapshot = audit
+            .receive(1, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(snapshot.retained());
+        assert!(!snapshot.raw().is_empty());
+        let original =
+            raddle_mqtt::QuarantineSnapshot::from_slice(snapshot.raw(), 1_048_576).unwrap();
+        assert!(original.payload().is_empty());
+        // Replay exactly the recovered original bytes, not an invented replacement.
+        raw_publish_qos(
+            &peer,
+            &mut eventloop,
+            &format!("{prefix}/orders"),
+            original.payload().to_vec(),
+            qos,
+        )
+        .await;
+        audit.complete(&mut snapshot).await.unwrap();
+        let mut replay = receiver
+            .receive(1, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(replay.raw().is_empty());
+        receiver.complete(&mut replay).await.unwrap();
+        receiver
+            .clear_retained_topic(&retained_topic, QoS::AtLeastOnce)
+            .await
+            .unwrap();
+        drop(snapshot);
+        drop(poison);
+        drop(replay);
+        receiver.close().await.unwrap();
+        audit.close().await.unwrap();
+        drop(eventloop);
+        drop(peer);
+    }
 }

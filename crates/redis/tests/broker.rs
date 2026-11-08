@@ -548,3 +548,90 @@ async fn atomic_ack_delete_preserves_another_groups_unread_copy() {
         "native XACKDEL ACKED settles each group without destroying another group's unread work"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires disposable real Redis fixture"]
+async fn partially_registered_schedule_repairs_without_replaying_completed_identity() {
+    let prefix = format!("{{t{}}}", uuid::Uuid::new_v4().simple());
+    let stream = format!("{prefix}:orders");
+    let namespace = format!("{prefix}:schedule");
+    let due = format!("{namespace}:due");
+    let bus = broker(vec![route("orders", &stream)]).await;
+    let completed = Envelope::encode(&Order(1)).unwrap();
+    bus.schedule(&namespace, "orders", &completed, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        bus.release_due(&namespace, 100, 8).await.unwrap().released,
+        1
+    );
+    let failed = Envelope::encode(&Order(2)).unwrap();
+    let mut raw = peer().await;
+    let _: () = redis::cmd("SET")
+        .arg(&due)
+        .arg("wrong-type")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        bus.schedule(&namespace, "orders", &failed, 100)
+            .await
+            .is_err()
+    );
+    let state: String = redis::cmd("HGET")
+        .arg(format!("{namespace}:state"))
+        .arg(failed.id().to_string())
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(state, "registering");
+    let _: usize = redis::cmd("DEL")
+        .arg(&due)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        bus.schedule(&namespace, "orders", &completed, 100)
+            .await
+            .unwrap();
+        bus.schedule(&namespace, "orders", &failed, 100)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        bus.release_due(&namespace, 100, 8).await.unwrap().released,
+        1
+    );
+    assert_eq!(
+        bus.release_due(&namespace, 100, 8).await.unwrap().released,
+        0
+    );
+    bus.schedule(&namespace, "orders", &failed, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        bus.release_due(&namespace, 100, 8).await.unwrap().released,
+        0
+    );
+    let mut receiver = bus
+        .receiver(
+            "orders",
+            "audit",
+            source(),
+            Ownership::Owned,
+            GroupStart::Beginning,
+        )
+        .await
+        .unwrap();
+    let deliveries = receiver
+        .receive(2, Duration::from_secs(2), Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 2);
+    let mut values = Vec::new();
+    for mut held in deliveries {
+        values.push(held.decode().unwrap().decode::<Order>().unwrap().0);
+        held.complete().await.unwrap();
+    }
+    assert_eq!(values, vec![1, 2]);
+}

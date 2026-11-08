@@ -523,7 +523,10 @@ pub struct Receiver {
 }
 impl Receiver {
     /// Pulls at most `limit` members within one total deadline, including broker wait.
-    /// Bad wire data remains in a held handle and never prevents later members arriving.
+    /// Each fresh pull/SDK inbox collects for at most half AckWait. Empty pulls may
+    /// repeat until the caller's deadline, but a nonempty page returns without waiting
+    /// through another pull. Leases conservatively start before that bounded request,
+    /// never at dequeue time (the SDK may have buffered an earlier delivery).
     pub async fn receive(
         &mut self,
         limit: usize,
@@ -534,53 +537,71 @@ impl Receiver {
             return Err(Error::Invalid("batch limit"));
         }
         let deadline = tokio::time::Instant::now() + wait;
-        let requested_at = std::time::Instant::now();
-        let mut batch = tokio::time::timeout_at(
-            deadline,
-            self.consumer
-                .batch()
-                .max_messages(limit)
-                .expires(wait)
-                .messages(),
-        )
-        .await
-        .map_err(|_| Error::Uncertain)?
-        .map_err(|_| Error::Uncertain)?;
         let mut result = Vec::with_capacity(limit);
         let mut inspected = 0;
-        while inspected < limit {
-            match tokio::time::timeout_at(deadline, batch.next()).await {
-                Err(_) | Ok(None) => break,
-                Ok(Some(Err(_))) => {
-                    if result.is_empty() {
-                        return Err(Error::Uncertain);
+        while inspected < limit && tokio::time::Instant::now() < deadline {
+            let requested_at = std::time::Instant::now();
+            let slice = (self.ack_wait / 2)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            if slice.is_zero() {
+                break;
+            }
+            let batch_deadline = (tokio::time::Instant::now() + slice).min(deadline);
+            // Leave room for the server's expiry response to reach this fresh inbox.
+            // Dropping it at the same instant as server expiry would create a gap
+            // where a still-pending pull could deliver to an already removed inbox.
+            let expires = (slice / 2).max(Duration::from_nanos(1));
+            let mut batch = tokio::time::timeout_at(
+                batch_deadline,
+                self.consumer
+                    .batch()
+                    .max_messages(limit - inspected)
+                    .expires(expires)
+                    .messages(),
+            )
+            .await
+            .map_err(|_| Error::Uncertain)?
+            .map_err(|_| Error::Uncertain)?;
+            while inspected < limit {
+                match tokio::time::timeout_at(batch_deadline, batch.next()).await {
+                    Err(_) | Ok(None) => break,
+                    Ok(Some(Err(_))) => {
+                        if result.is_empty() {
+                            return Err(Error::Uncertain);
+                        }
+                        break;
                     }
-                    break;
-                }
-                Ok(Some(Ok(message))) => {
-                    inspected += 1;
-                    if message.headers.as_ref().is_some_and(|h| {
-                        h.get("Nats-Schedule").is_some() && h.get("Nats-Scheduler").is_none()
-                    }) {
-                        // A scheduling control is not an application delivery. It counts
-                        // against this bounded pull page and is never dispatched early.
-                        let _ = tokio::time::timeout_at(
-                            deadline,
-                            self.jetstream
-                                .acknowledge(&message, async_nats::jetstream::AckKind::Ack),
-                        )
-                        .await;
-                        continue;
+                    Ok(Some(Ok(message))) => {
+                        inspected += 1;
+                        if message.headers.as_ref().is_some_and(|h| {
+                            h.get("Nats-Schedule").is_some() && h.get("Nats-Scheduler").is_none()
+                        }) {
+                            // A scheduling control is not an application delivery. It counts
+                            // against this bounded pull page and is never dispatched early.
+                            let _ = tokio::time::timeout_at(
+                                batch_deadline,
+                                self.jetstream
+                                    .acknowledge(&message, async_nats::jetstream::AckKind::Ack),
+                            )
+                            .await;
+                            continue;
+                        }
+                        result.push(HeldMessage::new(
+                            message,
+                            self.jetstream.clone(),
+                            self.source.clone(),
+                            self.ack_wait,
+                            self.max_extension,
+                            requested_at,
+                        )?);
                     }
-                    result.push(HeldMessage::new(
-                        message,
-                        self.jetstream.clone(),
-                        self.source.clone(),
-                        self.ack_wait,
-                        self.max_extension,
-                        requested_at,
-                    )?);
                 }
+            }
+            // A scheduler/OS stall must not expose expired members as owned work.
+            // They remain unacknowledged and can only proceed by broker redelivery.
+            result.retain(HeldMessage::is_owned);
+            if !result.is_empty() {
+                break;
             }
         }
         Ok(result)

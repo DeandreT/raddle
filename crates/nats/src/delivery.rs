@@ -48,7 +48,9 @@ impl HeldMessage {
             sequence: info.stream_sequence,
             attempt: info.delivered,
         };
-        // Start conservatively at pull admission, not after a queued batch is decoded.
+        // This request uses a fresh SDK inbox and collects for at most half AckWait.
+        // A delivery cannot predate its request; SDK dequeue time alone is not a safe
+        // lease anchor. Long empty waits use later requests, not this same timestamp.
         Ok(Self {
             message,
             jetstream,
