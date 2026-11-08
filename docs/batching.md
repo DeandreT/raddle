@@ -138,6 +138,9 @@ Rust-type/listener statistics are separate and are not reconstructed from the DB
     original row locks before business writes. Those locks fence takeover during a
 live transaction even if the clock passes its lease. SQL statement and lock
 timeouts bound database waits; the runner separately bounds the handler future.
+Fence checks refresh effective time after pool acquisition and row-lock waits:
+the caller's logical UTC origin is advanced by monotonic elapsed time, not replaced
+by the host's wall clock. Waiting cannot revive an expired lease or whole batch.
 Cancellation drops the scope without running a hidden failure continuation.
 Explicit rollback precedes opaque retry, timeout handling or probing. An error
 while committing is not proof of rollback: reconcile original canonical identities
@@ -165,8 +168,22 @@ transaction. A failed probe rolls back before its Retry disposition is recorded;
 successful probes commit and are excluded from future execution. Persisted probe
 progress resumes after process death. Once the sweep ends, later attempts execute
 the reduced remainder normally and cannot recursively trigger another sweep.
+If recovery exhausts the last unprobed unit, it closes probing and resumes the
+already-probed remainder as a normal reduced retry rather than consuming claims
+without invoking the handler.
 Timeouts retry without assuming a domain-error isolation match. A claim is bounded
 to 256 input units; individual attempts also remain bounded by original job budgets.
+
+An exhausted participant terminalizes its entire persisted coalesced unit: an
+older value can never be promoted when the last-value-wins survivor exhausts its
+smaller budget. Claim-time exhaustion and expiry quarantine use a savepoint per
+unit. Failed persistence retains active, batch-owned original custody with a
+pending-quarantine classification; those units are excluded from handler input
+and do not consume execution attempts. Healthy units continue. Quarantine-only
+work is postponed by 250ms, and due batches are selected by availability before
+creation time, so an older repeatedly failing unit cannot starve a later due batch.
+Only a committed canonical dead record is terminal; a pending classification is
+never reported as successful processing or completed quarantine.
 
 An operator can use canonical audited `Store::replay` for dead originals. Once the
 old batch is terminal, assembly detaches only the replayed ready originals and

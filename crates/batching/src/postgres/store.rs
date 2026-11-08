@@ -149,15 +149,16 @@ impl BatchStore {
         now: DateTime<Utc>,
         lease: Duration,
     ) -> Result<Option<BatchClaim>, Error> {
+        let clock = super::EffectiveClock::new(now);
         let ExecutionQueue::Independent(destination) = queue;
         raddle::SubscriptionName::try_new(destination)
             .map_err(|_| Error::Invalid("destination"))?;
         if !(Duration::from_millis(1)..=Duration::from_secs(7200)).contains(&lease) {
             return Err(Error::Invalid("lease"));
         }
-        let until = super::until(now, lease)?;
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT id,tenant,generation,attempts,expires_at FROM raddle_batches WHERE destination=$1 AND available_at <= $2 AND (status='ready' OR (status='active' AND lease_until <= $2)) ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED")
+        let now = clock.now()?;
+        let row = sqlx::query("SELECT id,tenant,generation,attempts,expires_at FROM raddle_batches WHERE destination=$1 AND available_at <= $2 AND (status='ready' OR (status='active' AND lease_until <= $2)) ORDER BY available_at,created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED")
             .bind(destination).bind(now).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             return Ok(None);
@@ -166,17 +167,24 @@ impl BatchStore {
         let expiry: Option<DateTime<Utc>> = row.try_get("expires_at")?;
         // Lock originals before counting attempts or expiry. The active job lease
         // is internal infinity; only this batch generation grants execution rights.
-        sqlx::query("SELECT j.id FROM raddle_jobs j JOIN raddle_batch_members m ON m.job_id=j.id WHERE m.batch_id=$1 AND j.status='active' ORDER BY j.id FOR UPDATE OF j")
-            .bind(id).fetch_all(&mut *tx).await?;
-        sqlx::query("UPDATE raddle_jobs j SET status='dead',owner=NULL,lease_until=NULL,last_error=CASE WHEN $2 THEN 'expired' ELSE 'attempts-exhausted' END FROM raddle_batch_members m WHERE m.job_id=j.id AND m.batch_id=$1 AND j.status='active' AND ($2 OR j.attempts >= j.max_attempts)")
-            .bind(id).bind(expiry.is_some_and(|expiry| expiry <= now)).execute(&mut *tx).await?;
-        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM raddle_jobs j JOIN raddle_batch_members m ON m.job_id=j.id WHERE m.batch_id=$1 AND j.status='active'")
-            .bind(id).fetch_one(&mut *tx).await?;
-        if pending == 0 {
-            sqlx::query("UPDATE raddle_batches SET status='completed',owner=NULL,lease_until=NULL,probing=false WHERE id=$1").bind(id).execute(&mut *tx).await?;
+        let members =
+            super::custody::lock_members(&mut tx, id, super::custody::MemberRead::Metadata).await?;
+        let now = clock.now()?;
+        super::custody::quarantine(
+            &mut tx,
+            id,
+            &members,
+            now,
+            expiry.is_some_and(|expiry| expiry <= now),
+        )
+        .await?;
+        let counts = super::custody::counts(&mut tx, id).await?;
+        if counts.executable == 0 {
+            super::custody::release(&mut tx, id, &counts, now).await?;
             tx.commit().await.map_err(Error::CustodyUncertain)?;
             return Ok(None);
         }
+        let until = super::until(now, lease)?;
         let owner = Uuid::new_v4();
         let generation: i64 = row.try_get("generation")?;
         let generation = generation
@@ -186,10 +194,12 @@ impl BatchStore {
         let attempts = attempts
             .checked_add(1)
             .ok_or(Error::Invalid("attempt overflow"))?;
-        sqlx::query("UPDATE raddle_batches SET status='active',owner=$2,generation=$3,lease_until=$4,attempts=$5 WHERE id=$1")
-            .bind(id).bind(owner).bind(generation).bind(until).bind(attempts).execute(&mut *tx).await?;
-        sqlx::query("UPDATE raddle_jobs j SET attempts=attempts+1 FROM raddle_batch_members m WHERE m.job_id=j.id AND m.batch_id=$1 AND j.status='active'")
-            .bind(id).execute(&mut *tx).await?;
+        // Exhaustion can remove the last unprobed unit after a crashed sweep.
+        // Resume the already-probed remainder as an ordinary reduced retry.
+        sqlx::query("UPDATE raddle_batches SET status='active',owner=$2,generation=$3,lease_until=$4,attempts=$5,probing=probing AND $6 WHERE id=$1")
+            .bind(id).bind(owner).bind(generation).bind(until).bind(attempts).bind(counts.unprobed > 0).execute(&mut *tx).await?;
+        sqlx::query("UPDATE raddle_jobs j SET attempts=attempts+1 FROM raddle_batch_members m WHERE m.job_id=j.id AND m.batch_id=$1 AND j.status='active' AND j.owner=$1 AND j.last_error IS DISTINCT FROM $2 AND j.last_error IS DISTINCT FROM $3")
+            .bind(id).bind(super::custody::EXHAUSTION_PENDING).bind(super::custody::EXPIRY_PENDING).execute(&mut *tx).await?;
         tx.commit().await.map_err(Error::CustodyUncertain)?;
         Ok(Some(BatchClaim {
             id,
@@ -219,12 +229,16 @@ impl BatchStore {
         after: u32,
         now: DateTime<Utc>,
     ) -> Result<bool, Error> {
+        let clock = super::EffectiveClock::new(now);
         if !(1..=1000).contains(&after) {
             return Err(Error::Invalid("probe threshold"));
         }
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT isolation_used,matching_failures FROM raddle_batches WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until > $4 FOR UPDATE")
-            .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(now).fetch_optional(&mut *tx).await?.ok_or(Error::Stale)?;
+        let row = sqlx::query("SELECT isolation_used,matching_failures,lease_until FROM raddle_batches WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' FOR UPDATE")
+            .bind(claim.id).bind(claim.owner).bind(claim.generation).fetch_optional(&mut *tx).await?.ok_or(Error::Stale)?;
+        if row.try_get::<DateTime<Utc>, _>("lease_until")? <= clock.now()? {
+            return Err(Error::Stale);
+        }
         if row.try_get::<bool, _>("isolation_used")? {
             return Ok(false);
         }

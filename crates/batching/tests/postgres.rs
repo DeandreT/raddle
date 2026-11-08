@@ -18,6 +18,9 @@ use uuid::Uuid;
 #[path = "postgres/preparation.rs"]
 mod preparation;
 
+#[path = "postgres/review.rs"]
+mod review;
+
 #[derive(Serialize, Deserialize)]
 struct Message {
     value: u32,

@@ -64,6 +64,7 @@ impl BatchStore {
         timeout: Duration,
         probe: bool,
     ) -> Result<Option<Execution>, Error> {
+        let clock = super::EffectiveClock::new(now);
         let millis = super::execution_timeout(timeout)?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -72,18 +73,52 @@ impl BatchStore {
         .bind(format!("{millis}ms"))
         .execute(&mut *tx)
         .await?;
-        let batch = sqlx::query("SELECT probing,group_key,expires_at FROM raddle_batches WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until > $4 FOR UPDATE")
-            .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(now).fetch_optional(&mut *tx).await?.ok_or(Error::Stale)?;
+        let batch = sqlx::query("SELECT probing,group_key,expires_at,lease_until FROM raddle_batches WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' FOR UPDATE")
+            .bind(claim.id).bind(claim.owner).bind(claim.generation).fetch_optional(&mut *tx).await?.ok_or(Error::Stale)?;
+        let lease_until: DateTime<Utc> = batch.try_get("lease_until")?;
+        if lease_until <= clock.now()? {
+            return Err(Error::Stale);
+        }
+        let rows =
+            super::custody::lock_members(&mut tx, claim.id, super::custody::MemberRead::Input)
+                .await?;
+        // Both the pool acquisition and either row-lock wait can consume the
+        // lease. The logical UTC origin remains the caller's deterministic one.
+        let now = clock.now()?;
+        if lease_until <= now {
+            return Err(Error::Stale);
+        }
         let expiry: Option<DateTime<Utc>> = batch.try_get("expires_at")?;
         if expiry.is_some_and(|expiry| expiry <= now) {
-            sqlx::query("UPDATE raddle_jobs j SET status='dead',last_error='expired',owner=NULL,lease_until=NULL FROM raddle_batch_members m WHERE m.job_id=j.id AND m.batch_id=$1 AND j.status='active' AND j.owner=$1")
-                .bind(claim.id).execute(&mut *tx).await?;
-            sqlx::query("UPDATE raddle_batches SET status='completed',owner=NULL,lease_until=NULL,probing=false WHERE id=$1")
-                .bind(claim.id).execute(&mut *tx).await?;
+            super::custody::quarantine(&mut tx, claim.id, &rows, now, true).await?;
+            let counts = super::custody::counts(&mut tx, claim.id).await?;
+            super::custody::release(&mut tx, claim.id, &counts, now).await?;
             tx.commit().await.map_err(Error::CustodyUncertain)?;
-            return Err(Error::Expired);
+            return Err(if counts.pending == 0 {
+                Error::Expired
+            } else {
+                Error::QuarantinePending
+            });
         }
-        let probing: bool = batch.try_get("probing")?;
+        let mut probing: bool = batch.try_get("probing")?;
+        let counts = super::custody::counts(&mut tx, claim.id).await?;
+        if probing && counts.unprobed == 0 && probe {
+            super::custody::release(&mut tx, claim.id, &counts, now).await?;
+            tx.commit().await.map_err(Error::CustodyUncertain)?;
+            return Ok(None);
+        }
+        if probing && counts.unprobed == 0 {
+            probing = false;
+            sqlx::query("UPDATE raddle_batches SET probing=false WHERE id=$1")
+                .bind(claim.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if counts.executable == 0 {
+            super::custody::release(&mut tx, claim.id, &counts, now).await?;
+            tx.commit().await.map_err(Error::CustodyUncertain)?;
+            return Err(Error::QuarantinePending);
+        }
         let key = BatchKey::new(claim.tenant.clone(), batch.try_get("group_key")?)
             .map_err(Error::Invalid)?;
         if probing != probe {
@@ -93,8 +128,18 @@ impl BatchStore {
                 Error::Invalid("not in probe mode")
             });
         }
-        let rows = sqlx::query("SELECT j.id,j.envelope,j.attempts,j.expires_at,m.coalesce_key,m.probed FROM raddle_batch_members m JOIN raddle_jobs j ON j.id=m.job_id WHERE m.batch_id=$1 AND j.status='active' AND j.owner=$1 ORDER BY m.ordinal FOR UPDATE OF j")
-            .bind(claim.id).fetch_all(&mut *tx).await?;
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let eligible = row.try_get::<&str, _>("status")? == "active"
+                    && row.try_get::<Option<Uuid>, _>("owner")? == Some(claim.id)
+                    && !super::custody::deferred(row.try_get("last_error")?);
+                Ok(eligible.then_some(row))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let unit = if probe {
             let Some(row) = rows
                 .iter()
@@ -262,13 +307,18 @@ impl Execution {
                     .bind(self.claim.id).bind(&unit).execute(self.scope.connection()).await?;
             }
         }
-        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM raddle_batch_members m JOIN raddle_jobs j ON j.id=m.job_id WHERE m.batch_id=$1 AND j.status='active' AND j.owner=$1")
-            .bind(self.claim.id).fetch_one(self.scope.connection()).await?;
-        let unprobed: i64 = sqlx::query_scalar("SELECT count(*) FROM raddle_batch_members m JOIN raddle_jobs j ON j.id=m.job_id WHERE m.batch_id=$1 AND j.status='active' AND j.owner=$1 AND NOT m.probed")
-            .bind(self.claim.id).fetch_one(self.scope.connection()).await?;
-        let continue_probe = self.probing && unprobed > 0;
-        sqlx::query("UPDATE raddle_batches SET status=$2,available_at=$3,probing=$4,owner=CASE WHEN $4 THEN owner ELSE NULL END,lease_until=CASE WHEN $4 THEN lease_until ELSE NULL END WHERE id=$1")
-            .bind(self.claim.id).bind(if pending == 0 { "completed" } else if continue_probe { "active" } else { "ready" }).bind(retry_at).bind(continue_probe).execute(self.scope.connection()).await?;
+        let counts = super::custody::counts(self.scope.connection(), self.claim.id).await?;
+        let continue_probe = self.probing && counts.unprobed > 0;
+        if continue_probe {
+            sqlx::query("UPDATE raddle_batches SET available_at=$2 WHERE id=$1")
+                .bind(self.claim.id)
+                .bind(retry_at)
+                .execute(self.scope.connection())
+                .await?;
+        } else {
+            super::custody::release(self.scope.connection(), self.claim.id, &counts, retry_at)
+                .await?;
+        }
         match self.scope.commit(now).await {
             Ok(()) => {}
             Err(raddle_postgres::Error::RollbackOnly) => {

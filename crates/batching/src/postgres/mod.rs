@@ -6,6 +6,7 @@
 //! the separately leased batch row fences execution and recovery. This is not a
 //! promise of sequencing against other destinations.
 
+mod custody;
 mod execution;
 mod store;
 mod tracking;
@@ -47,6 +48,10 @@ pub enum Error {
     /// originals were durably marked dead. No handler ran.
     #[error("assembled batch expired before execution")]
     Expired,
+    /// Only deferred quarantine originals remain. Custody is still pending;
+    /// no handler or fabricated successful settlement is returned.
+    #[error("batch originals await quarantine persistence")]
+    QuarantinePending,
     /// Explicit order-level preparation refusal; assembly quarantines only this
     /// original. Use Invalid instead for a genuinely shared configuration error.
     #[error("batch member preparation refused: {0}")]
@@ -92,6 +97,24 @@ fn until(now: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>, Error>
         chrono::Duration::from_std(duration).map_err(|_| Error::Invalid("duration"))?,
     )
     .ok_or(Error::Invalid("timestamp overflow"))
+}
+
+/// Keeps the caller's logical UTC origin while accounting for real async waits.
+struct EffectiveClock {
+    origin: DateTime<Utc>,
+    started: std::time::Instant,
+}
+
+impl EffectiveClock {
+    fn new(origin: DateTime<Utc>) -> Self {
+        Self {
+            origin,
+            started: std::time::Instant::now(),
+        }
+    }
+    fn now(&self) -> Result<DateTime<Utc>, Error> {
+        until(self.origin, self.started.elapsed())
+    }
 }
 
 fn execution_timeout(timeout: Duration) -> Result<i64, Error> {

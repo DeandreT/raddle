@@ -120,6 +120,7 @@ impl BatchStore {
                 }
             }
             Err(Error::Probing) => {}
+            Err(Error::QuarantinePending) => return Ok(report),
             Err(Error::Expired) => {
                 report.expired = true;
                 return Ok(report);
@@ -151,6 +152,7 @@ impl BatchStore {
             let mut execution = match self.probe(claim, clock()?, timeout).await {
                 Ok(Some(execution)) => execution,
                 Ok(None) => break,
+                Err(Error::QuarantinePending) => break,
                 Err(Error::Expired) => {
                     report.expired = true;
                     break;
