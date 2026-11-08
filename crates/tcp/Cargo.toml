@@ -1,0 +1,25 @@
+[package]
+name = "raddle-tcp"
+description = "Bounded native TCP messaging and explicit custody acknowledgements for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+raddle.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+raddle-postgres.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

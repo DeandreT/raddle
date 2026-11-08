@@ -3057,6 +3057,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "raddle-tcp"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "raddle",
+ "raddle-postgres",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "raddle-testkit"
 version = "0.1.0"
 dependencies = [
@@ -4324,6 +4338,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "slab",
