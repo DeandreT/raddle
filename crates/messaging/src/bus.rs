@@ -13,6 +13,9 @@ use crate::effects::Outgoing;
 use crate::scoped::{self, Committed, Failure, Flush, ScopedHandler};
 use crate::{BoxFuture, LocalQueue, MessageContext, QueueError, QueueMode, TrustedOrigin};
 
+mod streaming;
+pub use streaming::{InputStream, LocalStream, StreamError, StreamOptions};
+
 /// Application routing/admission failure, deliberately separate from typed handler errors.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
