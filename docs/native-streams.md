@@ -25,6 +25,25 @@ to at most 256 members. A malformed member retains its private native receipt an
 does not end a receiver. Callers must process each independent member inside its
 own failure boundary and retain successful-member state when retrying failures.
 
+These member and application-envelope limits are not a uniform ingress-allocation
+ceiling. NATS and Redis clients buffer and parse native message bodies before the
+adapter checks their application byte/header limits. Subscription capacity and
+Redis page counts limit members, not total parser allocation. Configure broker
+payload and storage restrictions separately; post-SDK rejection does not prove
+that an oversized message was never allocated.
+
+MQTT over TCP/TLS has an SDK packet-length check before expanding the MQTT packet
+buffer, with additional space allowed for native protocol metadata. WS/WSS adds a
+separate WebSocket framing layer before that check; its native frame/message
+limits are not reduced to the application-envelope limit. Qualify those transport
+profiles separately rather than claiming one application-sized memory bound.
+
+Oversized raw bodies also exceed the built-in retained-copy/DLQ limits. Rejection
+preserves their held receipt; it does not create a retained copy or authorize
+acknowledgement. Provide an explicit operational disposition for such input, and
+continue processing independent healthy members without treating the failed copy
+as successful quarantine.
+
 The native clients select Rustls' ring support without installing or changing a
 process-global crypto provider. An application that also enables another Rustls
 provider must select its provider at application bootstrap or supply native client
