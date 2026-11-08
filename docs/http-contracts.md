@@ -67,8 +67,12 @@ acceptance are not silently switched to native defaults.
   OpenAPI uses a standard `{rest}` placeholder for a catch-all, retaining the actual
   `{*rest}` template and catch-all semantics in native extensions.
   Concrete optional/version path expansions have distinct stable operation IDs.
+  Variants merged into one path/method select the lexicographically least
+  candidate operation ID, independent of their registration order.
   Schema bundles reserve collision-free component names before rewriting their
   references, so another route's root cannot replace a nested definition.
+  Definition references retain their full subschema-pointer suffix; only the
+  definition-name token is decoded and its component name re-escaped.
 - `Parameters::path<T>` / `required_path<T>` use `FromStr`, including handwritten
   strong IDs. Exact argument-name casing matters. Malformed native route values
   default to 404; `RouteParseFailure::BadRequest` explicitly selects 400.

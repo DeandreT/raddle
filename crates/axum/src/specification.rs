@@ -83,9 +83,12 @@ fn rewrite(
                     .strip_prefix("#/$defs/")
                     .or_else(|| reference.strip_prefix("#/definitions/"))
                 {
+                    // Decode only the definition-name token. The remaining JSON
+                    // Pointer is already escaped and must survive byte-for-byte.
+                    let (name, suffix) = name.split_at(name.find('/').unwrap_or(name.len()));
                     let name = name.replace("~1", "/").replace("~0", "~");
                     if let Some(component) = definitions.get(&name) {
-                        *reference = component_reference(component);
+                        *reference = format!("{}{suffix}", component_reference(component));
                     }
                 }
             }

@@ -1,7 +1,7 @@
 //! Collision-safe schema bundles and unique concrete-route operation identities.
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::marker::PhantomData;
 
@@ -183,6 +183,125 @@ async fn optional_paths_have_stable_unique_operation_ids_with_url_and_non_url_ve
         );
         for path in paths.keys().filter(|path| path.as_str() != "/openapi.json") {
             assert!(response_validator(&api, path).is_valid(&json!({"label":""})));
+        }
+    }
+}
+
+fn shared_versioned_api(reverse: bool, reader: VersionReader) -> Api {
+    let mut runtime = RuntimeBuilder::default();
+    let path = if matches!(reader, VersionReader::UrlSegment) {
+        "/{version}/items/{id?}"
+    } else {
+        "/items/{id?}"
+    };
+    let contract = |name: &str, version: &str| {
+        let mut contract = EndpointContract::new(HttpMethod::Get, path, name);
+        contract.parameters = vec![Parameter::typed::<u32>("id", ParameterSource::Path, false)];
+        contract.versioning = Some(Versioning {
+            supported: vec![ApiVersion::new("1.0"), ApiVersion::new("2.0")],
+            mapped: vec![version.into()],
+            readers: vec![reader.clone()],
+            default: None,
+            neutral: false,
+        });
+        contract
+    };
+    let zeta = EndpointRegistration::prepare(
+        &mut runtime,
+        contract("zeta", "1.0"),
+        Typed::<Flat>(PhantomData),
+    )
+    .unwrap();
+    let alpha = EndpointRegistration::prepare(
+        &mut runtime,
+        contract("alpha", "2.0"),
+        Typed::<Nested>(PhantomData),
+    )
+    .unwrap();
+    let mut builder = NativeApiBuilder::new(runtime.build(), auth);
+    if reverse {
+        builder.endpoint(alpha).unwrap().endpoint(zeta).unwrap();
+    } else {
+        builder.endpoint(zeta).unwrap().endpoint(alpha).unwrap();
+    }
+    builder.build()
+}
+
+fn operation_ids(api: &Api) -> BTreeMap<(String, String), String> {
+    let mut operations = BTreeMap::new();
+    let mut ids = HashSet::new();
+    for (path, item) in api.specification()["paths"].as_object().unwrap() {
+        for (method, operation) in item.as_object().unwrap() {
+            let id = operation["operationId"].as_str().unwrap().to_owned();
+            assert!(ids.insert(id.clone()), "duplicate ID at {method} {path}");
+            operations.insert((path.clone(), method.clone()), id);
+        }
+    }
+    operations
+}
+
+#[tokio::test]
+async fn differently_named_disjoint_version_variants_choose_the_same_ids_in_both_registration_orders()
+ {
+    for reader in [
+        VersionReader::Header("x-version".into()),
+        VersionReader::Query("v".into()),
+        VersionReader::UrlSegment,
+    ] {
+        let forward = shared_versioned_api(false, reader.clone());
+        let reverse = shared_versioned_api(true, reader.clone());
+        let ids = operation_ids(&forward);
+        assert_eq!(ids, operation_ids(&reverse));
+        assert_eq!(
+            ids.len(),
+            if matches!(reader, VersionReader::UrlSegment) {
+                6
+            } else {
+                4
+            }
+        );
+        if !matches!(reader, VersionReader::UrlSegment) {
+            for ((path, _), id) in &ids {
+                if path != "/openapi.json" {
+                    assert!(id.starts_with("alpha."));
+                }
+            }
+        }
+        for api in [&forward, &reverse] {
+            for (version, body) in [
+                ("1.0", json!({"label":""})),
+                ("2.0", json!({"meta":{"active":false}})),
+            ] {
+                for suffix in ["", "/42"] {
+                    let path = if matches!(reader, VersionReader::UrlSegment) {
+                        format!("/{version}/items{suffix}")
+                    } else {
+                        format!("/items{suffix}")
+                    };
+                    let mut request = Request::builder();
+                    let path = match &reader {
+                        VersionReader::Header(name) => {
+                            request = request.header(name.as_str(), version);
+                            path
+                        }
+                        VersionReader::Query(name) => format!("{path}?{name}={version}"),
+                        _ => path,
+                    };
+                    let response = api
+                        .router()
+                        .oneshot(request.uri(path).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 200);
+                    let actual: Value = serde_json::from_slice(
+                        &axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(actual, body);
+                }
+            }
         }
     }
 }
