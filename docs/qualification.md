@@ -51,9 +51,10 @@ own compilation lease must not be wrapped in a second copy of that lease.
 
 The normal workspace suite covers typed runtime behavior, independent fan-out,
 cancellation, wire framing/upcasting, HTTP schema contracts, and real-file SQLite
-transactions. PostgreSQL tests require an explicitly selected disposable server
-with database-create permission. They allocate isolated databases and cover
-transaction rollback, concurrent claims, process exits, upgrades from the
+transactions. Unignored Axum PostgreSQL tests run in the normal suite, so supply
+`DATABASE_URL` for an explicitly selected disposable server with database-create
+permission even without `--ignored`. PostgreSQL tests allocate isolated databases
+and cover transaction rollback, concurrent claims, process exits, upgrades from the
 initial schema, saga state, and request/reply races.
 
 Do not run the same SQLx PostgreSQL test concurrently from different checkouts
