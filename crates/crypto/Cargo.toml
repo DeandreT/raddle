@@ -1,0 +1,42 @@
+[package]
+name = "raddle-crypto"
+description = "Opt-in authenticated payload encryption for raddle transports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+rabbitmq-tests = ["dep:raddle-rabbitmq", "dep:lapin"]
+postgres-tests = ["dep:raddle-postgres", "dep:sqlx", "dep:chrono"]
+
+[dependencies]
+raddle.workspace = true
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+# Enable zeroization for the expanded cipher and authentication state too;
+# aes-gcm's own feature alone does not forward these dependency features.
+aes = { version = "0.8.4", features = ["zeroize"] }
+ghash = { version = "0.5.1", features = ["zeroize"] }
+polyval = { version = "0.6.2", features = ["zeroize"] }
+getrandom = "0.3"
+zeroize = "1.8"
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+raddle-rabbitmq = { path = "../raddle-rabbitmq", optional = true }
+lapin = { version = "4.12.3", optional = true, default-features = false, features = ["tokio", "rustls", "rustls--ring", "rustls-webpki-roots-certs"] }
+raddle-postgres = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "net", "io-util"] }
+uuid.workspace = true
+raddle-testkit.workspace = true
+raddle-policies = { path = "../policies" }
+
+[lints]
+workspace = true
