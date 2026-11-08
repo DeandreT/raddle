@@ -16,3 +16,9 @@ and route. A 202 response means custody committed, not handler completion.
 - [Source repository and Git dependency usage](https://github.com/DeandreT/raddle)
 
 MIT licensed. Source versions are not evidence of a registry release.
+## Native endpoint contracts
+
+The opt-in `raddle_axum::native` API prepares typed endpoint pipelines before the
+existing core runtime is built. See [native HTTP contracts](../../docs/http-contracts.md)
+for binding, response, policy, replay and remaining-parity boundaries. Existing
+`ApiBuilder` behavior is unchanged.

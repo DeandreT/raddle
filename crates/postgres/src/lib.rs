@@ -4,6 +4,7 @@ pub mod cluster;
 mod conversation;
 mod error;
 pub mod events;
+pub mod http_responses;
 mod job;
 pub mod operations;
 pub mod recurring;
