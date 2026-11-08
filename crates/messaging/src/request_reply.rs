@@ -24,14 +24,19 @@ impl WireMessage for ReplyFrame {
     const VERSION: u32 = 1;
 }
 
+struct ExpectedReply {
+    tenant: String,
+    contract: String,
+}
+
 struct Pending<'a> {
     token: Uuid,
-    tenants: &'a Mutex<HashMap<Uuid, String>>,
+    expected: &'a Mutex<HashMap<Uuid, ExpectedReply>>,
 }
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        if let Ok(mut tenants) = self.tenants.lock() {
-            tenants.remove(&self.token);
+        if let Ok(mut expected) = self.expected.lock() {
+            expected.remove(&self.token);
         }
     }
 }
@@ -45,7 +50,7 @@ pub struct ReplyHubInvoker<T> {
     hub: ReplyHub,
     reply_to: String,
     responders: BTreeMap<String, String>,
-    tenants: Mutex<HashMap<Uuid, String>>,
+    expected: Mutex<HashMap<Uuid, ExpectedReply>>,
 }
 
 impl<T: Transport> ReplyHubInvoker<T> {
@@ -77,7 +82,7 @@ impl<T: Transport> ReplyHubInvoker<T> {
             hub,
             reply_to: reply_to.to_owned(),
             responders: configured,
-            tenants: Mutex::new(HashMap::new()),
+            expected: Mutex::new(HashMap::new()),
         })
     }
 
@@ -85,30 +90,40 @@ impl<T: Transport> ReplyHubInvoker<T> {
     /// tenant/source/token/contract, duplicate or unrequested; acknowledge/drop
     /// those according to the application's receive policy, never upgrade trust.
     pub fn accept_reply(&self, origin: &TrustedOrigin, reply: Envelope) -> Result<bool, BusError> {
-        if reply.decode::<ReplyFrame>().is_err() {
+        let Ok(frame) = reply.decode::<ReplyFrame>() else {
             return Ok(false);
-        }
+        };
         let Some(token) = reply.correlation_id() else {
             return Ok(false);
         };
-        let tenants = self
-            .tenants
+        let expected = self
+            .expected
             .lock()
             .map_err(|_| BusError::Invalid("reply registry poisoned"))?;
-        if tenants
-            .get(&token)
-            .is_none_or(|tenant| tenant != origin.tenant())
-        {
+        let Some(expected_reply) = expected.get(&token) else {
+            return Ok(false);
+        };
+        if expected_reply.tenant != origin.tenant() {
             return Ok(false);
         }
-        drop(tenants);
+        // Do not let an authenticated but invalid inner response consume the
+        // outer-frame waiter. A later valid response must still be deliverable.
+        if let Some(bytes) = frame.body {
+            let Ok(inner) = Envelope::from_slice(&bytes, Default::default()) else {
+                return Ok(false);
+            };
+            if inner.contract() != expected_reply.contract {
+                return Ok(false);
+            }
+        }
+        drop(expected);
         self.hub
             .deliver(origin.source(), reply)
             .map_err(|_| BusError::Invalid("reply registry closed"))
     }
     /// Payload-free count for capacity, timeout and shutdown diagnostics.
     pub fn pending(&self) -> Result<usize, BusError> {
-        self.tenants
+        self.expected
             .lock()
             .map(|entries| entries.len())
             .map_err(|_| BusError::Invalid("reply registry poisoned"))
@@ -120,9 +135,11 @@ impl<T: Transport + 'static> RemoteInvoker for ReplyHubInvoker<T> {
         &'a self,
         destination: &'a str,
         context: &'a MessageContext,
-        _reply_contract: &'a str,
+        reply_contract: &'a str,
     ) -> BoxFuture<'a, Result<Envelope, BusError>> {
         Box::pin(async move {
+            raddle::SubscriptionName::try_new(reply_contract)
+                .map_err(|_| BusError::Invalid("invalid reply contract"))?;
             let responder = self
                 .responders
                 .get(destination)
@@ -134,13 +151,19 @@ impl<T: Transport + 'static> RemoteInvoker for ReplyHubInvoker<T> {
                 .hub
                 .register(token, responder, ReplyFrame::NAME)
                 .map_err(|_| BusError::Invalid("reply registration refused"))?;
-            self.tenants
+            self.expected
                 .lock()
                 .map_err(|_| BusError::Invalid("reply registry poisoned"))?
-                .insert(token, context.origin().tenant().to_owned());
+                .insert(
+                    token,
+                    ExpectedReply {
+                        tenant: context.origin().tenant().to_owned(),
+                        contract: reply_contract.to_owned(),
+                    },
+                );
             let _pending = Pending {
                 token,
-                tenants: &self.tenants,
+                expected: &self.expected,
             };
             let request = context
                 .envelope()
@@ -266,3 +289,7 @@ impl<T: Transport> RemoteResponder<T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "request_reply_tests.rs"]
+mod tests;

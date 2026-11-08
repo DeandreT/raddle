@@ -611,12 +611,17 @@ impl MessageBus {
         M: WireMessage,
         H: ScopedHandler<M>,
     {
-        let context = context.with_bus(self.clone());
+        // Caller/host cancellation flows down, but this execution's deadline or
+        // abandoned response must never cancel that shared parent or siblings.
+        let execution_cancellation = context.cancellation().child();
+        let context = context
+            .with_cancellation(execution_cancellation)
+            .with_bus(self.clone());
         let queue = self.0.execution.as_ref().ok_or(Failure::Closed)?;
         let timeout = self.deadline::<M>().map_err(|_| Failure::Closed)?;
         let deadline = tokio::time::Instant::now() + timeout;
         let (sender, receiver) = oneshot::channel();
-        let _guard = CancelOnDrop(context.cancellation().clone());
+        let mut guard = CancelOnDrop(Some(context.cancellation().clone()));
         let cancellation = context.cancellation().clone();
         let job_cancellation = cancellation.clone();
         let submit = queue.submit(async move {
@@ -646,7 +651,9 @@ impl MessageBus {
         // A caller timeout during commit/flush must not masquerade as rollback.
         // The pre-commit deadline still includes the time spent in this queue;
         // Finally/disposal and an in-progress SQL commit are deliberately joined.
-        receiver.await.map_err(|_| Failure::Closed)?
+        let result = receiver.await.map_err(|_| Failure::Closed)?;
+        guard.0 = None;
+        result
     }
 }
 
@@ -673,10 +680,12 @@ impl MessageBus {
     }
 }
 
-struct CancelOnDrop(crate::Cancellation);
+struct CancelOnDrop(Option<crate::Cancellation>);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.cancel();
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
     }
 }
 

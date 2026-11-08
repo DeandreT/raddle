@@ -182,6 +182,12 @@ impl LocalQueue {
             // Its caller owns cancellation, but admission is independently bounded.
             return measured(Arc::clone(&self.state), Box::pin(job)).await;
         }
+        let permit = self.reserve_buffered().await?;
+        permit.send(Box::pin(job));
+        Ok(())
+    }
+
+    async fn reserve_buffered(&self) -> Result<mpsc::Permit<'_, Job>, QueueError> {
         let permit = self
             .sender
             .reserve()
@@ -190,8 +196,7 @@ impl LocalQueue {
         if !self.state.accepting.load(Ordering::Acquire) {
             return Err(QueueError::Closed);
         }
-        permit.send(Box::pin(job));
-        Ok(())
+        Ok(permit)
     }
 }
 
@@ -237,20 +242,19 @@ impl QueueRunner {
         context.set_ready(false);
         self.state.accepting.store(false, Ordering::Release);
         self.receiver.close();
-        loop {
-            if active.len() < self.parallelism {
-                match self.receiver.try_recv() {
-                    Ok(job) => {
-                        active.push(measured(Arc::clone(&self.state), job));
-                        continue;
+        // A sender can have passed admission while still holding a reserved
+        // channel permit. Only recv(None), not an empty buffer, proves that all
+        // those senders have either handed over their jobs or released custody.
+        let mut receiving = true;
+        while receiving || !active.is_empty() {
+            tokio::select! {
+                Some(_) = active.next(), if !active.is_empty() => {},
+                job = self.receiver.recv(), if receiving && active.len() < self.parallelism => {
+                    match job {
+                        Some(job) => active.push(measured(Arc::clone(&self.state), job)),
+                        None => receiving = false,
                     }
-                    Err(
-                        mpsc::error::TryRecvError::Disconnected | mpsc::error::TryRecvError::Empty,
-                    ) => {}
                 }
-            }
-            if active.next().await.is_none() {
-                break;
             }
         }
         Ok(())
@@ -290,4 +294,100 @@ async fn measured(state: Arc<State>, job: Job) -> Result<(), QueueError> {
         }
     }
     result
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use raddle_host::Host;
+    use tokio::sync::{Notify, Semaphore};
+
+    use super::{LocalQueue, QueueMode, QueueSettings};
+
+    #[tokio::test]
+    async fn shutdown_drains_a_job_sent_through_a_previously_admitted_permit_after_close() {
+        let (queue, runner) = LocalQueue::new(QueueSettings {
+            mode: QueueMode::Buffered,
+            capacity: 2,
+            parallelism: 1,
+        })
+        .unwrap();
+        // Stop the real submit path between its accepting check and permit.send.
+        let permit = queue.reserve_buffered().await.unwrap();
+        assert!(queue.state.accepting.load(Ordering::Acquire));
+        let entered = Arc::new(Notify::new());
+        let started = Arc::clone(&entered);
+        queue
+            .submit(async move {
+                started.notify_one();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut host = Host::new(Duration::from_secs(5)).unwrap();
+        runner.attach(&mut host, "reserved").unwrap();
+        let shutdown = host.handle();
+        let host_task = tokio::spawn(host.run());
+        entered.notified().await;
+        queue.pause().unwrap();
+        shutdown.shutdown();
+        queue.sender.closed().await;
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&executed);
+        permit.send(Box::pin(async move {
+            ran.store(true, Ordering::Release);
+            Ok(())
+        }));
+        host_task.await.unwrap().unwrap();
+        assert!(executed.load(Ordering::Acquire));
+        assert_eq!(queue.snapshot().completed, 2);
+        assert_eq!(queue.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_polls_active_cleanup_while_waiting_for_a_reserved_permit_to_be_released() {
+        let (queue, runner) = LocalQueue::new(QueueSettings {
+            mode: QueueMode::Buffered,
+            capacity: 2,
+            parallelism: 2,
+        })
+        .unwrap();
+        let permit = queue.reserve_buffered().await.unwrap();
+        assert!(queue.state.accepting.load(Ordering::Acquire));
+        let entered = Arc::new(Notify::new());
+        let cleaned = Arc::new(Notify::new());
+        let cleanup_gate = Arc::new(Semaphore::new(0));
+        let started = Arc::clone(&entered);
+        let finished = Arc::clone(&cleaned);
+        let gate = Arc::clone(&cleanup_gate);
+        queue
+            .submit(async move {
+                started.notify_one();
+                gate.acquire().await.unwrap().forget();
+                finished.notify_one();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut host = Host::new(Duration::from_secs(5)).unwrap();
+        runner.attach(&mut host, "reserved-cleanup").unwrap();
+        let shutdown = host.handle();
+        let host_task = tokio::spawn(host.run());
+        entered.notified().await;
+        shutdown.shutdown();
+        queue.sender.closed().await;
+        cleanup_gate.add_permits(1);
+        cleaned.notified().await;
+        // Completion of active work is not completion of the closed receiver:
+        // it still owes the sender a chance to release its reserved slot.
+        assert!(!host_task.is_finished());
+        drop(permit);
+        host_task.await.unwrap().unwrap();
+        assert_eq!(queue.snapshot().completed, 1);
+    }
 }
