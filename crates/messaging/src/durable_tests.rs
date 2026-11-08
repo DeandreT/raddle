@@ -9,7 +9,8 @@ use chrono::Utc;
 use raddle::wire::{Envelope, WireMessage};
 use raddle_host::{Host, HostError};
 use raddle_postgres::{
-    Claim, Delivery, DeliveryKind, Error, FailureDisposition, RetryPolicy, Scope, Store,
+    Claim, CorrelationKey, Delivery, DeliveryKind, Error, FailureDisposition, HandlerFailure,
+    RetryPolicy, SagaInitialization, SagaState, Scope, Store, Worker,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -108,6 +109,122 @@ async fn snapshot(pool: &PgPool, id: Uuid) -> String {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+#[derive(Serialize, Deserialize)]
+struct MixedSaga {
+    count: u32,
+}
+impl SagaState for MixedSaga {
+    const NAME: &'static str = "test.mixed-ownership";
+    const VERSION: u32 = 1;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Unknown;
+impl WireMessage for Unknown {
+    const NAME: &'static str = "test.unregistered-mixed";
+    const VERSION: u32 = 1;
+}
+
+async fn stage_destination<M: WireMessage>(store: &Store, destination: &str, message: &M) -> Uuid {
+    let mut scope = store.begin().await.unwrap();
+    let ids = scope
+        .stage(
+            "source",
+            "tenant",
+            &Envelope::encode(message).unwrap(),
+            &[Delivery::new(DeliveryKind::Local, destination, Utc::now())],
+        )
+        .await
+        .unwrap();
+    scope.commit(Utc::now()).await.unwrap();
+    ids[0]
+}
+
+async fn mixed_worker_ownership(pool: PgPool, legacy_first: bool) {
+    let (store, endpoint, handler) = endpoint(&pool, 8).await;
+    let native_first = stage(&store, 10).await.0;
+    let legacy_first_id = stage_destination(&store, "legacy", &Work(1)).await;
+    let native_last = stage(&store, 11).await.0;
+    let legacy_last_id = stage_destination(&store, "legacy-second", &Work(2)).await;
+    let unowned = stage_destination(&store, "unowned", &Work(99)).await;
+    let unknown = stage_destination(&store, "legacy", &Unknown).await;
+    // A receiver must not even perform another queue's expiry/attempt sweep.
+    sqlx::query("UPDATE raddle_jobs SET expires_at=now()-interval '1 hour' WHERE id=$1")
+        .bind(unowned)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let unowned_before = snapshot(&pool, unowned).await;
+    let native_before = [
+        snapshot(&pool, native_first).await,
+        snapshot(&pool, native_last).await,
+    ];
+    let legacy_before = [
+        snapshot(&pool, legacy_first_id).await,
+        snapshot(&pool, legacy_last_id).await,
+        snapshot(&pool, unknown).await,
+    ];
+    let empty = Worker::new(store.clone(), RetryPolicy::default());
+    assert!(matches!(empty.run_once(0).await, Err(Error::Invalid(_))));
+    assert_eq!(empty.run_once(64).await.unwrap(), 0);
+    let mut legacy = Worker::new(store.clone(), RetryPolicy::default());
+    for destination in ["legacy", "legacy-second"] {
+        legacy
+            .handle_saga::<Work, MixedSaga, _, _>(
+                destination,
+                raddle::wire::Codecs::default(),
+                |work| CorrelationKey::new(work.0.to_string()).map_err(|_| HandlerFailure::Reject),
+                SagaInitialization::Start(|| MixedSaga { count: 0 }),
+                |_, saga, _| {
+                    Box::pin(async move {
+                        saga.state_mut().count += 1;
+                        Ok(())
+                    })
+                },
+            )
+            .unwrap();
+    }
+    if legacy_first {
+        assert_eq!(legacy.run_once(64).await.unwrap(), 3);
+        assert_eq!(snapshot(&pool, native_first).await, native_before[0]);
+        assert_eq!(snapshot(&pool, native_last).await, native_before[1]);
+        assert_eq!(endpoint.run_once().await.unwrap(), 2);
+    } else {
+        assert_eq!(endpoint.run_once().await.unwrap(), 2);
+        assert_eq!(snapshot(&pool, legacy_first_id).await, legacy_before[0]);
+        assert_eq!(snapshot(&pool, legacy_last_id).await, legacy_before[1]);
+        assert_eq!(snapshot(&pool, unknown).await, legacy_before[2]);
+        assert_eq!(legacy.run_once(64).await.unwrap(), 3);
+    }
+    assert_eq!(snapshot(&pool, unowned).await, unowned_before);
+    assert_eq!(handler.0.load(Ordering::SeqCst), 2);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM raddle_sagas WHERE kind=$1 AND tenant='tenant' AND (state->>'count')::int=1")
+        .bind(MixedSaga::NAME).fetch_one(&pool).await.unwrap(), 2);
+    for id in [native_first, native_last, legacy_first_id, legacy_last_id] {
+        let job = store.inspect("tenant", id).await.unwrap().unwrap();
+        assert_eq!(job.status, raddle_postgres::JobStatus::Completed);
+        assert_eq!(job.attempts, 1);
+    }
+    let unknown = store.inspect("tenant", unknown).await.unwrap().unwrap();
+    assert_eq!(unknown.status, raddle_postgres::JobStatus::Dead);
+    assert_eq!(unknown.last_error.as_deref(), Some("unregistered-contract"));
+    assert_eq!(legacy.run_once(64).await.unwrap(), 0);
+    assert_eq!(endpoint.run_once().await.unwrap(), 0);
+    assert_eq!(snapshot(&pool, unowned).await, unowned_before);
+}
+
+#[sqlx::test(migrations = "../postgres/migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn legacy_saga_worker_cannot_claim_new_durable_endpoint_work(pool: PgPool) {
+    mixed_worker_ownership(pool, true).await;
+}
+
+#[sqlx::test(migrations = "../postgres/migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn new_durable_endpoint_cannot_claim_legacy_saga_worker_work(pool: PgPool) {
+    mixed_worker_ownership(pool, false).await;
 }
 
 async fn listener(pool: &PgPool) -> PgListener {

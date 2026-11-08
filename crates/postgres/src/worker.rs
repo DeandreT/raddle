@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -78,14 +78,24 @@ impl Worker {
         Ok(())
     }
 
-    /// Processes one bounded batch; errors leave remaining leases recoverable.
+    /// Processes one bounded batch from registered destination queues only.
+    /// Other queues, including their expiry sweep, remain untouched. Workers
+    /// sharing a destination must register its complete contract set.
+    /// Errors leave remaining leases recoverable.
     pub async fn run_once(&self, limit: u32) -> Result<usize, Error> {
         use futures_util::stream::StreamExt;
 
+        let destinations = self
+            .handlers
+            .keys()
+            .map(|(destination, _)| destination.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let claims = self
             .store
-            .claim(
-                DeliveryKind::Local,
+            .claim_registered(
+                &destinations,
                 limit,
                 self.policy.timeout() + Duration::from_secs(5),
                 Utc::now(),

@@ -44,6 +44,13 @@ the heterogeneous registry boundary. The handler reports `Retry` or `Reject`;
 formatted domain errors are never persisted. A successful result commits the
 business transaction and inbox completion together.
 
+A worker claims and expires work only for destinations registered through
+`handle` or `handle_saga`. An empty registry does not consume unrelated queues.
+Multiple workers sharing one destination must register its complete contract set;
+an unknown contract within an owned queue is still quarantined. Destination
+filtering happens in the claim transaction, before taking a lease or incrementing
+attempts, so legacy workers and managed durable endpoints can share one store.
+
 Claims are bounded to 256 rows and use `SKIP LOCKED`. Expired claims get a new
 generation. Before business writes, execution locks and validates the original
 claim. That database lock fences recovery even when the lease time passes.
