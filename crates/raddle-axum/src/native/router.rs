@@ -558,6 +558,17 @@ fn shape(path: &str) -> String {
 }
 
 fn merge_operation(existing: &mut Value, other: Value) {
+    // A shared path/method exposes one client method even when its accepted
+    // variants have different route names. Choosing the least candidate ID is
+    // associative and order-independent; each candidate retains its path suffix.
+    if let (Some(current), Some(candidate)) = (
+        existing["operationId"].as_str(),
+        other["operationId"].as_str(),
+    ) && candidate < current
+    {
+        existing["operationId"] = other["operationId"].clone();
+        existing["x-route-name"] = other["x-route-name"].clone();
+    }
     if let Some(parameters) = existing["parameters"].as_array_mut() {
         let other = other["parameters"].as_array().cloned().unwrap_or_default();
         for parameter in parameters.iter_mut() {
