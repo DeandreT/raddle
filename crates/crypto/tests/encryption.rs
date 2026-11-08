@@ -386,3 +386,66 @@ async fn cancellation_drops_provider_future_without_publishing_or_mutating_messa
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(local.to_vec().unwrap(), before);
 }
+
+#[tokio::test]
+async fn retired_key_ids_cannot_be_rebound_and_lifetime_history_is_bounded() {
+    let ring = RotatingKeys::with_lifetime_id_budget(2, 3).unwrap();
+    let first = KeyId::new("first").unwrap();
+    let active = KeyId::new("active").unwrap();
+    ring.insert(first.clone(), SecretKey::new([17; 32]), true)
+        .unwrap();
+    ring.insert(active.clone(), SecretKey::new([18; 32]), true)
+        .unwrap();
+    assert!(ring.retire(&active).is_err());
+    ring.retire(&first).unwrap();
+    for bytes in [[17; 32], [19; 32]] {
+        assert!(
+            ring.clone()
+                .insert(first.clone(), SecretKey::new(bytes), true)
+                .is_err()
+        );
+    }
+    assert!(ring.lookup(&first).await.is_err());
+    assert_eq!(ring.active().await.unwrap().id(), &active);
+    let final_id = KeyId::new("last-budgeted-id").unwrap();
+    ring.insert(final_id.clone(), SecretKey::new([20; 32]), false)
+        .unwrap();
+    ring.retire(&final_id).unwrap();
+    assert!(
+        ring.insert(
+            KeyId::new("over-budget").unwrap(),
+            SecretKey::new([21; 32]),
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        ring.insert(final_id, SecretKey::new([20; 32]), false)
+            .is_err()
+    );
+    assert_eq!(ring.active().await.unwrap().id(), &active);
+    assert!(ring.lookup(&active).await.is_ok());
+    ring.activate(&active).unwrap();
+    for (capacity, budget) in [(0, 1), (2, 1), (1, 0), (1, 65537)] {
+        assert!(RotatingKeys::with_lifetime_id_budget(capacity, budget).is_err());
+    }
+}
+
+#[tokio::test]
+async fn rejected_live_capacity_insert_does_not_spend_lifetime_id_budget() {
+    let ring = RotatingKeys::with_lifetime_id_budget(2, 3).unwrap();
+    let first = KeyId::new("first").unwrap();
+    let next = KeyId::new("next").unwrap();
+    ring.insert(first.clone(), SecretKey::new([1; 32]), true)
+        .unwrap();
+    ring.insert(KeyId::new("second").unwrap(), SecretKey::new([2; 32]), true)
+        .unwrap();
+    assert!(
+        ring.insert(next.clone(), SecretKey::new([3; 32]), true)
+            .is_err()
+    );
+    ring.retire(&first).unwrap();
+    ring.insert(next.clone(), SecretKey::new([3; 32]), true)
+        .unwrap();
+    assert_eq!(ring.active().await.unwrap().id(), &next);
+}

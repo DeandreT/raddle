@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -99,6 +99,7 @@ impl<T: KeyProvider> KeyProvider for Arc<T> {
 
 struct State {
     keys: BTreeMap<KeyId, Arc<SecretKey>>,
+    used_ids: BTreeSet<KeyId>,
     active: Option<KeyId>,
 }
 
@@ -108,19 +109,33 @@ struct State {
 pub struct RotatingKeys {
     state: Arc<Mutex<State>>,
     capacity: usize,
+    lifetime_id_budget: usize,
 }
 impl RotatingKeys {
-    /// Keeps at most 1..=1024 retained keys. No automatic unsafe eviction.
+    /// Keeps at most 1..=1024 retained keys and remembers at most 4096 IDs for
+    /// this provider's lifetime. Retirement frees live-key capacity, not IDs.
     pub fn new(capacity: usize) -> Result<Self, KeyProviderError> {
-        if !(1..=1024).contains(&capacity) {
+        Self::with_lifetime_id_budget(capacity, 4096)
+    }
+    /// Sets an explicit lifetime budget from live capacity through 65536 IDs.
+    /// Exhaustion fails closed; retired IDs cannot be rebound, even to identical
+    /// bytes. A replacement/external provider must preserve identity uniqueness
+    /// across its own lifetimes while old ciphertext may still be received.
+    pub fn with_lifetime_id_budget(
+        capacity: usize,
+        lifetime_id_budget: usize,
+    ) -> Result<Self, KeyProviderError> {
+        if !(1..=1024).contains(&capacity) || !(capacity..=65536).contains(&lifetime_id_budget) {
             return Err(KeyProviderError);
         }
         Ok(Self {
             state: Arc::new(Mutex::new(State {
                 keys: BTreeMap::new(),
+                used_ids: BTreeSet::new(),
                 active: None,
             })),
             capacity,
+            lifetime_id_budget,
         })
     }
     /// Adds new immutable key identity. Reusing an ID, even with the same
@@ -132,9 +147,13 @@ impl RotatingKeys {
         activate: bool,
     ) -> Result<(), KeyProviderError> {
         let mut state = self.state.lock().map_err(|_| KeyProviderError)?;
-        if state.keys.len() == self.capacity || state.keys.contains_key(&id) {
+        if state.keys.len() == self.capacity
+            || state.used_ids.len() == self.lifetime_id_budget
+            || state.used_ids.contains(&id)
+        {
             return Err(KeyProviderError);
         }
+        state.used_ids.insert(id.clone());
         state.keys.insert(id.clone(), Arc::new(key));
         if activate {
             state.active = Some(id);
