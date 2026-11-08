@@ -4,6 +4,7 @@ mod api;
 mod authentication;
 mod binding;
 mod caching;
+pub mod dead_letters;
 mod error;
 mod health;
 mod limits;

@@ -128,7 +128,7 @@ impl ApiBuilder {
         Ok(self)
     }
 
-    fn reserve(&mut self, path: &str, method: &str) -> Result<usize, ApiError> {
+    pub(crate) fn reserve(&mut self, path: &str, method: &str) -> Result<usize, ApiError> {
         if !path.starts_with('/')
             || path.len() > 120
             || path.contains("//")

@@ -46,6 +46,12 @@ own permissions. Metrics contain no per-request IDs, tenant labels, tokens or
 payloads. Keep the operational router private even when the application's
 business endpoints are publicly reachable.
 
+`dead_letters(store, authorizer)` separately opts into bounded canonical failed
+message search, independently confirmed replay and audited discard. It requires
+an application policy for each operation and mutation approval, not merely
+inspection permission. See [secured dead-letter management](http-dead-letters.md)
+for native routes, tenant/cancellation rules and retained discard tombstones.
+
 All supplied routes, the authenticated `/openapi.json` endpoint, intentional
 headers, request/response schemas, errors, and security scheme come from the
 builder. Generated JSON Schema references are relocated into OpenAPI components
