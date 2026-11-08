@@ -33,6 +33,20 @@ workspace. Dependency feature unification is not proof that an isolated package
 builds. Check package contents for its license, README, migrations and protocol
 sources, and retain exact command exits rather than accepting filtered log output.
 
+## Frozen-source qualification
+
+Qualify the clean committed source that will be delivered, including all integrated
+changes. Record its revision, the command plan and each command's actual exit
+status in a fresh run directory. Earlier branch or package results do not qualify
+a later integrated head. Keep execution receipts outside the source repository.
+
+After an interruption, retain a passed stage only when the source revision,
+working-tree cleanliness, command and verification configuration still match.
+Confirm that the previous driver and its children have stopped before resuming.
+Keep failed and interrupted attempts separate from their reruns; a later passing
+attempt does not change an earlier outcome. Broker fixtures that acquire their
+own compilation lease must not be wrapped in a second copy of that lease.
+
 ## Offline and database checks
 
 The normal workspace suite covers typed runtime behavior, independent fan-out,
