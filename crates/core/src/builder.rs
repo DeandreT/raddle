@@ -9,8 +9,8 @@ use tokio::sync::Semaphore;
 use crate::handler::{ErasedRequest, Subscriber, TypedEvent, TypedRequest};
 use crate::pipeline::Pipeline;
 use crate::{
-    ConfigurationError, Event, EventDelivery, ExecutionContext, RegistrationError, Request,
-    Runtime, SubscriptionName,
+    ConfigurationError, Event, EventDelivery, EventFamily, ExecutionContext,
+    FamilyRegistrationError, RegistrationError, Request, RequestFamily, Runtime, SubscriptionName,
 };
 
 /// Explicit registrations and the shared maximum number of active handlers.
@@ -157,6 +157,64 @@ impl RuntimeBuilder {
                     marker: PhantomData,
                 }),
             });
+        Ok(self)
+    }
+
+    /// Atomically installs all concrete handlers in a declared request family.
+    ///
+    /// An empty family or any conflict with an ordinary or family registration
+    /// rejects the whole group, leaving this builder unchanged. The consumed
+    /// declaration is dropped on failure. Each installed member uses ordinary
+    /// exact-type dispatch, typed results, admission and caller-owned cancellation.
+    pub fn handle_family<T, R, E, F>(
+        &mut self,
+        family: RequestFamily<T, R, E, F>,
+    ) -> Result<&mut Self, FamilyRegistrationError> {
+        if family.members.is_empty() {
+            return Err(FamilyRegistrationError::Empty);
+        }
+        for member in &family.members {
+            if self.requests.contains_key(&member.message) {
+                return Err(RegistrationError::DuplicateRequest {
+                    message: member.diagnostic,
+                }
+                .into());
+            }
+        }
+        self.requests.extend(
+            family
+                .members
+                .into_iter()
+                .map(|member| (member.message, member.handler)),
+        );
+        Ok(self)
+    }
+
+    /// Atomically installs a family's independent named event subscribers.
+    ///
+    /// Names remain runtime-wide unique. An empty family or any existing name
+    /// rejects the entire group; no earlier member is partially installed.
+    /// Every concrete subscription retains ordinary fan-out failure isolation,
+    /// admission, context and report ordering. No tasks are spawned.
+    pub fn subscribe_family<T, E, F>(
+        &mut self,
+        family: EventFamily<T, E, F>,
+    ) -> Result<&mut Self, FamilyRegistrationError> {
+        if family.members.is_empty() {
+            return Err(FamilyRegistrationError::Empty);
+        }
+        for (_, subscriber) in &family.members {
+            if self.subscriptions.contains(&subscriber.name) {
+                return Err(RegistrationError::DuplicateSubscription {
+                    name: subscriber.name.clone(),
+                }
+                .into());
+            }
+        }
+        for (message, subscriber) in family.members {
+            self.subscriptions.insert(subscriber.name.clone());
+            self.events.entry(message).or_default().push(subscriber);
+        }
         Ok(self)
     }
 

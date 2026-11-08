@@ -118,6 +118,11 @@ an old Repeatable Read/Serializable snapshot fails with `40001` rather than
 validating pre-takeover data. Retry the **whole transaction**, never just a
 failed statement.
 
+SQLx may finish rolling back a rejected coordinator transaction after its call
+returns. Immediate validation can therefore correctly report `55P03` while that
+cleanup still holds the namespace lock, even when the capability is also stale.
+This remains a failed validation; never continue protected work in that scope.
+
 Failed, timed-out or cancelled validation marks the scope rollback-only. As with
 other scope APIs, propagate application errors or call `mark_rollback_only`.
 An application must await successful validation before doing protected work.

@@ -1,5 +1,8 @@
 # Application message bus
 
+See [native handler dispatch](handler-dispatch.md) for opt-in ordered classic
+composition, independent subscriptions and endpoint-specific sticky selections.
+
 `raddle-messaging` is an explicit application layer above the low-level runtime.
 It does not change `Runtime::invoke`, `Runtime::publish`, or the caller-driven
 `cascade` API. In particular, an ordinary low-level invocation still returns
@@ -87,6 +90,13 @@ observed claims, not completions.
 Host stop cancels unfinished durable pre-commit work, joins cleanup, and leaves
 the uncompleted lease recoverable. This is not cluster ownership, leader election
 or broker-native acknowledgement orchestration.
+
+Policy-driven local queues use `PolicyQueueBuilder`, `BusBuilder::policy_queue`
+and its Host-attached runner. Durable queues opt in before registration with
+`DurableEndpoint::policies` and `handle_policy`. Both preserve concrete handler
+errors and require explicit replay safety. See [endpoint policies](native-policy-crypto.md)
+for retry budgets, custody transitions, strict rollback and uncertainty recovery.
+Legacy registrations retain their existing defaults.
 
 ## Context and resources
 
@@ -214,3 +224,11 @@ compatibility. The reply frame uses bounded JSON and can have a smaller effectiv
 payload limit than a bare envelope. This native foundation does not establish
 .NET integration, conventional discovery, all endpoint modes, batching, cluster
 or complete Wolverine behavioral parity.
+
+The optional `serialization-rpc` feature adds an explicit `SelectedRpc` profile
+to both peers using `with_selected_rpc`. Its native v2 JSON outer reply frame
+carries a selected RDSB1 **application** response, decoded and canonically bounded
+before a waiter can be consumed. It does not change the existing v1 JSON mode.
+Configure selected request aliases and JSON outer reply aliases independently;
+see the [codec RPC guide](codec-rpc.md). A generic transport is opaque, and this
+profile neither inspects it nor supports an encrypted/selected-body stack.

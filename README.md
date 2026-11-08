@@ -98,6 +98,11 @@ authentication and listener configuration. The
 [`raddle-admin`](crates/admin/README.md) CLI provides read-only diagnostics
 and explicitly confirmed, audited tenant-scoped replay.
 
+The optional [native HTTP pipeline](docs/http-contracts.md) adds prepared typed
+endpoint contracts, bounded uploads, response policies, versioning, caching and
+persisted full-response replay over the same executor. Its native contracts do
+not imply ASP.NET or CLR integration.
+
 ## Storage and transports
 
 `raddle-sqlite` supports single-node durable queues with explicit writer

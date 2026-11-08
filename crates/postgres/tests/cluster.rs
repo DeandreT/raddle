@@ -3,6 +3,7 @@
 
 use std::process::{self, Command};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -12,7 +13,7 @@ use sqlx::{
     ConnectOptions, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 
 fn options(namespace: &str) -> ClusterOptions {
     ClusterOptions::new(
@@ -50,6 +51,18 @@ async fn expire_member(pool: &PgPool, instance: uuid::Uuid) {
 async fn expire_agent(pool: &PgPool, agent: &str) {
     sqlx::query("UPDATE raddle_cluster_agents SET lease_until=clock_timestamp()-interval '1 second' WHERE name=$1")
         .bind(agent).execute(pool).await.unwrap();
+}
+
+async fn synchronize_namespace(pool: &PgPool) {
+    // A rejected coordinator queues rollback through SQLx Drop. Await a real
+    // root-lock round trip before asserting the stale capability's exact error;
+    // otherwise NOWAIT validation may correctly observe that pending cleanup.
+    let mut barrier = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM raddle_cluster_namespaces WHERE namespace='test' FOR UPDATE")
+        .fetch_one(&mut *barrier)
+        .await
+        .unwrap();
+    barrier.rollback().await.unwrap();
 }
 
 #[test]
@@ -260,17 +273,124 @@ async fn dead_members_allow_takeover_before_agent_deadline_and_reject_old_fence(
         first.release(&old).await,
         Err(ClusterError::StaleLease)
     ));
+    synchronize_namespace(&pool).await;
     let mut scope = Scope::enroll(pool.begin().await.unwrap());
-    assert!(matches!(
-        scope.enforce_agent(&first, &old).await,
-        Err(ClusterError::StaleLease)
-    ));
+    let rejected = scope.enforce_agent(&first, &old).await;
+    assert!(
+        matches!(rejected, Err(ClusterError::StaleLease)),
+        "expected stale lease after takeover, got {rejected:?}"
+    );
     assert!(matches!(
         scope.commit(Utc::now()).await,
         Err(Error::RollbackOnly)
     ));
     second.renew(&replacement).await.unwrap();
     peer.close().await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn pending_coordinator_rollback_fails_fast_before_synchronized_stale_validation(
+    pool: PgPool,
+) {
+    let cluster = Cluster::connect(pool.clone(), options("test"))
+        .await
+        .unwrap();
+    let old_node = cluster.register("old", &["worker"]).await.unwrap();
+    let new_node = cluster.register("new", &["worker"]).await.unwrap();
+    let old = cluster
+        .acquire(&old_node, "cleanup")
+        .await
+        .unwrap()
+        .unwrap();
+    expire_member(&pool, old_node.instance()).await;
+    let replacement = cluster
+        .acquire(&new_node, "cleanup")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let paused = Arc::new(AtomicBool::new(false));
+    let resumed = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let controlled = PgPoolOptions::new()
+        .max_connections(1)
+        .after_release({
+            let paused = Arc::clone(&paused);
+            let resumed = Arc::clone(&resumed);
+            let released = Arc::clone(&released);
+            let resume = Arc::clone(&resume);
+            move |_, _| {
+                let pause = paused.swap(false, Ordering::SeqCst);
+                let resumed = Arc::clone(&resumed);
+                let released = Arc::clone(&released);
+                let resume = Arc::clone(&resume);
+                Box::pin(async move {
+                    released.notify_one();
+                    if pause {
+                        tokio::time::timeout(Duration::from_secs(10), resume.notified())
+                            .await
+                            .expect("test must release the rollback gate");
+                        resumed.store(true, Ordering::SeqCst);
+                    }
+                    Ok(true)
+                })
+            }
+        })
+        .connect_lazy_with((*pool.connect_options()).clone());
+    let coordinator = Cluster::connect(controlled.clone(), options("test"))
+        .await
+        .unwrap();
+    // The lazy pool has made exactly one checkout. Wait until its initial
+    // after_release callback has observed the unarmed gate before arming it.
+    tokio::time::timeout(Duration::from_secs(10), released.notified())
+        .await
+        .unwrap();
+    paused.store(true, Ordering::SeqCst);
+    let rejected = coordinator.release(&old).await;
+    assert!(
+        matches!(rejected, Err(ClusterError::StaleLease)),
+        "{rejected:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), released.notified())
+        .await
+        .unwrap();
+
+    // SQLx queues rollback when the rejected coordinator transaction is dropped.
+    // after_release runs before the pool ping that sends that queued rollback.
+    let mut contended = Scope::enroll(pool.begin().await.unwrap());
+    let error = contended.enforce_agent(&cluster, &old).await.unwrap_err();
+    eprintln!("pending coordinator rollback rejection: {error:?}");
+    match error {
+        ClusterError::Database(sqlx::Error::Database(error)) => {
+            assert_eq!(error.code().as_deref(), Some("55P03"));
+        }
+        other => panic!("expected pending-rollback namespace contention, got {other:?}"),
+    }
+    assert!(matches!(
+        contended.commit(Utc::now()).await,
+        Err(Error::RollbackOnly)
+    ));
+
+    resume.notify_one();
+    synchronize_namespace(&pool).await;
+    let mut stale = Scope::enroll(pool.begin().await.unwrap());
+    let rejected = stale.enforce_agent(&cluster, &old).await;
+    assert!(
+        matches!(rejected, Err(ClusterError::StaleLease)),
+        "{rejected:?}"
+    );
+    assert!(matches!(
+        stale.commit(Utc::now()).await,
+        Err(Error::RollbackOnly)
+    ));
+    cluster.renew(&replacement).await.unwrap();
+    controlled.close().await;
+    assert!(
+        resumed.load(Ordering::SeqCst),
+        "rollback gate did not resume"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -291,11 +411,13 @@ async fn expired_lease_cannot_renew_or_release_even_without_takeover(pool: PgPoo
         cluster.release(&old).await,
         Err(ClusterError::StaleLease)
     ));
+    synchronize_namespace(&pool).await;
     let mut scope = Scope::enroll(pool.begin().await.unwrap());
-    assert!(matches!(
-        scope.validate_lease(&cluster, &old).await,
-        Err(ClusterError::StaleLease)
-    ));
+    let rejected = scope.validate_lease(&cluster, &old).await;
+    assert!(
+        matches!(rejected, Err(ClusterError::StaleLease)),
+        "expected stale expired lease, got {rejected:?}"
+    );
     scope.rollback().await.unwrap();
     let fresh = cluster.acquire(&b, "cleanup").await.unwrap().unwrap();
     assert_eq!(fresh.epoch(), old.epoch() + 1);

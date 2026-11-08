@@ -13,6 +13,9 @@ use crate::effects::Outgoing;
 use crate::scoped::{self, Committed, Failure, Flush, ScopedHandler};
 use crate::{BoxFuture, LocalQueue, MessageContext, QueueError, QueueMode, TrustedOrigin};
 
+mod streaming;
+pub use streaming::{InputStream, LocalStream, StreamError, StreamOptions};
+
 /// Application routing/admission failure, deliberately separate from typed handler errors.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -41,6 +44,9 @@ pub enum BusError {
     /// Local queue admission failed.
     #[error("local queue admission failed")]
     Queue(#[from] QueueError),
+    /// Policy queue refused invalid identity, closed custody or a full retained budget.
+    #[error("policy queue admission failed")]
+    Policy(#[from] raddle_policies::DriverError),
     /// Message encoding/decoding failed.
     #[error("message envelope failed validation")]
     Wire(#[from] WireError),
@@ -101,7 +107,7 @@ pub trait RemoteInvoker: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<Envelope, BusError>>;
 }
 
-trait Publisher: Send + Sync {
+pub(crate) trait Publisher: Send + Sync {
     fn publish<'a>(
         &'a self,
         destination: &'a str,
@@ -119,8 +125,10 @@ impl<T: Transport> Publisher for TypedPublisher<T> {
     }
 }
 
-enum Endpoint {
+#[derive(Clone)]
+pub(crate) enum Endpoint {
     Local(LocalQueue),
+    Policy(crate::PolicyQueue),
     Durable(Store),
     Remote(Arc<dyn Publisher>),
 }
@@ -134,16 +142,17 @@ type Handler = Arc<
 /// Typed registration shared by routed Send/Publish and scoped invocation. Its
 /// handler/resources are never retrieved through an untyped service locator.
 pub struct ScopedRegistration<M, H> {
-    handler: Arc<H>,
-    store: Store,
-    flush: Arc<dyn Flush>,
-    marker: std::marker::PhantomData<fn(M)>,
+    pub(crate) handler: Arc<H>,
+    pub(crate) store: Store,
+    pub(crate) flush: Arc<dyn Flush>,
+    pub(crate) marker: std::marker::PhantomData<fn(M)>,
 }
 
 /// Finite explicit registration; no service locator, scanning, reflection or code generation.
+#[derive(Clone)]
 pub struct BusBuilder {
     runtime: Runtime,
-    endpoints: BTreeMap<String, Endpoint>,
+    pub(crate) endpoints: BTreeMap<String, Endpoint>,
     routes: BTreeMap<Key, Vec<String>>,
     handlers: BTreeMap<(String, Key), Handler>,
     remote: Option<Arc<dyn RemoteInvoker>>,
@@ -152,6 +161,9 @@ pub struct BusBuilder {
     allow_remote: bool,
     propagated: BTreeSet<String>,
     execution: Option<LocalQueue>,
+    pub(crate) combined: Vec<crate::handler_routing::CombinedHandlers>,
+    pub(crate) selected_durable: BTreeMap<String, Key>,
+    endpoint_timeouts: BTreeMap<(String, Key), Duration>,
 }
 
 impl BusBuilder {
@@ -168,6 +180,9 @@ impl BusBuilder {
             allow_remote: true,
             propagated: BTreeSet::new(),
             execution: None,
+            combined: Vec::new(),
+            selected_durable: BTreeMap::new(),
+            endpoint_timeouts: BTreeMap::new(),
         }
     }
     fn endpoint(&mut self, name: &str, endpoint: Endpoint) -> Result<(), BusError> {
@@ -182,6 +197,12 @@ impl BusBuilder {
     /// Adds an inline/buffered named local queue. Attach its runner to the host separately.
     pub fn local(&mut self, name: &str, queue: LocalQueue) -> Result<(), BusError> {
         self.endpoint(name, Endpoint::Local(queue))
+    }
+    /// Installs an explicitly registered typed-error policy queue. Attach its
+    /// sole runner to Host; Send/Publish acknowledge bounded volatile custody.
+    pub fn policy_queue(&mut self, queue: crate::PolicyQueue) -> Result<(), BusError> {
+        let name = queue.name().to_owned();
+        self.endpoint(&name, Endpoint::Policy(queue))
     }
     /// Adds PostgreSQL custody, using the alias as an independent subscription.
     /// Register the matching handler on `DurableEndpoint` and attach it to the host.
@@ -243,6 +264,45 @@ impl BusBuilder {
             return Err(BusError::Invalid("duplicate route or fanout exceeded"));
         }
         routes.push(endpoint.to_owned());
+        Ok(())
+    }
+    pub(crate) fn ensure_route<M: WireMessage>(&mut self, endpoint: &str) -> Result<(), BusError> {
+        if self
+            .routes
+            .get(&key::<M>()?)
+            .is_some_and(|routes| routes.iter().any(|name| name == endpoint))
+        {
+            return Ok(());
+        }
+        self.route::<M>(endpoint)
+    }
+    pub(crate) fn route_names<M: WireMessage>(&self) -> Result<Vec<String>, BusError> {
+        Ok(self.routes.get(&key::<M>()?).cloned().unwrap_or_default())
+    }
+    pub(crate) fn has_endpoint_handler<M: WireMessage>(
+        &self,
+        endpoint: &str,
+    ) -> Result<bool, BusError> {
+        Ok(self
+            .handlers
+            .contains_key(&(endpoint.to_owned(), key::<M>()?))
+            || self.selected_durable.get(endpoint) == Some(&key::<M>()?))
+    }
+    pub(crate) fn handler_timeout<M: WireMessage>(&self) -> Result<Duration, BusError> {
+        Ok(self
+            .timeouts
+            .get(&key::<M>()?)
+            .copied()
+            .unwrap_or(self.timeout))
+    }
+    pub(crate) fn endpoint_timeout<M: WireMessage>(
+        &mut self,
+        endpoint: &str,
+        timeout: Duration,
+    ) -> Result<(), BusError> {
+        validate_timeout(timeout)?;
+        self.endpoint_timeouts
+            .insert((endpoint.to_owned(), key::<M>()?), timeout);
         Ok(())
     }
     /// Explicit typed local handler. Returned failures affect only this queued job.
@@ -509,6 +569,15 @@ impl MessageBus {
         for destination in routes {
             let result = async {
                 match &self.0.endpoints[destination] {
+                    Endpoint::Policy(queue) => {
+                        queue
+                            .submit(
+                                context
+                                    .clone()
+                                    .with_cancellation(crate::Cancellation::new()),
+                            )
+                            .await?
+                    }
                     Endpoint::Local(queue) => {
                         let handler = Arc::clone(
                             self.0
@@ -521,7 +590,13 @@ impl MessageBus {
                         let context = context
                             .clone()
                             .with_cancellation(crate::Cancellation::new());
-                        let timeout = self.0.timeouts.get(&key).copied().unwrap_or(self.0.timeout);
+                        let timeout = self
+                            .0
+                            .endpoint_timeouts
+                            .get(&(destination.clone(), key.clone()))
+                            .copied()
+                            .or_else(|| self.0.timeouts.get(&key).copied())
+                            .unwrap_or(self.0.timeout);
                         let deadline = tokio::time::Instant::now() + timeout;
                         queue
                             .submit(async move { handler(context, deadline).await })
@@ -568,7 +643,9 @@ impl MessageBus {
         if let Some(routes) = self.0.routes.get(&key::<M>()?) {
             for destination in routes {
                 let kind = match &self.0.endpoints[destination] {
-                    Endpoint::Local(_) => return Err(BusError::NonAtomicRoute),
+                    Endpoint::Local(_) | Endpoint::Policy(_) => {
+                        return Err(BusError::NonAtomicRoute);
+                    }
                     Endpoint::Durable(_) => DeliveryKind::Local,
                     Endpoint::Remote(_) => DeliveryKind::Remote,
                 };

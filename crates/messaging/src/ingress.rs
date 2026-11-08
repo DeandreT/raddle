@@ -44,6 +44,22 @@ impl IngressDecoder for JsonIngress {
     }
 }
 
+#[cfg(feature = "serialization-ingress")]
+impl IngressDecoder for raddle_serialization::EndpointCodecs {
+    type Error = raddle_serialization::Error;
+
+    fn decode<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        _: &'a TrustedOrigin,
+    ) -> BoxFuture<'a, Result<Envelope, Self::Error>> {
+        // Selected typed decoding and any explicit upcasting complete before
+        // identity comparison, inbox custody or handler invocation. Decoded
+        // metadata never supplies the independently authenticated origin.
+        Box::pin(async move { self.decode(bytes) })
+    }
+}
+
 #[cfg(feature = "crypto-ingress")]
 impl<P: raddle_crypto::KeyProvider> IngressDecoder for raddle_crypto::EncryptionCodec<P> {
     type Error = raddle_crypto::CryptoError;

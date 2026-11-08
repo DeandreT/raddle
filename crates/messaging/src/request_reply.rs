@@ -9,10 +9,13 @@ use raddle::{Request, Runtime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(feature = "serialization-rpc")]
+use crate::codec_rpc::{ReplyContract, SelectedReplyFrame, SelectedResponse, SelectedRpc};
 use crate::{BoxFuture, BusError, MessageContext, RemoteInvoker, TrustedOrigin};
 
 const REPLY_TO: &str = "raddle-reply-to";
 const TOKEN: &str = "raddle-request-token";
+const MODE: &str = "raddle-reply-mode";
 
 /// Native raddle protocol frame, NOT a claim of Wolverine/.NET wire compatibility.
 #[derive(Serialize, Deserialize)]
@@ -24,9 +27,20 @@ impl WireMessage for ReplyFrame {
     const VERSION: u32 = 1;
 }
 
+#[derive(Clone)]
 struct ExpectedReply {
     tenant: String,
     contract: String,
+    #[cfg(feature = "serialization-rpc")]
+    selected: Option<SelectedExpected>,
+}
+
+#[cfg(feature = "serialization-rpc")]
+#[derive(Clone)]
+struct SelectedExpected {
+    source: String,
+    request_id: Uuid,
+    reply: ReplyContract,
 }
 
 struct Pending<'a> {
@@ -51,6 +65,8 @@ pub struct ReplyHubInvoker<T> {
     reply_to: String,
     responders: BTreeMap<String, String>,
     expected: Mutex<HashMap<Uuid, ExpectedReply>>,
+    #[cfg(feature = "serialization-rpc")]
+    selected: Option<SelectedRpc>,
 }
 
 impl<T: Transport> ReplyHubInvoker<T> {
@@ -83,13 +99,33 @@ impl<T: Transport> ReplyHubInvoker<T> {
             reply_to: reply_to.to_owned(),
             responders: configured,
             expected: Mutex::new(HashMap::new()),
+            #[cfg(feature = "serialization-rpc")]
+            selected: None,
         })
+    }
+
+    /// Explicitly opts into selected native RPC v2; both peers must agree.
+    /// Configure selected request transport and JSON outer reply transport
+    /// separately. Generic transports cannot be inspected for codec/encryption
+    /// configuration. Existing `new` remains legacy JSON v1.
+    #[cfg(feature = "serialization-rpc")]
+    pub fn with_selected_rpc(mut self, selected: SelectedRpc) -> Result<Self, BusError> {
+        selected.validate()?;
+        if self.selected.is_some() || self.pending()? != 0 {
+            return Err(BusError::Invalid("selected RPC already configured/active"));
+        }
+        self.selected = Some(selected);
+        Ok(self)
     }
 
     /// Receives an independently authenticated reply. False means late, wrong
     /// tenant/source/token/contract, duplicate or unrequested; acknowledge/drop
     /// those according to the application's receive policy, never upgrade trust.
     pub fn accept_reply(&self, origin: &TrustedOrigin, reply: Envelope) -> Result<bool, BusError> {
+        #[cfg(feature = "serialization-rpc")]
+        if let Some(selected) = &self.selected {
+            return self.accept_selected(origin, reply, selected);
+        }
         let Ok(frame) = reply.decode::<ReplyFrame>() else {
             return Ok(false);
         };
@@ -121,6 +157,79 @@ impl<T: Transport> ReplyHubInvoker<T> {
             .deliver(origin.source(), reply)
             .map_err(|_| BusError::Invalid("reply registry closed"))
     }
+
+    #[cfg(feature = "serialization-rpc")]
+    fn accept_selected(
+        &self,
+        origin: &TrustedOrigin,
+        reply: Envelope,
+        selected: &SelectedRpc,
+    ) -> Result<bool, BusError> {
+        // All validation and canonical conversion precedes ReplyHub::deliver.
+        // Never decode a second time after consuming the waiter: converters can
+        // be stateful application code, and a bad reply must leave it alive.
+        let Some(token) = reply.correlation_id() else {
+            return Ok(false);
+        };
+        let expected = self
+            .expected
+            .lock()
+            .map_err(|_| BusError::Invalid("reply registry poisoned"))?
+            .get(&token)
+            .cloned();
+        let Some(expected) = expected else {
+            return Ok(false);
+        };
+        let Some(details) = &expected.selected else {
+            return Ok(false);
+        };
+        if expected.tenant != origin.tenant()
+            || details.source != origin.source()
+            || reply.causation_id() != Some(details.request_id)
+            || reply.validate(Default::default()).is_err()
+        {
+            return Ok(false);
+        }
+        let Ok(frame) = reply.decode::<SelectedReplyFrame>() else {
+            return Ok(false);
+        };
+        if frame.mode != selected.declaration() {
+            return Ok(false);
+        }
+        let body = match frame.response {
+            SelectedResponse::Success { body: bytes } => {
+                let Ok(inner) = selected.decode(&bytes) else {
+                    return Ok(false);
+                };
+                if inner.contract() != expected.contract || inner.version() != details.reply.version
+                {
+                    return Ok(false);
+                }
+                let Ok(bytes) = inner.to_vec() else {
+                    return Ok(false);
+                };
+                // The downstream RemoteInvoker/MessageBus handoff reparses a
+                // canonical envelope and decodes the expected typed R. Validate
+                // both now, including a canonicalizer's final model/schema.
+                let Ok(canonical) = Envelope::from_slice(&bytes, Default::default()) else {
+                    return Ok(false);
+                };
+                if !(details.reply.validate)(&canonical) {
+                    return Ok(false);
+                }
+                Some(bytes)
+            }
+            SelectedResponse::Failure {} => None,
+        };
+        // Internal v1-shaped carrier contains ONLY validated canonical content;
+        // it is not published and cannot trigger a selected decode after custody.
+        let Ok(canonical) = reply.rebody(&ReplyFrame { body }, Default::default()) else {
+            return Ok(false);
+        };
+        self.hub
+            .deliver(origin.source(), canonical)
+            .map_err(|_| BusError::Invalid("reply registry closed"))
+    }
     /// Payload-free count for capacity, timeout and shutdown diagnostics.
     pub fn pending(&self) -> Result<usize, BusError> {
         self.expected
@@ -144,6 +253,16 @@ impl<T: Transport + 'static> RemoteInvoker for ReplyHubInvoker<T> {
                 .responders
                 .get(destination)
                 .ok_or(BusError::RemoteDisabled)?;
+            #[cfg(feature = "serialization-rpc")]
+            let selected_reply = if let Some(selected) = &self.selected {
+                let pair = selected.pair(context.envelope())?;
+                if pair.name != reply_contract {
+                    return Err(BusError::Invalid("selected RPC reply contract mismatch"));
+                }
+                Some(pair)
+            } else {
+                None
+            };
             // Every attempt has a fresh nonce even when the business envelope is
             // retried. A late reply to the old attempt can never match this one.
             let token = Uuid::new_v4();
@@ -159,6 +278,12 @@ impl<T: Transport + 'static> RemoteInvoker for ReplyHubInvoker<T> {
                     ExpectedReply {
                         tenant: context.origin().tenant().to_owned(),
                         contract: reply_contract.to_owned(),
+                        #[cfg(feature = "serialization-rpc")]
+                        selected: selected_reply.map(|reply| SelectedExpected {
+                            source: responder.clone(),
+                            request_id: context.envelope().id(),
+                            reply,
+                        }),
                     },
                 );
             let _pending = Pending {
@@ -170,6 +295,17 @@ impl<T: Transport + 'static> RemoteInvoker for ReplyHubInvoker<T> {
                 .clone()
                 .with_header(REPLY_TO.into(), self.reply_to.clone())?
                 .with_header(TOKEN.into(), token.to_string())?;
+            #[cfg(feature = "serialization-rpc")]
+            let request = if let Some(selected) = &self.selected {
+                let request = request.with_header(MODE.into(), selected.declaration())?;
+                // Admit before serializing; exhaustion cannot create unbounded
+                // concurrent preflight bodies. The guard releases both slots on
+                // projection failure. Physical encoding remains the transport's job.
+                selected.encode(&request)?;
+                request
+            } else {
+                request
+            };
             self.transport.publish(destination, &request).await?;
             // MessageBus owns the effective request deadline and drops this future
             // on timeout/cancellation, which removes BOTH registries through Drop.
@@ -196,6 +332,8 @@ pub struct RemoteResponder<T> {
     runtime: Runtime,
     reply_endpoints: BTreeSet<String>,
     handlers: BTreeMap<(String, u32), Handler>,
+    #[cfg(feature = "serialization-rpc")]
+    selected: Option<SelectedRpc>,
 }
 impl<T: Transport> RemoteResponder<T> {
     /// Freezes configured reply aliases. Runtime remains explicit application state.
@@ -218,7 +356,23 @@ impl<T: Transport> RemoteResponder<T> {
             runtime,
             reply_endpoints: configured,
             handlers: BTreeMap::new(),
+            #[cfg(feature = "serialization-rpc")]
+            selected: None,
         })
+    }
+    /// Opts into selected application replies, carried inside JSON native v2
+    /// protocol envelopes. Must be called before registering handlers. Configure
+    /// the reply publisher as JSON, not as a selected application-body publisher.
+    #[cfg(feature = "serialization-rpc")]
+    pub fn with_selected_rpc(mut self, selected: SelectedRpc) -> Result<Self, BusError> {
+        selected.validate()?;
+        if self.selected.is_some() || !self.handlers.is_empty() {
+            return Err(BusError::Invalid(
+                "selected RPC already configured/handlers registered",
+            ));
+        }
+        self.selected = Some(selected);
+        Ok(self)
     }
     /// Declares one accepted typed request/reply pair; no wire name is inferred
     /// from a Rust type name and unknown requests get a negative acknowledgement.
@@ -227,6 +381,14 @@ impl<T: Transport> RemoteResponder<T> {
         M: Request + WireMessage,
         M::Reply: WireMessage,
     {
+        #[cfg(feature = "serialization-rpc")]
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !selected.has_pair::<M>())
+        {
+            return Err(BusError::Invalid("unconfigured selected RPC handler pair"));
+        }
         let key = (M::NAME.to_owned(), M::VERSION);
         raddle::routing::WireMessageType::of::<M>()
             .map_err(|_| BusError::Invalid("invalid request contract"))?;
@@ -257,6 +419,7 @@ impl<T: Transport> RemoteResponder<T> {
     /// or negative acknowledgement. Settle the request only after this confirms.
     /// Request/reply is volatile; a caller timeout does not undo peer business work.
     pub async fn respond(&self, context: &MessageContext) -> Result<(), BusError> {
+        self.validate_mode(context)?;
         let reply_to = context
             .envelope()
             .headers()
@@ -276,16 +439,52 @@ impl<T: Transport> RemoteResponder<T> {
             context.envelope().version(),
         );
         let body = match self.handlers.get(&key) {
-            Some(handler) => handler(context.envelope().clone())
-                .await
-                .ok()
-                .map(|reply| reply.to_vec())
-                .transpose()?,
+            Some(handler) => handler(context.envelope().clone()).await.ok(),
             None => None,
         };
+        #[cfg(feature = "serialization-rpc")]
+        if let Some(selected) = &self.selected {
+            let response = match body.as_ref() {
+                Some(reply) => {
+                    // The caller's internal canonical carrier is bounded too.
+                    Envelope::encode(&ReplyFrame {
+                        body: Some(reply.to_vec()?),
+                    })?;
+                    SelectedResponse::Success {
+                        body: selected.encode(reply)?,
+                    }
+                }
+                None => SelectedResponse::Failure {},
+            };
+            let reply = Envelope::encode(&SelectedReplyFrame {
+                mode: selected.declaration(),
+                response,
+            })?
+            .correlated(token, context.envelope().id())?;
+            self.transport.publish(reply_to, &reply).await?;
+            return Ok(());
+        }
+        let body = body.as_ref().map(Envelope::to_vec).transpose()?;
         let reply =
             Envelope::encode(&ReplyFrame { body })?.correlated(token, context.envelope().id())?;
         self.transport.publish(reply_to, &reply).await?;
+        Ok(())
+    }
+
+    fn validate_mode(&self, context: &MessageContext) -> Result<(), BusError> {
+        let mode = context.envelope().headers().get(MODE);
+        #[cfg(feature = "serialization-rpc")]
+        if let Some(selected) = &self.selected {
+            if mode != Some(&selected.declaration()) {
+                return Err(BusError::Invalid("native RPC peer mode mismatch"));
+            }
+            selected.pair(context.envelope())?;
+            selected.encode(context.envelope())?;
+            return Ok(());
+        }
+        if mode.is_some() {
+            return Err(BusError::Invalid("unsupported native RPC peer mode"));
+        }
         Ok(())
     }
 }

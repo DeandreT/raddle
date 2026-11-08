@@ -33,6 +33,20 @@ workspace. Dependency feature unification is not proof that an isolated package
 builds. Check package contents for its license, README, migrations and protocol
 sources, and retain exact command exits rather than accepting filtered log output.
 
+## Frozen-source qualification
+
+Qualify the clean committed source that will be delivered, including all integrated
+changes. Record its revision, the command plan and each command's actual exit
+status in a fresh run directory. Earlier branch or package results do not qualify
+a later integrated head. Keep execution receipts outside the source repository.
+
+After an interruption, retain a passed stage only when the source revision,
+working-tree cleanliness, command and verification configuration still match.
+Confirm that the previous driver and its children have stopped before resuming.
+Keep failed and interrupted attempts separate from their reruns; a later passing
+attempt does not change an earlier outcome. Broker fixtures that acquire their
+own compilation lease must not be wrapped in a second copy of that lease.
+
 ## Offline and database checks
 
 The normal workspace suite covers typed runtime behavior, independent fan-out,
@@ -41,6 +55,13 @@ transactions. PostgreSQL tests require an explicitly selected disposable server
 with database-create permission. They allocate isolated databases and cover
 transaction rollback, concurrent claims, process exits, upgrades from the
 initial schema, saga state, and request/reply races.
+
+Do not run the same SQLx PostgreSQL test concurrently from different checkouts
+against one server. SQLx 0.8.6 derives its test database name from the test path,
+not the checkout, so those runs can recreate or remove each other's database.
+Use separate explicitly selected servers or serialize the entire test execution.
+A compilation lease alone is insufficient when prebuilt test binaries continue
+running after that lease is released.
 
 `raddle-testkit` supplies a manual clock and bounded scripted transport. Scripts
 distinguish failure before acceptance from lost confirmation after acceptance;

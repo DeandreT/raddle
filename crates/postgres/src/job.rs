@@ -94,6 +94,8 @@ pub enum JobStatus {
     Completed,
     /// Rejected, expired, or exhausted.
     Dead,
+    /// Explicitly discarded by an operator, not successful business completion.
+    Discarded,
 }
 
 /// A redacted operator view of a job; excludes its payload and authorization data.

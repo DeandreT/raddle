@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::codec::Codec;
 use crate::config::{Error, Limits};
 use crate::framing;
 
@@ -44,6 +45,7 @@ pub trait Consumer: Send + Sync + 'static {
 pub struct Receiver {
     listener: TcpListener,
     limits: Limits,
+    codec: Codec,
 }
 
 impl Receiver {
@@ -53,7 +55,22 @@ impl Receiver {
         let listener = TcpListener::bind(address)
             .await
             .map_err(|_| Error::Configuration)?;
-        Ok(Self { listener, limits })
+        Ok(Self {
+            listener,
+            limits,
+            codec: Codec::default(),
+        })
+    }
+
+    /// Enables explicit RDTC2 selected-body framing while retaining RDTC1 JSON
+    /// clients. No content sniffing changes the legacy default. Canonical decode
+    /// completes before the consumer can acknowledge custody.
+    #[cfg(feature = "serialization")]
+    pub fn with_codecs(mut self, codecs: Arc<raddle_serialization::EndpointCodecs>) -> Self {
+        self.codec = Codec {
+            selected: Some(codecs),
+        };
+        self
     }
 
     /// Bound local address, including an OS-assigned port when binding port zero.
@@ -82,11 +99,12 @@ impl Receiver {
                     };
                     let consumer = Arc::clone(&consumer);
                     let limits = self.limits;
+                    let codec = self.codec.clone();
                     let deadline = tokio::time::Instant::now() + limits.deadline;
                     connections.spawn(async move {
                         let _ = tokio::time::timeout_at(
                             deadline,
-                            serve(stream, Peer { address }, limits, consumer),
+                            serve(stream, Peer { address }, limits, codec, consumer),
                         ).await;
                     });
                 }
@@ -102,6 +120,7 @@ async fn serve<C: Consumer>(
     mut stream: TcpStream,
     peer: Peer,
     limits: Limits,
+    codec: Codec,
     consumer: Arc<C>,
 ) -> Result<(), Error> {
     stream.set_nodelay(true).map_err(|_| Error::Uncertain)?;
@@ -110,7 +129,8 @@ async fn serve<C: Consumer>(
         .read_exact(&mut magic)
         .await
         .map_err(|_| Error::Uncertain)?;
-    if magic != *framing::MAGIC {
+    let selected = magic == *framing::SELECTED_MAGIC;
+    if magic != *framing::MAGIC && !(selected && codec.selected()) {
         return Err(Error::Rejected);
     }
     let count = usize::from(stream.read_u16().await.map_err(|_| Error::Uncertain)?);
@@ -122,7 +142,7 @@ async fn serve<C: Consumer>(
         let bytes =
             framing::read_frame(&mut stream, limits.envelope.max_bytes.min(remaining)).await?;
         remaining -= bytes.len();
-        let envelope = match Envelope::from_slice(&bytes, limits.envelope) {
+        let envelope = match codec.decode(&bytes, limits.envelope, selected) {
             Ok(envelope) => envelope,
             Err(_) => {
                 stream
@@ -145,7 +165,7 @@ async fn serve<C: Consumer>(
                 {
                     (framing::RETRY, None)
                 } else {
-                    match reply.to_vec() {
+                    match codec.encode(&reply, limits.envelope, selected) {
                         Ok(bytes) if bytes.len() <= remaining => {
                             remaining -= bytes.len();
                             (framing::REPLY, Some(bytes))

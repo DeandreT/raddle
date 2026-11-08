@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use crate::PolicyErrorCode;
 
 /// In-process quota algorithms, not distributed admission promises.
@@ -49,6 +51,7 @@ struct State {
 pub struct Quota {
     kind: QuotaKind,
     state: Arc<Mutex<State>>,
+    clock: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Successful permit or a deterministic retry time (None for concurrency).
@@ -100,6 +103,7 @@ impl Quota {
         }
         Ok(Self {
             kind,
+            clock: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(State {
                 last: Duration::ZERO,
                 anchor: Duration::ZERO,
@@ -108,6 +112,20 @@ impl Quota {
                 times: VecDeque::new(),
             })),
         })
+    }
+    /// Acquires using one quota-owned monotonic clock shared by all clones.
+    /// Sampling and admission are serialized together, so competing endpoints
+    /// cannot present different clock origins or out-of-order observations.
+    /// Returns the admission and its sampled time; subtract that time from a
+    /// limited `retry_at` when translating into an endpoint's scheduling clock.
+    /// Zero is established on first use. Do not mix this method with explicit-
+    /// clock `acquire` calls on the same quota state.
+    pub fn acquire_current(&self) -> Result<(QuotaAdmission, Duration), PolicyErrorCode> {
+        let mut clock = self.clock.lock().map_err(|_| PolicyErrorCode)?;
+        let now = clock.get_or_insert_with(Instant::now).elapsed();
+        let admission = self.acquire(now)?;
+        drop(clock);
+        Ok((admission, now))
     }
     /// Rejects backwards clocks. No waiting queue is allocated on rejection.
     pub fn acquire(&self, now: Duration) -> Result<QuotaAdmission, PolicyErrorCode> {

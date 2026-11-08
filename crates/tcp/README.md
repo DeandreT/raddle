@@ -49,3 +49,20 @@ Replies must correlate to and be caused by that request's identity. Unknown
 statuses, truncation and deadlines never produce a positive acknowledgement.
 
 Licensed under the repository's MIT license.
+
+## Optional typed body codecs
+
+The `serialization` feature adds explicit per-alias `Publisher::with_codecs` and
+`Receiver::with_codecs` configuration using `raddle-serialization::EndpointCodecs`.
+Selected connections use `RDTC\x02` with bounded `RDSB\x01` metadata/raw-body frames;
+the existing RDTC1 JSON default is unchanged. Configured receivers also retain
+legacy clients. Unconfigured receivers refuse the new connection version rather
+than guessing body content. There is no automatic protocol fallback or resend.
+Replies use the selected path and retain the existing correlation checks.
+
+Outgoing encoded batches are retained once within the batch-byte budget so custom
+codecs cannot change their output after size accounting. Selected decoding and
+explicit canonicalization finish before the consumer can declare custody. See the
+[serialization guide](../../docs/serialization.md) for framing, configuration,
+allocation trust and compatibility limits. This remains raddle-native framing,
+not Wolverine's TCP protocol or named .NET codec interoperability.

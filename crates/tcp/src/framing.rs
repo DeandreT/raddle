@@ -3,6 +3,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::Error;
 
 pub(crate) const MAGIC: &[u8; 5] = b"RDTC\x01";
+pub(crate) const SELECTED_MAGIC: &[u8; 5] = b"RDTC\x02";
 pub(crate) const ACCEPTED: u8 = 0;
 pub(crate) const RETRY: u8 = 1;
 pub(crate) const REJECTED: u8 = 2;
