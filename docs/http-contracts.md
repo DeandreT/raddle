@@ -5,8 +5,8 @@ existing `raddle::Runtime`. It is a semantic implementation, not ASP.NET, CLR
 discovery, Asp.Versioning, System.Text.Json or a .NET library bridge. The comparison
 target is Wolverine **V6.62.0**, resolved to
 `3653e7a0d8f5eaa2f35b9d4589c1ba22f441549e`. Later upstream documentation is not the
-contract. Issue 37 remains open until its remaining behaviors and counterpart
-qualification are complete.
+contract. Native contract behavior does not establish CLR/ASP.NET identity or
+foreign-wire interoperability; those require separate counterpart qualification.
 
 ## Registration and execution ownership
 

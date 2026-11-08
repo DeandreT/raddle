@@ -10,6 +10,11 @@ then copies its test executables into the run directory and runs those snapshots
 Broker runtime tests do not occupy the build lock or wait with an idle broker,
 and later builds cannot replace the executable under an active test. Brokers run
 as the invoking Linux UID so retained fixture state remains inspectable.
+Build targets are checkout-specific by default. `--target-dir <path>` selects an
+explicit directory on the verified perok volume; do not reuse another checkout's
+target directory.
+Mount/target guards can be checked without Docker:
+`python3 -B -m unittest discover -s conformance/streams -p 'test_*.py'`.
 Standard pulled images remain Docker's shared cache; there are no run-created
 networks, volumes or private image tags. Retained state/receipts are under
 `/mnt/perok/build/raddle/parity-native/streams-runs/` for inspection.

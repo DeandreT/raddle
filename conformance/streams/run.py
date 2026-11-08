@@ -3,6 +3,7 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ def command(args, *, timeout=300, check=True, env=None):
     return result
 
 
-def phase(family, run, directory):
+def phase(family, run, directory, target):
     images = {
         "nats": ["nats:2.14.7-alpine", "nats:2.12.5-alpine"],
         "redis": ["redis:8.2.9-alpine", "redis:8.2.4-alpine"],
@@ -62,7 +63,7 @@ def phase(family, run, directory):
         with (BUILD / "compile.lock").open("a") as lease:
             fcntl.flock(lease, fcntl.LOCK_EX)
             built = command(["cargo", "test", "-p", crate, "--tests", "--no-run", "--locked",
-                             "--message-format=json", "--target-dir", str(BUILD / "streams-target"),
+                              "--message-format=json", "--target-dir", str(target),
                              "--config", "profile.dev.debug=0", "-j", "1"], timeout=3600, check=False)
             (directory / f"{family}-compile.log").write_text(built.stdout)
             receipt["compile_exit"] = built.returncode
@@ -185,13 +186,30 @@ def phase(family, run, directory):
             raise RuntimeError(f"{family} owned container cleanup failed; see receipt")
 
 
+def target_directory(path):
+    target = path.resolve()
+    if not target.is_relative_to(Path("/mnt/perok/build")):
+        raise RuntimeError("Build output must remain below the perok build directory")
+    existing = target.parent
+    while not existing.exists():
+        existing = existing.parent
+    actual = command(["findmnt", "-n", "-o", "SOURCE,FSTYPE", "-T", str(existing)]).stdout.split()
+    if actual != ["/dev/sdb1", "btrfs"]:
+        raise RuntimeError("Build output is not on the verified perok volume")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("families", nargs="*", choices=["nats", "redis", "mqtt"])
+    checkout = hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
+    parser.add_argument("--target-dir", type=Path, default=BUILD / "streams-targets" / checkout / "target")
     args = parser.parse_args()
     mounted = command(["findmnt", "-n", "-o", "SOURCE,FSTYPE", "-T", "/mnt/perok"]).stdout.split()
     if mounted != ["/dev/sdb1", "btrfs"]:
         raise RuntimeError("Required /dev/sdb1 btrfs build disk is not mounted")
+    target = target_directory(args.target_dir)
     run = uuid.uuid4().hex[:12]
     directory = BUILD / "streams-runs" / run
     directory.mkdir(parents=True)
@@ -199,7 +217,7 @@ def main():
     failed = []
     for family in args.families or ["nats", "redis", "mqtt"]:
         try:
-            phase(family, run, directory)
+            phase(family, run, directory, target)
         except (RuntimeError, subprocess.SubprocessError) as error:
             print(f"{family}: {error}", flush=True)
             failed.append(family)
