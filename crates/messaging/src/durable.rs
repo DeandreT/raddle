@@ -33,6 +33,8 @@ pub(crate) enum ClaimOutcome {
     Quarantined,
     FailureRecorded,
     Recoverable,
+    // Custody is retained, but no success or automatic retry is authorized.
+    UncertainRetained,
     OwnershipLost,
 }
 

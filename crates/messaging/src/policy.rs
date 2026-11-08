@@ -139,6 +139,9 @@ pub(crate) enum AttemptFailure {
     Application(PolicyError),
     Cancelled,
     Infrastructure(raddle_postgres::Error),
+    // The already-admitted attempt cannot prove its transaction outcome. This
+    // retains only that delivery; it is not evidence of a shared admission outage.
+    Uncertain(raddle_postgres::Error),
     InvalidInput,
 }
 
@@ -149,7 +152,7 @@ impl AttemptFailure {
         match failure {
             Failure::Handler(error) => Self::Application(Box::new(error)),
             Failure::Cancelled => Self::Cancelled,
-            Failure::UncertainDatabase(error) => Self::Infrastructure(error),
+            Failure::UncertainDatabase(error) => Self::Uncertain(error),
             Failure::Database(error) if !order_failure(&error) => Self::Infrastructure(error),
             Failure::Effect(crate::effects::EffectError::Storage(error))
                 if !order_failure(&error) =>

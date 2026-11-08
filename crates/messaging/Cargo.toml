@@ -25,6 +25,7 @@ uuid.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 sqlx.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 raddle-tcp = { path = "../tcp", version = "0.1.0" }

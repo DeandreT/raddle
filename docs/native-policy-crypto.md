@@ -274,9 +274,30 @@ legacy attempt field is separate from the persisted policy handling counter.
 Lease expiry during cooldown or asynchronous cleanup can end this owner's retry
 permission. Stale ownership affects only that claim, never the Host's cancellation
 signal or healthy siblings. The owner cannot extend an expired lease or clear a
-successor's uncertainty marker. Database failures propagate after the already
-claimed healthy siblings finish. A locally uncertain in-memory scoped attempt is
-retained Interrupted and causes its Host service to fail rather than retrying.
+successor's uncertainty marker. A scoped post-admission uncertain commit or
+rollback retains only the affected delivery, logs a payload-free error, and
+bypasses ordinary retry and circuit failure samples. It does not stop the Host
+or cancel sibling services: healthy current and newly arriving work use fresh
+scopes. SQL custody keeps its uncertainty marker and requires audited operator
+reconciliation; no success acknowledgement or automatic lease-recovery replay
+is invented. Claim counts returned by `run_once` are observations, not business
+successes.
+
+The local policy runner retains uncertain work as `Interrupted` in its existing
+volatile custody. It does not claim a durable taint record or audit trail. Only
+an explicit `resume_interrupted` safety authorization, after reconciliation, can
+resume that identity; duplicate submission and ordinary dead-letter retry cannot
+bypass it. Completed siblings remain completed. Process exit still loses this
+volatile custody.
+
+Shared claim acquisition, fresh-scope admission, custody-driver and other genuine
+infrastructure errors still propagate. A real shared database outage is detected
+by the next actual claim or scope admission; an isolated admitted attempt's lost
+connection is not treated as proof that the entire database is unavailable.
+The transaction pipeline still joins its commit/rollback attempt and Finally/
+disposal before handing the uncertain result back to its runner. A successful
+root's post-commit failures remain successful roots and never enter this
+uncertainty or root-retry path.
 
 Policy custody operations preserve the supplied caller clock and advance it by
 monotonic elapsed time from method entry through connection-pool and row-lock

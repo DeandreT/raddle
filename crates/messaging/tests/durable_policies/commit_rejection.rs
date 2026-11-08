@@ -289,11 +289,8 @@ async fn postgres_unknown_completion_sqlstate_is_not_a_known_commit_rejection(po
         Arc::new(LocalOnlyFlush),
     );
     let id = stage(&store, "unknown-commit", 42).await;
-    let error = endpoint.run_once().await.unwrap_err();
-    let raddle_postgres::Error::Database(sqlx::Error::Database(error)) = error else {
-        panic!("expected server SQLSTATE");
-    };
-    assert_eq!(error.code().as_deref(), Some("40003"));
+    assert_eq!(endpoint.run_once().await.unwrap(), 1);
+    assert_eq!(*handler.uncertain_sqlstates.lock().await, ["40003"]);
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
     assert_eq!(handler.uncertain_completions.load(Ordering::SeqCst), 1);
     assert_eq!(

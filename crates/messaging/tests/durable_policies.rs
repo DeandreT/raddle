@@ -28,6 +28,8 @@ use uuid::Uuid;
 mod commit_rejection;
 #[path = "durable_policies/policy_clock.rs"]
 mod policy_clock;
+#[path = "durable_policies/uncertainty_isolation.rs"]
+mod uncertainty_isolation;
 
 #[derive(Serialize, Deserialize)]
 struct Work(i32);
@@ -56,6 +58,7 @@ struct Handler {
     invalid_outgoing: Option<i32>,
     commit_rejections: AtomicUsize,
     uncertain_completions: AtomicUsize,
+    uncertain_sqlstates: Mutex<Vec<String>>,
 }
 impl Handler {
     fn new(failed: i32) -> Self {
@@ -76,6 +79,7 @@ impl Handler {
             invalid_outgoing: None,
             commit_rejections: AtomicUsize::new(0),
             uncertain_completions: AtomicUsize::new(0),
+            uncertain_sqlstates: Mutex::new(Vec::new()),
         }
     }
 }
@@ -195,8 +199,16 @@ impl ScopedHandler<Work> for Handler {
                     assert_eq!(error.code().as_deref(), Some("23505"));
                     self.commit_rejections.fetch_add(1, Ordering::SeqCst);
                 }
-                Failure::UncertainDatabase(_) => {
+                Failure::UncertainDatabase(error) => {
                     self.uncertain_completions.fetch_add(1, Ordering::SeqCst);
+                    if let raddle_postgres::Error::Database(error) = error
+                        && let Some(code) = error.as_database_error().and_then(|error| error.code())
+                    {
+                        self.uncertain_sqlstates
+                            .lock()
+                            .await
+                            .push(code.into_owned());
+                    }
                 }
                 _ => {}
             }
@@ -538,9 +550,7 @@ async fn real_host_shutdown_joins_rollback_finally_and_does_not_trip_circuit(poo
 
 #[sqlx::test(migrations = "../postgres/migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-async fn commit_io_failure_retains_custody_reports_infrastructure_after_healthy_siblings(
-    pool: PgPool,
-) {
+async fn commit_io_failure_retains_custody_without_blocking_healthy_siblings(pool: PgPool) {
     schema(&pool).await;
     let store = Store::new(pool.clone());
     // A deferred trigger closes only this test transaction's own connection
@@ -558,10 +568,7 @@ async fn commit_io_failure_retains_custody_reports_infrastructure_after_healthy_
     let first = stage(&store, "uncertain", 41).await;
     let id = stage(&store, "uncertain", 42).await;
     let last = stage(&store, "uncertain", 43).await;
-    assert!(matches!(
-        endpoint.run_once().await,
-        Err(raddle_postgres::Error::Database(_))
-    ));
+    assert_eq!(endpoint.run_once().await.unwrap(), 3);
     assert_eq!(
         store.inspect("tenant", id).await.unwrap().unwrap().status,
         JobStatus::Active
@@ -933,10 +940,7 @@ async fn rollback_io_failure_is_not_reclassified_as_a_retryable_handler_error(po
         Arc::new(LocalOnlyFlush),
     );
     let id = stage(&store, "rollback-io", 42).await;
-    assert!(matches!(
-        endpoint.run_once().await,
-        Err(raddle_postgres::Error::Database(_))
-    ));
+    assert_eq!(endpoint.run_once().await.unwrap(), 1);
     assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
     assert_eq!(handler.finalized.load(Ordering::SeqCst), 1);
     assert_eq!(handler.disposed.load(Ordering::SeqCst), 1);

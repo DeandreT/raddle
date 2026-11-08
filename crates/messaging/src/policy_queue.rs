@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -207,8 +208,9 @@ impl PolicyQueueBuilder {
         }), replay)
     }
     /// Runs the original scoped pipeline with fresh resources/SQL per attempt.
-    /// Rollback failure or uncertain commit is infrastructure failure, not a
-    /// retryable domain error. Post-commit errors never replay the parent.
+    /// Uncertain commit/rollback retains only that delivery for explicit
+    /// reconciliation; shared scope-admission errors still fail the service.
+    /// Post-commit errors never replay the parent.
     pub fn scoped<M, H>(
         &mut self,
         handler: Arc<H>,
@@ -402,11 +404,17 @@ impl PolicyQueueRunner {
         }
         let handlers = &self.handlers;
         let contexts = &self.contexts;
-        let result = self
+        // run_joined already retains outer errors without a policy/circuit
+        // sample. Distinguish this one typed outcome from shared infrastructure
+        // failure without changing the lower-level driver's error contract.
+        let uncertain = AtomicBool::new(false);
+        let observed_uncertain = &uncertain;
+        let mut result = self
             .queue
             .run_joined(&self.executor, now, stop, |envelope| {
                 let entry = contexts.get(&envelope.id());
                 let handler = handlers.get(&(envelope.contract().to_owned(), envelope.version()));
+                let message_id = envelope.id();
                 async move {
                     let (context, _) = entry.ok_or(DriverError::Custody)?;
                     let registered = handler.ok_or(DriverError::Invalid)?;
@@ -418,8 +426,14 @@ impl PolicyQueueRunner {
                     match outcome {
                         Ok(()) => Ok(Ok(())),
                         Err(AttemptFailure::Application(error)) => Ok(Err(error)),
-                        // The managed memory driver retains these without a failure
-                        // policy/circuit sample; the Host reports infrastructure loss.
+                        Err(AttemptFailure::Uncertain(error)) => {
+                            tracing::error!(%message_id, error = %error,
+                                "policy transaction uncertain; retaining memory custody pending explicit reconciliation");
+                            observed_uncertain.store(true, Ordering::Relaxed);
+                            Err(DriverError::Custody)
+                        }
+                        // A failed fresh scope admission or other shared error is
+                        // still reported by the Host, never blanket-suppressed.
                         Err(AttemptFailure::Infrastructure(_)) => Err(DriverError::Custody),
                         Err(AttemptFailure::InvalidInput) => Err(DriverError::Invalid),
                         Err(AttemptFailure::Cancelled) => {
@@ -429,6 +443,19 @@ impl PolicyQueueRunner {
                 }
             })
             .await;
+        if uncertain.load(Ordering::Relaxed)
+            && matches!(result, Err(DriverError::Custody))
+            && active_id.is_some_and(|id| {
+                self.queue.deliveries().iter().any(|delivery| {
+                    delivery.envelope.id() == id
+                        && delivery.status == raddle_policies::MemoryStatus::Interrupted
+                })
+            })
+        {
+            // Only suppress the typed uncertain outcome AFTER the driver has
+            // actually retained it. Any failed retention/state error propagates.
+            result = Ok(true);
+        }
         if result.is_err() {
             let _ = self.queue.recover_interrupted();
         }

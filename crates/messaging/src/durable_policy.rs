@@ -216,6 +216,16 @@ impl DurableEndpoint {
                     policies.cancel_probe().await;
                     return Ok(ClaimOutcome::Recoverable);
                 }
+                Err(AttemptFailure::Uncertain(error)) => {
+                    // Attempt entry already persisted uncertainty. Do not settle,
+                    // authorize replay, or turn this into a circuit sample. A
+                    // later real claim/admission operation still reports an
+                    // unavailable shared database through its normal error path.
+                    policies.cancel_probe().await;
+                    tracing::error!(job_id = %claim.id(), error = %error,
+                        "policy transaction uncertain; automatic replay blocked pending reconciliation");
+                    return Ok(ClaimOutcome::UncertainRetained);
+                }
                 Err(AttemptFailure::Infrastructure(error)) => {
                     policies.cancel_probe().await;
                     return if matches!(error, Error::StaleClaim) {
