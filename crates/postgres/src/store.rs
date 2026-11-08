@@ -173,6 +173,7 @@ impl Store {
     }
 
     /// Records a classified failure or reschedules with deterministic bounded jitter.
+    /// An expired lease cannot settle or release work, even before its next takeover.
     pub async fn fail(
         &self,
         claim: &Claim,
@@ -192,8 +193,8 @@ impl Store {
             )
             .ok_or(Error::Invalid("retry timestamp overflow"))?
         };
-        let changed = sqlx::query("UPDATE raddle_jobs SET status=$4,available_at=$5,owner=NULL,lease_until=NULL,last_error=$6 WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active'")
-            .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(if terminal { "dead" } else { "ready" }).bind(due).bind(code).execute(&self.pool).await?;
+        let changed = sqlx::query("UPDATE raddle_jobs SET status=$4,available_at=$5,owner=NULL,lease_until=NULL,last_error=$6 WHERE id=$1 AND owner=$2 AND generation=$3 AND status='active' AND lease_until > $7")
+            .bind(claim.id).bind(claim.owner).bind(claim.generation).bind(if terminal { "dead" } else { "ready" }).bind(due).bind(code).bind(now).execute(&self.pool).await?;
         if changed.rows_affected() == 1 {
             Ok(())
         } else {

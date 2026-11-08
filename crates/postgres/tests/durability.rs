@@ -103,7 +103,7 @@ async fn business_writes_and_effects_share_one_transaction(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-async fn invalid_time_bounds_preserve_jobs_and_terminal_rejection_needs_no_future_time(
+async fn invalid_time_bounds_and_expired_failure_preserve_jobs_then_live_rejection_succeeds(
     pool: PgPool,
 ) {
     let store = Store::new(pool.clone());
@@ -163,13 +163,38 @@ async fn invalid_time_bounds_preserve_jobs_and_terminal_rejection_needs_no_futur
             .await
             .unwrap();
     assert_eq!(before, after);
+    let before: String =
+        sqlx::query_scalar("SELECT row_to_json(j)::text FROM raddle_jobs j WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(matches!(
+        store
+            .fail(
+                &claim,
+                raddle_postgres::FailureDisposition::Reject,
+                RetryPolicy::default(),
+                "rejected",
+                chrono::DateTime::<Utc>::MAX_UTC,
+            )
+            .await,
+        Err(Error::StaleClaim)
+    ));
+    let after: String =
+        sqlx::query_scalar("SELECT row_to_json(j)::text FROM raddle_jobs j WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
     store
         .fail(
             &claim,
             raddle_postgres::FailureDisposition::Reject,
             RetryPolicy::default(),
             "rejected",
-            chrono::DateTime::<Utc>::MAX_UTC,
+            Utc::now(),
         )
         .await
         .unwrap();

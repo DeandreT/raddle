@@ -6,7 +6,7 @@ use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
 use raddle::wire::WireMessage;
 use raddle_host::{Host, HostError, RestartPolicy, ServiceFailure};
-use raddle_postgres::{DeliveryKind, Error, FailureDisposition, RetryPolicy, Scope, Store};
+use raddle_postgres::{Claim, DeliveryKind, Error, FailureDisposition, RetryPolicy, Scope, Store};
 use tokio::sync::{Mutex, watch};
 
 use crate::scoped::{self, Failure, Flush, ScopedHandler};
@@ -17,6 +17,15 @@ type Handler = Box<
         + Send
         + Sync,
 >;
+
+#[derive(Debug, Eq, PartialEq)]
+enum ClaimOutcome {
+    Completed,
+    Quarantined,
+    FailureRecorded,
+    Recoverable,
+    OwnershipLost,
+}
 
 /// Idempotent pause/resume of one durable receiving block, not the entire store.
 #[derive(Clone)]
@@ -172,6 +181,7 @@ impl DurableEndpoint {
 
     /// Executes one endpoint-local batch, joining every independent result.
     /// Infrastructure failures are reported only after healthy siblings finish.
+    /// The count is claims observed, not an acknowledgement of successful work.
     pub async fn run_once(&self) -> Result<usize, Error> {
         self.run_batch(Cancellation::new()).await
     }
@@ -193,51 +203,7 @@ impl DurableEndpoint {
             .await?;
         let count = claims.len();
         let results = stream::iter(claims)
-            .map(|claim| {
-                let shutdown = cancellation.clone();
-                let cancellation = cancellation.child();
-                async move {
-                    let envelope = claim.envelope()?;
-                    let Some(handler) = self
-                        .handlers
-                        .get(&(envelope.contract().to_owned(), envelope.version()))
-                    else {
-                        return self
-                            .store
-                            .fail(
-                                &claim,
-                                FailureDisposition::Reject,
-                                self.policy,
-                                "unregistered-contract",
-                                Utc::now(),
-                            )
-                            .await;
-                    };
-                    let origin =
-                        TrustedOrigin::authenticated(claim.tenant(), claim.source(), None)?;
-                    let mut context = MessageContext::new(origin, envelope, Utc::now())
-                        .with_cancellation(cancellation.clone());
-                    if let Some(bus) = &self.bus {
-                        context = context.with_bus(bus.clone());
-                    }
-                    let scope = self.store.execution(&claim, Utc::now()).await?;
-                    match handler(scope, context).await {
-                        Ok(()) => Ok(()),
-                        Err(_) if shutdown.is_cancelled() => Ok(()), // retain recoverable lease, not a fabricated terminal failure
-                        Err(disposition) => {
-                            self.store
-                                .fail(
-                                    &claim,
-                                    disposition,
-                                    self.policy,
-                                    "handler-failed",
-                                    Utc::now(),
-                                )
-                                .await
-                        }
-                    }
-                }
-            })
+            .map(|claim| self.process_claim(claim, cancellation.clone()))
             .buffer_unordered(self.parallelism as usize)
             .collect::<Vec<_>>()
             .await;
@@ -245,6 +211,75 @@ impl DurableEndpoint {
             result?;
         }
         Ok(count)
+    }
+
+    async fn process_claim(
+        &self,
+        claim: Claim,
+        shutdown: Cancellation,
+    ) -> Result<ClaimOutcome, Error> {
+        let envelope = match claim.envelope() {
+            Ok(envelope) => envelope,
+            Err(Error::Wire(_)) => {
+                return self
+                    .record_failure(&claim, FailureDisposition::Reject, "invalid-envelope")
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(handler) = self
+            .handlers
+            .get(&(envelope.contract().to_owned(), envelope.version()))
+        else {
+            return self
+                .record_failure(&claim, FailureDisposition::Reject, "unregistered-contract")
+                .await;
+        };
+        let origin = match TrustedOrigin::authenticated(claim.tenant(), claim.source(), None) {
+            Ok(origin) => origin,
+            Err(_) => {
+                return self
+                    .record_failure(&claim, FailureDisposition::Reject, "invalid-origin")
+                    .await;
+            }
+        };
+        let mut context =
+            MessageContext::new(origin, envelope, Utc::now()).with_cancellation(shutdown.child());
+        if let Some(bus) = &self.bus {
+            context = context.with_bus(bus.clone());
+        }
+        let scope = match self.store.execution(&claim, Utc::now()).await {
+            Ok(scope) => scope,
+            Err(Error::StaleClaim) => return Ok(ClaimOutcome::OwnershipLost),
+            Err(error) => return Err(error),
+        };
+        match handler(scope, context).await {
+            Ok(()) => Ok(ClaimOutcome::Completed),
+            Err(_) if shutdown.is_cancelled() => Ok(ClaimOutcome::Recoverable),
+            Err(disposition) => {
+                self.record_failure(&claim, disposition, "handler-failed")
+                    .await
+            }
+        }
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &Claim,
+        disposition: FailureDisposition,
+        code: &'static str,
+    ) -> Result<ClaimOutcome, Error> {
+        match self
+            .store
+            .fail(claim, disposition, self.policy, code, Utc::now())
+            .await
+        {
+            Ok(()) if disposition == FailureDisposition::Reject => Ok(ClaimOutcome::Quarantined),
+            // A retry disposition can also exhaust the attempt budget.
+            Ok(()) => Ok(ClaimOutcome::FailureRecorded),
+            Err(Error::StaleClaim) => Ok(ClaimOutcome::OwnershipLost),
+            Err(error) => Err(error),
+        }
     }
 
     /// Attaches the receiving owner. Host stop cancels unfinished pre-commit
@@ -283,3 +318,7 @@ impl DurableEndpoint {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "durable_tests.rs"]
+mod tests;
