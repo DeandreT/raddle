@@ -139,6 +139,52 @@ class FixtureContracts(unittest.TestCase):
                 self.assertEqual(fixture.main(), 0)
         self.assertEqual(events, ['lease', 'build', 'up', 'test', 'down'])
 
+    def test_crc_cli_cannot_reuse_an_inert_or_retained_fixture(self):
+        for arguments in [['up', '--mode', 'crc'], ['test', '--mode', 'crc', '--state', 'old-state']]:
+            with mock.patch.object(fixture.sys, 'argv', ['run.py', *arguments]), \
+                    mock.patch.object(fixture, 'up') as up:
+                with self.assertRaises(SystemExit):
+                    fixture.main()
+                up.assert_not_called()
+        with mock.patch.object(fixture, 'load', return_value={'containers': ['owned'], 'mode': 'crc'}), \
+                mock.patch.object(fixture.subprocess, 'run') as run:
+            with self.assertRaises(RuntimeError):
+                fixture.test(Path('inert'), ['cargo', 'test'], {})
+            run.assert_not_called()
+
+    def test_crc_advertises_only_proxy_while_docker_maps_backend(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proxy = SimpleNamespace(port=23456, backend=None, descriptor=lambda: {'bootstrap': '127.0.0.1:23456', 'pid': 123, 'control': '127.0.0.1:23457'})
+            with mock.patch.object(fixture, 'mounted'), \
+                    mock.patch.object(fixture, 'build_directory'), \
+                    mock.patch.object(fixture, 'FIXTURES', Path(temporary)), \
+                    mock.patch.object(fixture, 'resolve_image', return_value='apache/kafka@sha256:' + 'a' * 64), \
+                    mock.patch.object(fixture.shutil, 'disk_usage', return_value=SimpleNamespace(free=10 * 1024**3)), \
+                    mock.patch.object(fixture, 'compose'), \
+                    mock.patch.object(fixture, 'docker', return_value=SimpleNamespace(stdout='owned-container\n')):
+                path = fixture.up(proxy)
+            state = json.loads(path.read_text())
+            config = json.loads(Path(state['compose']).read_text())['services']['broker']
+            self.assertEqual(state['bootstrap'], '127.0.0.1:23456')
+            self.assertEqual(state['mode'], 'crc')
+            self.assertEqual(config['ports'], [f'127.0.0.1:{proxy.backend}:29092'])
+            self.assertEqual(config['environment']['KAFKA_ADVERTISED_LISTENERS'], 'INTERNAL://broker:9092,EXTERNAL://127.0.0.1:23456')
+            self.assertEqual(config['labels']['raddle.kafka.fixture'], state['run'])
+
+    def test_test_target_selection_and_control_credentials_are_mode_scoped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(fixture, 'mounted'), mock.patch.object(fixture, 'build_directory'):
+                ordinary, _ = fixture.build_inputs(Path('/mnt/perok/build/ordinary'))
+                crc, _ = fixture.build_inputs(Path('/mnt/perok/build/crc'), 'crc')
+            self.assertEqual(ordinary[ordinary.index('--test') + 1], 'broker')
+            self.assertEqual(crc[crc.index('--test') + 1], 'crc_wire')
+        state = {'containers': ['owned'], 'bootstrap': '127.0.0.1:29092'}
+        with mock.patch.object(fixture, 'load', return_value=state), \
+                mock.patch.object(fixture.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run:
+            fixture.test(Path('owned'), ['cargo'], {'RADDLE_KAFKA_CRC_CONTROL': 'inherited', 'RADDLE_KAFKA_CRC_TOKEN': 'inherited'})
+            self.assertNotIn('RADDLE_KAFKA_CRC_CONTROL', run.call_args.kwargs['env'])
+            self.assertNotIn('RADDLE_KAFKA_CRC_TOKEN', run.call_args.kwargs['env'])
+
 
 if __name__ == '__main__':
     unittest.main()
