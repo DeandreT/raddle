@@ -3091,6 +3091,7 @@ dependencies = [
  "futures-util",
  "lapin",
  "raddle",
+ "raddle-crypto",
  "raddle-host",
  "raddle-postgres",
  "raddle-rabbitmq",

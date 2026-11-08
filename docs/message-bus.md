@@ -46,6 +46,16 @@ still conflicts. Expiration comparisons use PostgreSQL timestamp precision.
 The existing `Scope::stage` retains its strict immutable scheduling fingerprint.
 The listener owns acknowledgement and must not acknowledge failed decode/custody.
 
+With the optional `crypto-ingress` feature, an
+`raddle_crypto::EncryptionCodec<P>` implements `IngressDecoder` directly. Pass
+that codec to `MessageBus::receive`; asynchronous key lookup, authentication and
+receive-required checks finish before dispatch opens a custody transaction.
+The bus stages the decrypted original envelope, so new nonces and key rotation
+do not change inbox identity. Trusted source and tenant still come from the
+independently authenticated `TrustedOrigin`, not authenticated payload claims.
+Codec failures remain `IngressError::Decode`; a transport must not acknowledge
+them as successful custody or run a handler on their ciphertext.
+
 ## Named local queues and host ownership
 
 `LocalQueue::new` returns a cloneable sending handle and one `QueueRunner`.

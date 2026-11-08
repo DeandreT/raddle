@@ -44,6 +44,21 @@ impl IngressDecoder for JsonIngress {
     }
 }
 
+#[cfg(feature = "crypto-ingress")]
+impl<P: raddle_crypto::KeyProvider> IngressDecoder for raddle_crypto::EncryptionCodec<P> {
+    type Error = raddle_crypto::CryptoError;
+
+    fn decode<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        _: &'a TrustedOrigin,
+    ) -> BoxFuture<'a, Result<Envelope, Self::Error>> {
+        // Authentication and receive-required enforcement finish before dispatch
+        // opens a custody transaction. Key/nonce changes are not inbox identity.
+        Box::pin(self.decode_bytes(bytes))
+    }
+}
+
 /// Codec rejection is separate from post-decode routing/custody failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
