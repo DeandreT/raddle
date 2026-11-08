@@ -5,6 +5,7 @@
 //! not the Wolverine wire protocol. Acknowledgements attest only to the receiver's
 //! declared custody, not durable storage unless its consumer actually commits it.
 
+mod codec;
 mod config;
 mod framing;
 mod publisher;
