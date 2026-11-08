@@ -29,6 +29,7 @@ serde.workspace = true
 [dev-dependencies]
 raddle-tcp = { path = "../tcp", version = "0.1.0", features = ["serialization"] }
 prost = "0.14.4"
+rmp-serde = "1.3.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 serde_json.workspace = true
 sqlx.workspace = true

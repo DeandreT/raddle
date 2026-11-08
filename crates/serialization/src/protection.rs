@@ -8,9 +8,13 @@ pub(crate) fn plaintext(value: &Value) -> Result<(), Error> {
     if value
         .get("format")
         .and_then(Value::as_str)
-        .is_some_and(|s| s.starts_with("raddle-aes"))
+        .is_some_and(|s| reserved_format(s.as_bytes()))
     {
         return Err(Error::UnsupportedProtection);
     }
     Ok(())
+}
+
+pub(crate) fn reserved_format(value: &[u8]) -> bool {
+    value.starts_with(b"raddle-aes")
 }

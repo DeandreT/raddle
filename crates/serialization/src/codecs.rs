@@ -94,6 +94,8 @@ impl<M: Serialize + DeserializeOwned> BodyCodec<M> for MessagePack {
 
 fn scan_messagepack(bytes: &[u8], limits: Limits) -> Result<(), Error> {
     limits.encoded(bytes)?;
+    let root_map = matches!(bytes.first().copied(), Some(0x80..=0x8f | 0xde | 0xdf));
+    let mut root_format_key = false;
     // Counts of still-unread values at each depth. No length-sized allocation.
     let mut stack = vec![1usize];
     let mut cursor = 0usize;
@@ -104,6 +106,7 @@ fn scan_messagepack(bytes: &[u8], limits: Limits) -> Result<(), Error> {
             continue;
         }
         *left -= 1;
+        let map_key = *left % 2 == 1;
         nodes += 1;
         if nodes > limits.max_nodes || stack.len() > limits.max_depth {
             return Err(Error::Limits);
@@ -153,7 +156,19 @@ fn scan_messagepack(bytes: &[u8], limits: Limits) -> Result<(), Error> {
         if children > limits.max_nodes.saturating_sub(nodes) {
             return Err(Error::Limits);
         }
-        take(bytes, &mut cursor, scalar)?;
+        let value = take(bytes, &mut cursor, scalar)?;
+        if root_map && stack.len() == 2 {
+            // Inspect raw root map entries, before serde can erase unknown
+            // fields or default a target model. Nested application maps and
+            // positional arrays are not protected-envelope declarations.
+            // Include bin scalars too: serde strings may accept UTF-8 bytes.
+            let textual = matches!(tag, 0xa0..=0xbf | 0xc4..=0xc6 | 0xd9..=0xdb);
+            if map_key {
+                root_format_key = textual && value == b"format";
+            } else if root_format_key && textual && crate::protection::reserved_format(value) {
+                return Err(Error::UnsupportedProtection);
+            }
+        }
         if children != 0 {
             stack.push(children);
         }

@@ -372,6 +372,9 @@ impl Mapper {
             headers: BTreeMap::new(),
         };
         let envelope = self.codecs.decode_body(metadata, media, bytes)?;
+        // Endpoint decoding/canonicalization can expand a small input under
+        // different limits. Enforce this mapper's own final output boundary.
+        self.limits.envelope(&envelope)?;
         Ok(MappedEvent { envelope, external })
     }
 

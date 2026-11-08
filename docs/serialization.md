@@ -87,6 +87,12 @@ RDTC1 compatibility cannot pass ciphertext into that profile's consumer. This is
 composition guard, not authentication, decryption or a universal detector of
 application-encrypted blobs. Trusted converters remain trusted application code.
 
+JSON and MessagePack inspect the incoming root frame before target-model
+deserialization. Optional/defaulted serde models cannot erase the protected-frame
+marker to bypass this guard. MessagePack inspects raw root-map key/value scalars,
+independently of unknown-field preservation; nested application maps and positional
+arrays are not interpreted as protected-envelope declarations.
+
 Default TCP without body-codec configuration retains its existing JSON-envelope
 path. An explicitly decrypting/receive-required `EncryptionCodec` ingress can keep
 that path and must finish authentication/decryption before bus custody. Plaintext
@@ -204,6 +210,9 @@ Choose a durable mapping if a deterministic hash is inappropriate. Reusing a nat
 identity for different source/id pairs is an application configuration defect.
 
 `MappedEvent` returns the canonical envelope **and separate typed external metadata**.
+The mapper enforces its own canonical-envelope limits on the final decoded output,
+after endpoint conversion and upcasting, even when the endpoint uses larger limits.
+Endpoint limits still apply independently; both boundaries must accept the message.
 Persist/forward that metadata separately when needed after custody; the existing
 native inbox stores only its canonical envelope. External source/subject/extensions
 never populate `TrustedOrigin`, native headers or privileged correlation fields.

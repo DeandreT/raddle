@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use raddle::wire::{Envelope, WireMessage};
+use raddle::wire::{Codecs, Envelope, WireMessage};
 use raddle_serialization::cloudevents::{Aliases, Binding, EventMetadata, Mapper, NativeIdentity};
 use raddle_serialization::{
     EndpointCodecs, Error, Limits, MessagePack, MessagePackLayout, Registry,
@@ -37,6 +37,14 @@ fn identity(external: &EventMetadata) -> Result<NativeIdentity, Error> {
     })
 }
 fn mapper(binary: bool) -> Mapper {
+    mapper_with_limits(binary, Limits::default(), Limits::default(), false)
+}
+fn mapper_with_limits(
+    binary: bool,
+    codec_limits: Limits,
+    mapper_limits: Limits,
+    expand: bool,
+) -> Mapper {
     let mut registry = Registry::default();
     registry.json::<Text>().unwrap();
     registry
@@ -45,12 +53,168 @@ fn mapper(binary: bool) -> Mapper {
     if binary {
         registry.set_default("binary/messagepack").unwrap();
     }
-    let codecs = EndpointCodecs::new(Arc::new(registry), Limits::default()).unwrap();
+    let mut codecs = EndpointCodecs::new(Arc::new(registry), codec_limits).unwrap();
+    if expand {
+        let mut upcasters = Codecs::default();
+        upcasters
+            .upcast(Text::NAME, 1, |mut value| {
+                value["padding"] = if value["text"] == "expand" {
+                    "x".repeat(1024)
+                } else {
+                    String::new()
+                }
+                .into();
+                Ok(value)
+            })
+            .unwrap();
+        codecs = codecs.with_canonicalizer(move |envelope| {
+            let current = upcasters
+                .decode::<ExpandedText>(&envelope)
+                .map_err(|_| Error::Projection)?;
+            envelope
+                .rebody(&current, Limits::default().canonical)
+                .map_err(|_| Error::Projection)
+        });
+    }
     let mut aliases = Aliases::default();
     aliases
         .register::<Text>("urn:foreign.event:Text/v7")
         .unwrap();
-    Mapper::new(Arc::new(codecs), aliases, Limits::default(), identity).unwrap()
+    Mapper::new(Arc::new(codecs), aliases, mapper_limits, identity).unwrap()
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExpandedText {
+    text: String,
+    padding: String,
+}
+impl WireMessage for ExpandedText {
+    const NAME: &'static str = Text::NAME;
+    const VERSION: u32 = 2;
+}
+
+fn small_canonical_limit() -> Limits {
+    Limits {
+        canonical: raddle::wire::EnvelopeLimits {
+            max_bytes: 512,
+            ..Limits::default().canonical
+        },
+        ..Limits::default()
+    }
+}
+
+fn text_envelope(text: String) -> Envelope {
+    let identity = identity(&external()).unwrap();
+    Envelope::with_identity(identity.id, identity.created_at, &Text { text }).unwrap()
+}
+
+#[test]
+fn mapper_and_codec_canonical_limits_are_independent_inbound_and_outbound() {
+    for binary in [false, true] {
+        let producer = mapper(binary);
+        for (codec_limits, mapper_limits) in [
+            (Limits::default(), small_canonical_limit()),
+            (small_canonical_limit(), Limits::default()),
+        ] {
+            let limited = mapper_with_limits(binary, codec_limits, mapper_limits, false);
+            for (text, oversized) in [
+                ("healthy-before".into(), false),
+                ("x".repeat(1024), true),
+                ("healthy-after".into(), false),
+            ] {
+                let envelope = text_envelope(text);
+                assert_eq!(envelope.to_vec().unwrap().len() > 512, oversized);
+                let bytes = producer.encode_structured(&envelope, &external()).unwrap();
+                let inbound = limited.decode_structured("application/cloudevents+json", &bytes);
+                let outbound = limited.encode_structured(&envelope, &external());
+                if oversized {
+                    assert!(matches!(inbound, Err(Error::Limits)));
+                    assert_eq!(outbound, Err(Error::Limits));
+                } else {
+                    assert_eq!(
+                        inbound.unwrap().envelope.content_bytes().unwrap(),
+                        envelope.content_bytes().unwrap()
+                    );
+                    assert!(outbound.is_ok());
+                }
+                for binding in [Binding::Http, Binding::Kafka] {
+                    let event = producer
+                        .encode_binary(binding, &envelope, &external())
+                        .unwrap();
+                    let inbound = limited.decode_binary(binding, &event.headers, &event.body);
+                    let outbound = limited.encode_binary(binding, &envelope, &external());
+                    if oversized {
+                        assert!(matches!(inbound, Err(Error::Limits)));
+                        assert!(matches!(outbound, Err(Error::Limits)));
+                    } else {
+                        assert_eq!(
+                            inbound.unwrap().envelope.content_bytes().unwrap(),
+                            envelope.content_bytes().unwrap()
+                        );
+                        assert!(outbound.is_ok());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mapper_checks_final_upcast_expansion_for_structured_http_and_kafka() {
+    for binary in [false, true] {
+        let producer = mapper(binary);
+        let receiving =
+            mapper_with_limits(binary, Limits::default(), small_canonical_limit(), true);
+        let unconstrained = mapper_with_limits(binary, Limits::default(), Limits::default(), true);
+        for (text, oversized) in [
+            ("healthy-before", false),
+            ("expand", true),
+            ("healthy-after", false),
+        ] {
+            let envelope = text_envelope(text.into());
+            assert!(envelope.to_vec().unwrap().len() < 512);
+            let bytes = producer.encode_structured(&envelope, &external()).unwrap();
+            assert!(bytes.len() < 512);
+            let expanded = unconstrained
+                .decode_structured("application/cloudevents+json", &bytes)
+                .unwrap()
+                .envelope;
+            assert_eq!(expanded.version(), 2);
+            assert_eq!(expanded.to_vec().unwrap().len() > 512, oversized);
+            let result = receiving.decode_structured("application/cloudevents+json", &bytes);
+            if oversized {
+                assert!(matches!(result, Err(Error::Limits)));
+            } else {
+                assert_eq!(
+                    result.unwrap().envelope.content_bytes().unwrap(),
+                    expanded.content_bytes().unwrap()
+                );
+            }
+            for binding in [Binding::Http, Binding::Kafka] {
+                let event = producer
+                    .encode_binary(binding, &envelope, &external())
+                    .unwrap();
+                assert!(
+                    event.body.len()
+                        + event
+                            .headers
+                            .iter()
+                            .map(|(k, v)| k.len() + v.len())
+                            .sum::<usize>()
+                        < 512
+                );
+                let result = receiving.decode_binary(binding, &event.headers, &event.body);
+                if oversized {
+                    assert!(matches!(result, Err(Error::Limits)));
+                } else {
+                    assert_eq!(
+                        result.unwrap().envelope.content_bytes().unwrap(),
+                        expanded.content_bytes().unwrap()
+                    );
+                }
+            }
+        }
+    }
 }
 fn external() -> EventMetadata {
     EventMetadata {

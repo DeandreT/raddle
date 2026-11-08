@@ -20,7 +20,8 @@ use raddle_crypto::{
 use raddle_messaging::{BusBuilder, IngressError, MessageBus, MessageContext, TrustedOrigin};
 use raddle_postgres::Store;
 use raddle_serialization::{
-    BodyCodec, EndpointCodecs, Error, Limits, MessagePack, MessagePackLayout, Protobuf, Registry,
+    BodyCodec, EndpointCodecs, Error, Json, Limits, MessagePack, MessagePackLayout, Protobuf,
+    Registry,
 };
 use raddle_tcp::{Consumer, Delivery, Endpoint, Peer, Publisher, Receiver};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,46 @@ struct Open(Value);
 impl WireMessage for Open {
     const NAME: &'static str = "serialization.protection";
     const VERSION: u32 = 1;
+}
+// Ordinary serde models can discard every crypto field and still deserialize.
+// The reserved frame must be refused before this target model is consulted.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+struct Defaulted {
+    text: Option<String>,
+    #[serde(default)]
+    count: u32,
+}
+impl WireMessage for Defaulted {
+    const NAME: &'static str = "serialization.defaulted";
+    const VERSION: u32 = 1;
+}
+
+fn defaulted_profile(media: &str) -> Arc<EndpointCodecs> {
+    let mut registry = Registry::default();
+    registry.json::<Defaulted>().unwrap();
+    registry
+        .register::<Defaulted, Defaulted, _, _, _>(MessagePack(MessagePackLayout::Map), Ok, Ok)
+        .unwrap();
+    registry.set_default(media).unwrap();
+    Arc::new(EndpointCodecs::new(Arc::new(registry), Limits::default()).unwrap())
+}
+
+fn crypto_bodies(encrypted: &Envelope) -> [(&'static str, Vec<u8>); 2] {
+    let payload = serde_json::to_value(encrypted).unwrap()["payload"].clone();
+    assert!(
+        payload["format"]
+            .as_str()
+            .unwrap()
+            .starts_with("raddle-aes")
+    );
+    [
+        ("application/json", serde_json::to_vec(&payload).unwrap()),
+        // Simulate incoming external bytes, independent of the guarded codec.
+        (
+            "binary/messagepack",
+            rmp_serde::to_vec_named(&payload).unwrap(),
+        ),
+    ]
 }
 #[derive(Clone, PartialEq, Message)]
 struct ProtoText {
@@ -144,6 +185,65 @@ async fn actual_required_crypto_frames_are_refused_before_selected_publication_f
     );
 }
 
+#[tokio::test]
+async fn actual_crypto_frames_cannot_be_erased_by_optional_defaulted_target_models() {
+    let keys = keys();
+    let plain = Envelope::encode(&Defaulted {
+        text: Some("plain 雪".into()),
+        count: 7,
+    })
+    .unwrap();
+    let encrypted = crypto(&keys).encode(&plain).await.unwrap();
+    for (media, body) in crypto_bodies(&encrypted) {
+        let profile = defaulted_profile(media);
+        assert!(matches!(
+            profile.decode_body(encrypted.metadata(), media, &body),
+            Err(Error::UnsupportedProtection)
+        ));
+        assert!(matches!(
+            profile.decode(&packet(&encrypted, media, &body)),
+            Err(Error::UnsupportedProtection)
+        ));
+        match media {
+            "application/json" => assert_eq!(
+                <Json as BodyCodec<Defaulted>>::decode(&Json, &body, Limits::default()),
+                Err(Error::UnsupportedProtection)
+            ),
+            _ => assert_eq!(
+                <MessagePack as BodyCodec<Defaulted>>::decode(
+                    &MessagePack(MessagePackLayout::Map),
+                    &body,
+                    Limits::default()
+                ),
+                Err(Error::UnsupportedProtection)
+            ),
+        }
+        assert_eq!(
+            profile.encode(&encrypted),
+            Err(Error::UnsupportedProtection)
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let transport = EncryptedTransport::new(
+            publisher(listener.local_addr().unwrap())
+                .with_codecs("inbox", Arc::clone(&profile))
+                .unwrap(),
+            crypto(&keys),
+        );
+        assert_eq!(
+            transport.publish("inbox", &plain).await,
+            Err(TransportError::Rejected)
+        );
+        assert!(
+            matches!(listener.into_std().unwrap().accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let bytes = profile.encode(&plain).unwrap();
+        assert_eq!(
+            profile.decode(&bytes).unwrap().content_bytes().unwrap(),
+            plain.content_bytes().unwrap()
+        );
+    }
+}
+
 struct Admission {
     bus: MessageBus,
     crypto: Option<EncryptionCodec<RotatingKeys>>,
@@ -216,9 +316,7 @@ async fn cipher_frames_never_reach_custody_even_with_value_models_and_legacy_jso
     });
     let running = tokio::spawn(receiver.run(Arc::clone(&admission), stop.clone()));
     let json_body = serde_json::to_vec(&payload).unwrap();
-    let binary_body = MessagePack(MessagePackLayout::Map)
-        .encode(&Open(payload), Limits::default())
-        .unwrap();
+    let binary_body = rmp_serde::to_vec_named(&payload).unwrap();
     for (media, body) in [
         ("application/json", json_body),
         ("binary/messagepack", binary_body),
@@ -295,6 +393,128 @@ async fn cipher_frames_never_reach_custody_even_with_value_models_and_legacy_jso
             .unwrap(),
         original.content_bytes().unwrap()
     );
+    stop.cancel();
+    running.await.unwrap().unwrap();
+}
+
+#[sqlx::test(migrations = "../postgres/migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn defaulted_models_never_ack_or_store_protected_frames_among_healthy_neighbors(
+    pool: PgPool,
+) {
+    let keys = keys();
+    let profile = defaulted_profile("binary/messagepack");
+    let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+    builder.durable("inbox", Store::new(pool.clone())).unwrap();
+    builder.route::<Defaulted>("inbox").unwrap();
+    let bus = builder.build();
+    let receiver = Receiver::bind((Ipv4Addr::LOCALHOST, 0).into(), Default::default())
+        .await
+        .unwrap()
+        .with_codecs(Arc::clone(&profile));
+    let address = receiver.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let admission = Arc::new(Admission {
+        bus: bus.clone(),
+        crypto: None,
+        reached: AtomicUsize::new(0),
+    });
+    let running = tokio::spawn(receiver.run(Arc::clone(&admission), stop.clone()));
+    let mut accepted = 0;
+    for media in ["application/json", "binary/messagepack"] {
+        for bad in 0..3 {
+            let messages: Vec<_> = (0..3)
+                .map(|n| {
+                    Envelope::encode(&Defaulted {
+                        text: Some(format!("healthy-{n}")),
+                        count: n,
+                    })
+                    .unwrap()
+                })
+                .collect();
+            let encrypted = crypto(&keys).encode(&messages[bad]).await.unwrap();
+            let body = crypto_bodies(&encrypted)
+                .into_iter()
+                .find(|(m, _)| *m == media)
+                .unwrap()
+                .1;
+            let rejected = packet(&encrypted, media, &body);
+            let mut frames: Vec<_> = messages
+                .iter()
+                .map(|m| packet(m, media, &profile.encode_body(m, media).unwrap()))
+                .collect();
+            frames[bad] = rejected.clone();
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket.write_all(b"RDTC\x02").await.unwrap();
+            socket.write_u16(frames.len() as u16).await.unwrap();
+            for frame in &frames {
+                socket.write_u32(frame.len() as u32).await.unwrap();
+                socket.write_all(frame).await.unwrap();
+            }
+            let mut statuses = vec![0; frames.len()];
+            socket.read_exact(&mut statuses).await.unwrap();
+            assert_eq!(
+                statuses,
+                (0..3)
+                    .map(|i| if i == bad { 2 } else { 0 })
+                    .collect::<Vec<_>>()
+            );
+            accepted += 2;
+            assert_eq!(admission.reached.load(Ordering::SeqCst), accepted);
+            assert!(matches!(
+                bus.receive(profile.as_ref(), &rejected, origin(), Utc::now(), true)
+                    .await,
+                Err(IngressError::Decode(Error::UnsupportedProtection))
+            ));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM raddle_jobs WHERE message_id=$1"
+                )
+                .bind(messages[bad].id())
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                0
+            );
+            for (i, message) in messages.iter().enumerate() {
+                if i == bad {
+                    continue;
+                }
+                let stored: Vec<u8> =
+                    sqlx::query_scalar("SELECT envelope FROM raddle_jobs WHERE message_id=$1")
+                        .bind(message.id())
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    Envelope::from_slice(&stored, Default::default())
+                        .unwrap()
+                        .content_bytes()
+                        .unwrap(),
+                    message.content_bytes().unwrap()
+                );
+            }
+            // Correct only the rejected identity; successful neighbors must not
+            // be resubmitted or lose their canonical custody state.
+            let sender = publisher(address)
+                .with_codecs("inbox", defaulted_profile(media))
+                .unwrap();
+            sender.publish("inbox", &messages[bad]).await.unwrap();
+            accepted += 1;
+            let ids: Vec<_> = messages.iter().map(Envelope::id).collect();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM raddle_jobs WHERE message_id=ANY($1)"
+                )
+                .bind(&ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                3
+            );
+        }
+    }
+    assert_eq!(admission.reached.load(Ordering::SeqCst), accepted);
     stop.cancel();
     running.await.unwrap().unwrap();
 }

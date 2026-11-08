@@ -150,6 +150,75 @@ fn hand_authored_messagepack_vectors_have_real_array_map_integer_key_bytes() {
 }
 
 #[test]
+fn messagepack_reserved_crypto_root_is_checked_before_any_target_model() {
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Defaulted {
+        optional: Option<String>,
+        #[serde(default)]
+        count: u32,
+    }
+    let codec = MessagePack(MessagePackLayout::Map);
+    // Independent map/fixstr, map16/str8, map32/str16/str32 and bin vectors;
+    // also inspect every duplicate root key, not only serde's retained value.
+    for bytes in [
+        &b"\x81\xa6format\xadraddle-aes-v2"[..],
+        b"\xde\x00\x01\xd9\x06format\xd9\x0draddle-aes-v2",
+        b"\xdf\x00\x00\x00\x01\xda\x00\x06format\xdb\x00\x00\x00\x0draddle-aes-v2",
+        b"\x81\xc4\x06format\xc4\x0draddle-aes-v2",
+        b"\x82\xa6format\xa5plain\xa6format\xadraddle-aes-v2",
+        b"\x82\xa6format\xadraddle-aes-v2\xa6format\xa5plain",
+        b"\x82\xa6nested\x81\xa6format\xa5plain\xa6format\xadraddle-aes-v2",
+    ] {
+        assert_eq!(
+            <MessagePack as BodyCodec<Defaulted>>::decode(&codec, bytes, Limits::default()),
+            Err(Error::UnsupportedProtection)
+        );
+        assert!(matches!(
+            <MessagePack as BodyCodec<serde_json::Value>>::decode(&codec, bytes, Limits::default()),
+            Err(Error::UnsupportedProtection)
+        ));
+    }
+    for value in [
+        json!({"nested":{"format":"raddle-aes-v2"}}),
+        json!({"format":{"nested":"raddle-aes-v2"}}),
+        json!({"format":"plain"}),
+    ] {
+        let bytes = codec.encode(&value, Limits::default()).unwrap();
+        assert_eq!(
+            <MessagePack as BodyCodec<serde_json::Value>>::decode(
+                &codec,
+                &bytes,
+                Limits::default()
+            )
+            .unwrap(),
+            value
+        );
+    }
+    assert_eq!(
+        codec.encode(&json!({"format":"raddle-aes-v2"}), Limits::default()),
+        Err(Error::UnsupportedProtection)
+    );
+    assert_eq!(
+        <MessagePack as BodyCodec<Vec<String>>>::decode(
+            &codec,
+            b"\x92\xa6format\xadraddle-aes-v2",
+            Limits::default()
+        )
+        .unwrap(),
+        ["format", "raddle-aes-v2"]
+    );
+    assert_eq!(
+        <MessagePack as BodyCodec<BTreeMap<u32, String>>>::decode(
+            &codec,
+            b"\x81\x00\xadraddle-aes-v2",
+            Limits::default()
+        )
+        .unwrap(),
+        BTreeMap::from([(0, "raddle-aes-v2".into())])
+    );
+}
+
+#[test]
 fn protobuf_spec_vector_zero_byte_asymmetry_and_declared_length_bounds() {
     // Independently authored proto3: message Text { string text = 1; }
     let wire = [0x0a, 3, 0xe9, 0x9b, 0xaa];
