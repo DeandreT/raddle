@@ -14,6 +14,7 @@ pub mod scoped;
 
 pub use bus::ScopedRegistration;
 pub use bus::{BusBuilder, BusError, InvokeError, InvokeOptions, MessageBus, RemoteInvoker};
+pub use bus::{InputStream, LocalStream, StreamError, StreamOptions};
 pub use context::{Cancellation, HeaderError, MessageContext, TrustedOrigin};
 pub use durable::{DurableControl, DurableEndpoint};
 pub use ingress::{IngressDecoder, IngressError, JsonIngress};
