@@ -116,6 +116,13 @@ and message identities; it does not create successors or replay successful jobs.
 It does not edit payloads. Correct an external failure and retry only the failed
 eligible IDs, not the neighbors that already succeeded.
 
+For opt-in policy endpoints, replay does not reconcile an uncertain handling
+attempt. It changes eligible dead-letter custody only; the policy claim path
+still refuses an identity with retained uncertainty. Neither HTTP authorization
+nor approval establishes that the original effects rolled back. Resolve eligible
+uncertain execution through the policy recovery contract with independently
+verified safety, not by treating ordinary replay as that authorization.
+
 The HTTP path opts into `Store::replay_dead_letter_bounded`, sharing the original
 replay implementation with transaction-local two-second PostgreSQL statement and
 lock timeouts installed before quota admission. Discard uses the same server
@@ -130,6 +137,11 @@ DLQ; it does not erase the canonical message. Original identity, fingerprint,
 generation, body and any recovery metadata remain unchanged. Discarded work cannot
 be claimed or replayed and does not block a later live partition member. Repeating
 discard reports `not_eligible` and does not duplicate its audit.
+
+An old uncertainty marker does not reopen a discarded identity. Policy recovery
+requires eligible active custody, and stale owner transitions cannot clear the
+marker on this terminal tombstone. Later partition members remain eligible;
+discard is terminal for ordering but never successful business execution.
 
 Discarded records are retained deduplication tombstones. Re-staging identical
 custody cannot resurrect them; changed content conflicts. They are excluded from

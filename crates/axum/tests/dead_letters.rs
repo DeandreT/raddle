@@ -22,6 +22,8 @@ use uuid::Uuid;
 mod cancellation;
 #[path = "dead_letters/isolation.rs"]
 mod isolation;
+#[path = "dead_letters/policy.rs"]
+mod policy;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct Failed {
