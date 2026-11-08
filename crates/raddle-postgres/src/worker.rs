@@ -209,17 +209,30 @@ impl<T: Transport> OutboxWorker<T> {
 
     /// Publishes a bounded batch outside database transactions.
     pub async fn run_once(&self, limit: u32) -> Result<usize, Error> {
+        self.run_once_inner(None, limit).await
+    }
+
+    /// Flushes one configured destination without claiming unrelated endpoints.
+    pub async fn run_once_for(&self, destination: &str, limit: u32) -> Result<usize, Error> {
+        self.run_once_inner(Some(destination), limit).await
+    }
+
+    async fn run_once_inner(&self, destination: Option<&str>, limit: u32) -> Result<usize, Error> {
         use futures_util::stream::StreamExt;
 
-        let claims = self
-            .store
-            .claim(
-                DeliveryKind::Remote,
-                limit,
-                self.policy.timeout() + Duration::from_secs(5),
-                Utc::now(),
-            )
-            .await?;
+        let lease = self.policy.timeout() + Duration::from_secs(5);
+        let claims = match destination {
+            Some(destination) => {
+                self.store
+                    .claim_for(DeliveryKind::Remote, destination, limit, lease, Utc::now())
+                    .await?
+            }
+            None => {
+                self.store
+                    .claim(DeliveryKind::Remote, limit, lease, Utc::now())
+                    .await?
+            }
+        };
         let count = claims.len();
         let results = futures_util::stream::iter(claims)
             .map(|claim| async move {
