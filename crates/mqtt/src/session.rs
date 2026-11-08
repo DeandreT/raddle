@@ -14,6 +14,9 @@ use rumqttc::{Outgoing, Transport};
 use crate::config;
 use crate::{Bounds, Error, HeldMessage, PublishOptions, QoS, Route, Source};
 
+#[cfg(test)]
+mod tests;
+
 /// MQTT publication outcome. Only QoS1 PubAck and QoS2 PubComp are confirmed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -33,6 +36,8 @@ pub enum Acceptance {
 pub struct Session {
     client: AsyncClient,
     eventloop: EventLoop,
+    // Validated application configuration, independent of SDK connection state.
+    options: MqttOptions,
     routes: BTreeMap<String, String>,
     bounds: Bounds,
     source: Source,
@@ -94,10 +99,11 @@ impl Session {
             .set_outgoing_inflight_upper_limit(1)
             .set_max_packet_size(Some((bounds.envelope.max_bytes + 131_072) as u32))
             .set_connection_timeout(bounds.timeout.as_secs().max(1));
-        let (client, eventloop) = AsyncClient::new(options, usize::from(bounds.prefetch));
+        let (client, eventloop) = AsyncClient::new(options.clone(), usize::from(bounds.prefetch));
         Ok(Self {
             client,
             eventloop,
+            options,
             routes: configured,
             bounds,
             source,
@@ -478,6 +484,8 @@ impl Session {
     /// No token is read, fetched, printed or persisted by this adapter. Refresh is refused
     /// with outstanding receipts or unresolved writes; drain or replace that session instead.
     /// Persistent broker session/subscriptions depend on the caller's MqttOptions.
+    /// Rebuilds the entire SDK client/event loop, discarding unread SDK events without
+    /// acknowledging them. A persistent broker may redeliver them as fresh owned receipts.
     pub fn refresh_credentials(
         &mut self,
         username: String,
@@ -488,11 +496,17 @@ impl Session {
         if !self.incoming.is_empty() || self.outstanding.load(Ordering::Relaxed) != 0 {
             return Err(Error::Invalid("drain before credential refresh"));
         }
-        self.eventloop
-            .options
+        let mut options = self.options.clone();
+        options
             .set_credentials(username, token)
             .set_authentication_method(authentication_method);
-        self.eventloop.clean();
+        // SDK clean() retains buffered incoming events. A new receipt namespace
+        // must never adopt those old events (packet IDs can be reused after reconnect).
+        let (client, eventloop) =
+            AsyncClient::new(options.clone(), usize::from(self.bounds.prefetch));
+        self.client = client;
+        self.eventloop = eventloop;
+        self.options = options;
         self.connected = false;
         self.id = uuid::Uuid::new_v4();
         Ok(())

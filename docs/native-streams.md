@@ -207,7 +207,9 @@ Receive-side native connection errors, server Disconnect and unexpected repeat
 ConnAck also fail closed. The session must be replaced; an old held receipt can
 never be carried into an automatically reconnected broker session with reused
 packet IDs. Ordinary idle receive deadlines do not poison a healthy connection.
-Explicit drained credential refresh rotates the local receipt namespace as well.
+Explicit drained credential refresh rebuilds the complete SDK client/event loop
+and rotates the local receipt namespace. Unread old SDK events and queued requests
+are discarded without acknowledging their payloads, not adopted by the new session.
 
 Static aliases, explicit application-trusted dynamic topics, wildcard subscriptions,
 bounded MQTT user properties, reply-topic aliases/correlation, native expiry and
@@ -242,7 +244,11 @@ Numeric loopback is required for plaintext. Callers select distinct stable proto
 client IDs; `Clients` refuses duplicate IDs across its registrations. Persistent
 redelivery requires appropriate clean-start/session-expiry and broker persistence.
 `refresh_credentials` reconnects a drained session with a caller-refreshed JWT/OAuth
-password and optional authentication method. It does not acquire tokens or perform
+password and optional authentication method. Validated application TLS, network,
+client-ID, session and flow-limit configuration is preserved independently of SDK
+connection state. Persistent brokers may legitimately redeliver unread work under
+fresh receipts; when the broker does not resume subscriptions, callers must subscribe
+again. Refresh does not acquire tokens or perform
 in-place MQTT AUTH challenge/re-authentication exchanges.
 
 ## Framework boundary and qualification
