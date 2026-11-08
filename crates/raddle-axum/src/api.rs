@@ -40,8 +40,8 @@ pub struct Accepted {
 
 /// Router and OpenAPI document created together from the same registrations.
 pub struct Api {
-    router: Router,
-    specification: Value,
+    pub(crate) router: Router,
+    pub(crate) specification: Value,
 }
 
 impl Api {

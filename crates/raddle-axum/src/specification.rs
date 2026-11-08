@@ -7,11 +7,19 @@ pub(crate) fn schema<T: JsonSchema>(
     contract: Contract,
     components: &mut Map<String, Value>,
 ) -> Value {
-    let mut root = SchemaSettings::draft2020_12()
+    let root = SchemaSettings::draft2020_12()
         .with(|settings| settings.contract = contract)
         .into_generator()
         .into_root_schema_for::<T>()
         .to_value();
+    value_schema(root, name, components)
+}
+
+pub(crate) fn value_schema(
+    mut root: Value,
+    name: &str,
+    components: &mut Map<String, Value>,
+) -> Value {
     let definitions = root.as_object_mut().and_then(|object| {
         object.remove("$schema");
         object

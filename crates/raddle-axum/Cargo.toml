@@ -11,7 +11,10 @@ readme = "README.md"
 [dependencies]
 raddle.workspace = true
 raddle-postgres.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["http2"] }
+multer = "3.1"
+matchit = "=0.8.4"
+url.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,12 +26,12 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "time", "process", "io-util"] }
 tower.workspace = true
 http-body-util.workspace = true
 sqlx.workspace = true
 jsonschema = { version = "0.33", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "multipart"] }
 
 [lints]
 workspace = true
