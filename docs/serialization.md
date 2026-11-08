@@ -71,15 +71,22 @@ with serialization. Applications choose that order through `IngressDecoder`.
 ### Framework request/reply boundary
 
 Application-body registrations do not automatically register the private framework
-reply wrapper used by `RemoteResponder` and `ReplyHubInvoker`. Selecting a body
-profile on that reply publisher can reject the wrapper after the handler has run.
-Configure the existing JSON-based reply path separately, with its normal trusted
-ingress and decryption policy where required; reject an unsupported selected-body
-reply-publisher configuration during application startup.
+reply wrapper used by `RemoteResponder` and `ReplyHubInvoker`. Keep their outer
+reply publisher on JSON. With messaging's explicit `serialization-rpc` feature,
+`SelectedRpc` selects genuine registered application request/reply bodies and a
+versioned native v2 reply frame containing an RDSB1 application envelope. See the
+[native codec RPC guide](codec-rpc.md) for configuration, trust and limits.
+Untouched APIs remain native v1 JSON, including existing decrypting ingress paths.
+The new selected RPC profile is plaintext only, not a binary/crypto composition.
 
-Selected request-body TCP handling does not establish selected application-reply
-serialization through the framework wrapper. The bare TCP request/reply hooks and
-the framework's correlated reply protocol are different composition boundaries.
+`EndpointCodecs::supports(media, contract, version)` checks an exact **canonical**
+contract/version key, just like `encode_body` and `decode_body`: endpoint-local
+registration wins, otherwise application registration is inherited. Invalid or
+missing keys return false. It does not execute converters, fabricate a default
+model, mutate registrations or fall back to JSON. Availability does not establish
+that a specific value converts successfully, that any transport uses this codec,
+or that a peer is authenticated/authorized. `SelectedRpc::register::<M>` uses this
+lookup to check actual selected request and reply registrations before operation.
 
 ### Encryption composition is explicitly unsupported
 
