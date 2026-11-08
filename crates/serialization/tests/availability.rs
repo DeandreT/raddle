@@ -1,3 +1,4 @@
+//! Exact codec availability, inheritance and callback-free startup lookup.
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
