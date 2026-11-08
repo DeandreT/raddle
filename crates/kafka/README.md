@@ -44,6 +44,15 @@ per native synchronous request so a partial failure cannot falsely acknowledge a
 different partition. An uncertain result retains completed state for offset-only
 retry; no handler is resubmitted by the receiver.
 
+Failed offset settlement does not gate native polling. `receive` serves native
+poll/rebalance events before retrying due safe positions, so a queued revoke can
+complete and a denied partition cannot prevent fetching an independent partition
+while admission remains available. Recoverable offset failures still return
+`Uncertain` or `Stale`; any record fetched during that call stays in the bounded
+incidental slot for the next `receive`. Retry receiving or flushing, not completed
+business work. After assignment loss, broker redelivery still requires the
+application's existing durable custody/deduplication policy.
+
 Isolation defaults explicitly to `read_uncommitted`, matching the released
 Wolverine contract rather than bundled librdkafka 2.12.1's `read_committed` default.
 Set native `isolation.level=read_committed` to exclude aborted transactions and

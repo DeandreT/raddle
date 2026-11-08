@@ -334,12 +334,21 @@ impl Receiver {
     /// Polls for at most one short native interval. None is not end-of-stream.
     /// A single extra incidental slot handles returns around pause/rebalance.
     /// At full capacity, complete existing custody before calling again.
+    /// Due offset retries follow native polling instead of gating it. A record
+    /// fetched before an offset failure is kept for the next call; retry
+    /// receiving, not already completed business work.
     pub async fn receive(&mut self) -> Result<Option<Received>, Error> {
-        self.finish_commit().await?;
+        let settlement_failure = match self.finish_commit().await {
+            Ok(()) => None,
+            Err(error @ (Error::Uncertain | Error::Stale)) => Some(error),
+            Err(error) => return Err(error),
+        };
         self.harvest_poll().await?;
         self.synchronize()?;
-        self.flush_if_due().await?;
         if self.incidental.is_some() {
+            if let Some(error) = settlement_failure {
+                return Err(error);
+            }
             if self.pending() > self.limits.max_pending {
                 return Err(Error::Capacity);
             }
@@ -350,20 +359,25 @@ impl Receiver {
         let consumer = Arc::clone(&self.consumer);
         let ownership = Arc::clone(&self.ownership);
         self.poll = Some(tokio::task::spawn_blocking(move || {
-            let assignment = consumer.assignment().map_err(|_| Error::Native)?;
-            if !assignment.elements().is_empty() {
-                let result = if full {
-                    consumer.pause(&assignment)
-                } else {
-                    consumer.resume(&assignment)
-                };
-                result.map_err(|_| Error::Native)?;
-                if assignment
-                    .elements()
-                    .iter()
-                    .any(|entry| entry.error().is_err())
-                {
-                    return Err(Error::Native);
+            // A failed commit can mark the assignment lost and queue a revoke.
+            // Only polling dispatches that revoke and permits rejoin. Do not
+            // gate it on another commit or on APIs for the lost assignment.
+            if !consumer.assignment_lost() {
+                let assignment = consumer.assignment().map_err(|_| Error::Native)?;
+                if !assignment.elements().is_empty() {
+                    let result = if full {
+                        consumer.pause(&assignment)
+                    } else {
+                        consumer.resume(&assignment)
+                    };
+                    result.map_err(|_| Error::Native)?;
+                    if assignment
+                        .elements()
+                        .iter()
+                        .any(|entry| entry.error().is_err())
+                    {
+                        return Err(Error::Native);
+                    }
                 }
             }
             match consumer.poll(Duration::from_millis(50)) {
@@ -376,6 +390,11 @@ impl Receiver {
             }
         }));
         self.harvest_poll().await?;
+        if let Some(error) = settlement_failure {
+            return Err(error);
+        }
+        // Preserve one serialized poll before every due retry. Otherwise a
+        // retained failed prefix can starve rebalancing and other partitions.
         self.flush_if_due().await?;
         if full {
             return Err(Error::Capacity);
