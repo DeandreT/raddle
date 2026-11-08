@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/postgres", "crates/axum", "crates/sqlite", "crates/rabbitmq", "crates/servicebus", "crates/testkit", "crates/host", "crates/admin", "crates/grpc", "crates/messaging", "crates/policies", "crates/crypto", "crates/tcp", "crates/nats", "crates/redis", "crates/mqtt", "crates/kafka"]
+members = ["crates/core", "crates/postgres", "crates/axum", "crates/sqlite", "crates/rabbitmq", "crates/servicebus", "crates/testkit", "crates/host", "crates/admin", "crates/grpc", "crates/messaging", "crates/policies", "crates/crypto", "crates/tcp", "crates/nats", "crates/redis", "crates/mqtt", "crates/kafka", "crates/batching"]
 resolver = "3"
 exclude = ["conformance", "vendor/azservicebus", "vendor/fe2o3-amqp", "vendor/fe2o3-amqp-management", "vendor/fe2o3-amqp-cbs", "fuzz"]
 
