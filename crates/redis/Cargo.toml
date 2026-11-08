@@ -1,0 +1,26 @@
+[package]
+name = "raddle-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Fenced Redis Streams deliveries and confirmed publishing for raddle"
+
+[dependencies]
+raddle.workspace = true
+redis = { version = "0.32", default-features = false, features = ["tokio-rustls-comp", "script", "streams"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio = { workspace = true, features = ["time", "rt", "macros"] }
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true
