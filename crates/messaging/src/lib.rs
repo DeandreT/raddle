@@ -4,9 +4,11 @@
 //! returned effects. This crate opts into managed application behavior explicitly.
 
 mod bus;
+pub mod composition;
 mod context;
 mod durable;
 pub mod effects;
+pub mod handler_routing;
 mod ingress;
 mod queue;
 mod request_reply;
