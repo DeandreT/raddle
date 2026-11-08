@@ -1,0 +1,29 @@
+[package]
+name = "raddle-batching"
+description = "Typed receive-side batching and original-member custody for raddle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[features]
+default = []
+postgres = ["dep:sqlx", "dep:raddle-postgres", "dep:tokio"]
+
+[dependencies]
+raddle.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+sqlx = { workspace = true, optional = true }
+raddle-postgres = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
+
+[dev-dependencies]
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

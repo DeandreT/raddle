@@ -3239,6 +3239,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "raddle-batching"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "raddle",
+ "raddle-postgres",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "raddle-crypto"
 version = "0.1.0"
 dependencies = [
