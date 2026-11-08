@@ -12,13 +12,16 @@ pub struct TrackingSession {
     ids: Vec<Uuid>,
 }
 
-/// Terminal durable outcomes. Quarantine is not successful business execution.
+/// Terminal durable outcomes. Only completed originals represent business success.
 #[derive(Debug, Default)]
 pub struct TrackedOutcome {
     /// Successfully committed originals.
     pub completed: Vec<Uuid>,
     /// Quarantined, expired or exhausted originals.
     pub dead: Vec<Uuid>,
+    /// Originals explicitly retired by an operator, not completed or quarantined.
+    /// Discard is terminal but is not successful business execution.
+    pub discarded: Vec<Uuid>,
 }
 
 impl TrackingSession {
@@ -72,11 +75,14 @@ impl TrackingSession {
                     match row.try_get::<&str, _>("status")? {
                         "completed" => outcome.completed.push(row.try_get("id")?),
                         "dead" => outcome.dead.push(row.try_get("id")?),
+                        "discarded" => outcome.discarded.push(row.try_get("id")?),
                         "ready" | "active" => {}
                         _ => return Err(Error::Invalid("persisted job status")),
                     }
                 }
-                if outcome.completed.len() + outcome.dead.len() == self.ids.len() {
+                if outcome.completed.len() + outcome.dead.len() + outcome.discarded.len()
+                    == self.ids.len()
+                {
                     return Ok(outcome);
                 }
             }

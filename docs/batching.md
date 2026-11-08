@@ -127,8 +127,13 @@ retention sweep; applications must retain it (it contains no message payload).
 
 `TrackingSession` observes an explicit bounded set of original delivery ids in one
 trusted tenant and waits for canonical terminal settlement, not handler return.
-It distinguishes completed and dead originals, remains pending through retries
-and uncommitted transactions, and treats missing/pruned identities as an error.
+It reports completed, dead and operator-discarded originals in separate outcome
+lists. Discard is a non-successful terminal outcome, never business completion or
+quarantine. A discarded original does not stop observation of ready or active
+siblings: the session remains pending until every requested original has a known
+terminal outcome, including work still retrying or not yet committed. Missing,
+pruned or unrecognized identities/statuses remain errors, and database errors
+propagate rather than becoming terminal success.
 The caller supplies a finite total deadline and polling interval; cancellation
 changes no custody. Assembly/workers must be driven independently. PostgreSQL
 `pending` counts durable custody by tenant/destination; the volatile registry's
