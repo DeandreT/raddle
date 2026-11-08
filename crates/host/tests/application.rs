@@ -32,7 +32,7 @@ fn application_rejects_nonloopback_or_ambiguous_service_addresses() {
     );
 }
 
-#[sqlx::test(migrations = "../raddle-postgres/migrations")]
+#[sqlx::test(migrations = "../postgres/migrations")]
 #[ignore = "requires isolated local DATABASE_URL and numeric-loopback RADDLE_RABBITMQ_TEST_URI"]
 async fn pipeline_schedule_saga_events_projection_and_confirmed_broker_compose(
     pool: PgPool,

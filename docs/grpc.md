@@ -8,7 +8,7 @@ server task shutdown. The adapter does not start a listener automatically.
 
 ## Stable transport contract
 
-The included [`raddle/v1/dispatch.proto`](../crates/raddle-grpc/proto/raddle/v1/dispatch.proto)
+The included [`raddle/v1/dispatch.proto`](../crates/grpc/proto/raddle/v1/dispatch.proto)
 defines one unary RPC, `/raddle.v1.Dispatch/Invoke`:
 
 ```proto

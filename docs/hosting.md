@@ -56,7 +56,7 @@ only after their first successful database batch. An idle outbox batch does not
 probe broker health; applications needing transport-readiness checks should own
 that startup check and readiness reporting explicitly.
 
-The [executable PostgreSQL host example](../crates/raddle-host/examples/postgres_host.rs)
+The [executable PostgreSQL host example](../crates/host/examples/postgres_host.rs)
 actually uses both helpers, with an explicitly confirmed disposable database.
 Its intentionally unconfigured transport returns transient failure instead of
 falsely acknowledging delivery. Production applications provide their own

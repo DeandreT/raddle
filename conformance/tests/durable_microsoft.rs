@@ -194,7 +194,7 @@ async fn exchange(connection: &Connection, pool: PgPool) -> TestResult<Uuid> {
     Ok(request_id)
 }
 
-#[sqlx::test(migrations = "../crates/raddle-postgres/migrations")]
+#[sqlx::test(migrations = "../crates/postgres/migrations")]
 #[ignore = "requires disposable PostgreSQL and the official Microsoft emulator fixture"]
 async fn durable_request_reply_survives_post_commit_redelivery(pool: PgPool) -> TestResult {
     sqlx::query("CREATE TABLE processed_requests(id UUID PRIMARY KEY,value BIGINT NOT NULL)")

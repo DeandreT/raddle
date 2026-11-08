@@ -9,7 +9,7 @@ Workers and migrations are explicit. Confirmed remote publication remains
 at-least-once: a crash after broker acceptance can cause republishing, so consumers
 must be idempotent. PostgreSQL 14 or later is the supported database baseline.
 
-The [durable example](https://github.com/DeandreT/raddle/blob/main/crates/raddle-postgres/examples/postgres_durable.rs)
+The [durable example](https://github.com/DeandreT/raddle/blob/main/crates/postgres/examples/postgres_durable.rs)
 stages a purchase, commits its business row and completed saga together, and
 processes a durable receipt. Repeating it retains the original effects. It
 requires an **isolated example database**, since workers claim from that database

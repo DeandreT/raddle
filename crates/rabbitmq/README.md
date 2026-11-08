@@ -13,7 +13,7 @@ Production connections require TLS. Plaintext is limited to numeric loopback
 fixtures. RabbitMQ does not provide the Service Bus session/lock-renewal contract.
 
 - [Setup and backend-specific guarantees](https://github.com/DeandreT/raddle/blob/main/docs/adapters.md)
-- [Real-broker durable request/reply example test](https://github.com/DeandreT/raddle/blob/main/crates/raddle-rabbitmq/tests/conversation.rs)
+- [Real-broker durable request/reply example test](https://github.com/DeandreT/raddle/blob/main/crates/rabbitmq/tests/conversation.rs)
 - [Source repository and Git dependency usage](https://github.com/DeandreT/raddle)
 
 MIT licensed. Source versions are not evidence of a registry release.

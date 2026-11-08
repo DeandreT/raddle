@@ -20,7 +20,7 @@ chrono.workspace = true
 serde.workspace = true
 uuid.workspace = true
 url.workspace = true
-raddle-rabbitmq = { path = "../raddle-rabbitmq", version = "0.1.0" }
+raddle-rabbitmq = { path = "../rabbitmq", version = "0.1.0" }
 lapin = { version = "4.12.3", default-features = false, features = ["tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 

@@ -409,7 +409,7 @@ async fn outbox_exchange(connection: &Connection, pool: PgPool, bad_position: us
     Ok(())
 }
 
-#[sqlx::test(migrations = "../crates/raddle-postgres/migrations")]
+#[sqlx::test(migrations = "../crates/postgres/migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn refused_servicebus_publication_keeps_outbox_retryable_and_successes_completed(
     pool: PgPool,

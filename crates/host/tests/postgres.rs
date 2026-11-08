@@ -35,7 +35,7 @@ impl Transport for Confirmed {
     }
 }
 
-#[sqlx::test(migrations = "../raddle-postgres/migrations")]
+#[sqlx::test(migrations = "../postgres/migrations")]
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn hosted_workers_execute_transactions_and_confirm_outbox_before_shutdown(pool: PgPool) {
     sqlx::query("CREATE TABLE host_effect (id integer PRIMARY KEY)")

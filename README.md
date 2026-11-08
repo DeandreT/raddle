@@ -69,7 +69,7 @@ explicit context, bounded cascading commands/events, and owned retry decisions.
 Ordinary dispatch retains its original typed reply and never silently retries
 side effects or executes returned work.
 
-[`raddle-host`](crates/raddle-host/README.md) supervises explicitly registered
+[`raddle-host`](crates/host/README.md) supervises explicitly registered
 services with bounded restart policies, generation-safe readiness, cooperative
 shutdown and an enforced drain deadline. PostgreSQL worker/outbox helpers and
 explicit RabbitMQ topology declarations compose with application-owned state;
@@ -92,10 +92,10 @@ from the same registrations and checked against actual responses. See
 HTTP also supports explicit typed path/query/header/JSON binding, bounded SSE,
 per-identity ingress limits, private conditional GET revalidation,
 authenticated readiness and payload-free tenant queue views. The
-[`raddle-grpc`](crates/raddle-grpc/README.md) adapter exposes typed registrations
+[`raddle-grpc`](crates/grpc/README.md) adapter exposes typed registrations
 through a documented Protobuf JSON bridge over standard gRPC, with application-owned
 authentication and listener configuration. The
-[`raddle-admin`](crates/raddle-admin/README.md) CLI provides read-only diagnostics
+[`raddle-admin`](crates/admin/README.md) CLI provides read-only diagnostics
 and explicitly confirmed, audited tenant-scoped replay.
 
 ## Storage and transports
@@ -104,9 +104,9 @@ and explicitly confirmed, audited tenant-scoped replay.
 serialization. `raddle-rabbitmq` supports AMQP 0-9-1 confirms, mandatory routing,
 and bounded explicit-ack consumption. See [adapter guarantees](docs/adapters.md).
 
-Run the [SQLite durable walkthrough](crates/raddle-sqlite/examples/sqlite_durable.rs)
+Run the [SQLite durable walkthrough](crates/sqlite/examples/sqlite_durable.rs)
 against a dedicated example file, or the
-[PostgreSQL purchase/receipt walkthrough](crates/raddle-postgres/examples/postgres_durable.rs)
+[PostgreSQL purchase/receipt walkthrough](crates/postgres/examples/postgres_durable.rs)
 against an explicitly confirmed isolated database. Both retain the same effects
 when rerun. See [running the walkthroughs](docs/walkthroughs.md) for commands and
 safety boundaries.

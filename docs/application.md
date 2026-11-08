@@ -1,7 +1,7 @@
 # A composed application
 
-The [application example](../crates/raddle-host/examples/application.rs) and its
-[opt-in integration test](../crates/raddle-host/tests/application.rs) execute the
+The [application example](../crates/host/examples/application.rs) and its
+[opt-in integration test](../crates/host/tests/application.rs) execute the
 same application function. This is real PostgreSQL execution and RabbitMQ
 publication/consumption, not a transport mock or a collection of API sketches.
 

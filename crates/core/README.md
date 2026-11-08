@@ -21,7 +21,7 @@ From the [repository](https://github.com/DeandreT/raddle), run:
 cargo run -p raddle --example local
 ```
 
-- [Runnable request/event example](https://github.com/DeandreT/raddle/blob/main/crates/raddle/examples/local.rs)
+- [Runnable request/event example](https://github.com/DeandreT/raddle/blob/main/crates/core/examples/local.rs)
 - [Architecture and execution guarantees](https://github.com/DeandreT/raddle/blob/main/docs/architecture.md)
 - [Pipelines, cascades, retry policy, and typed routing](https://github.com/DeandreT/raddle/blob/main/docs/pipelines.md)
 - [Durable orchestration](https://github.com/DeandreT/raddle/blob/main/docs/orchestration.md)

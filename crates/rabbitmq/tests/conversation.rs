@@ -51,7 +51,7 @@ async fn custody(
     Ok(())
 }
 
-#[sqlx::test(migrations = "../raddle-postgres/migrations")]
+#[sqlx::test(migrations = "../postgres/migrations")]
 #[ignore = "requires isolated DATABASE_URL and RADDLE_RABBITMQ_TEST_URI"]
 async fn durable_conversation_completes_after_real_broker_custody(
     pool: PgPool,

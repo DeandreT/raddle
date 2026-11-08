@@ -101,7 +101,7 @@ A database probe or idle outbox cannot establish broker connectivity.
 
 The queue view is scoped to the authenticated tenant and contains aggregate
 ready/active/dead/completed/due counts, never bodies, error text or cross-tenant
-enumeration. See [raddle-admin](../crates/raddle-admin/README.md) for command-line
+enumeration. See [raddle-admin](../crates/admin/README.md) for command-line
 diagnostics and explicit audited replay without an HTTP listener.
 
 ## Ingress limits and conditional responses

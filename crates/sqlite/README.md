@@ -8,7 +8,7 @@ synchronization on a local filesystem.
 SQLite has one active writer. Keep handlers short and free of network effects;
 use PostgreSQL when parallel writers or persisted sagas/conversations are needed.
 
-The [durable example](https://github.com/DeandreT/raddle/blob/main/crates/raddle-sqlite/examples/sqlite_durable.rs)
+The [durable example](https://github.com/DeandreT/raddle/blob/main/crates/sqlite/examples/sqlite_durable.rs)
 commits a credit, closes and reopens the database, then applies the credit once.
 Run it against a dedicated example file from the repository checkout:
 
