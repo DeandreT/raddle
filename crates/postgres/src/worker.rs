@@ -81,7 +81,9 @@ impl Worker {
     /// Processes one bounded batch from registered destination queues only.
     /// Other queues, including their expiry sweep, remain untouched. Workers
     /// sharing a destination must register its complete contract set.
-    /// Errors leave remaining leases recoverable.
+    /// Returns the number of observed claims, not successful executions. Lost
+    /// claims belong to recovery, not this poller; other errors propagate after
+    /// the current batch joins and leave remaining leases recoverable.
     pub async fn run_once(&self, limit: u32) -> Result<usize, Error> {
         use futures_util::stream::StreamExt;
 
@@ -165,10 +167,7 @@ impl Worker {
             .buffer_unordered(limit as usize)
             .collect::<Vec<_>>()
             .await;
-        for result in results {
-            result?;
-        }
-        Ok(count)
+        finish_batch(count, results)
     }
 
     /// Polls until shutdown is requested; in-flight batches are joined before return.
@@ -218,11 +217,14 @@ impl<T: Transport> OutboxWorker<T> {
     }
 
     /// Publishes a bounded batch outside database transactions.
+    /// Returns observed claims, not confirmed completions. Lost claims are left
+    /// to their current owner; other errors propagate after the batch joins.
     pub async fn run_once(&self, limit: u32) -> Result<usize, Error> {
         self.run_once_inner(None, limit).await
     }
 
     /// Flushes one configured destination without claiming unrelated endpoints.
+    /// Counts observed claims and handles ownership loss as in `run_once`.
     pub async fn run_once_for(&self, destination: &str, limit: u32) -> Result<usize, Error> {
         self.run_once_inner(Some(destination), limit).await
     }
@@ -288,9 +290,73 @@ impl<T: Transport> OutboxWorker<T> {
             .buffer_unordered(limit as usize)
             .collect::<Vec<_>>()
             .await;
-        for result in results {
-            result?;
+        finish_batch(count, results)
+    }
+}
+
+fn finish_batch(count: usize, results: Vec<Result<(), Error>>) -> Result<usize, Error> {
+    for result in results {
+        match result {
+            // Queued executions and publications outside a transaction can
+            // lose ownership. Fencing leaves their successor claim untouched.
+            Ok(()) | Err(Error::StaleClaim) => {}
+            Err(error) => return Err(error),
         }
-        Ok(count)
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Error;
+
+    use super::finish_batch;
+
+    #[test]
+    fn ownership_loss_in_any_result_position_counts_observed_claims() {
+        // buffer_unordered produces completion order, not claim/input order.
+        for stale in 0..3 {
+            let results = (0..3)
+                .map(|index| {
+                    if index == stale {
+                        Err(Error::StaleClaim)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .collect();
+            assert!(matches!(finish_batch(3, results), Ok(3)));
+        }
+        assert!(matches!(
+            finish_batch(2, vec![Err(Error::StaleClaim), Err(Error::StaleClaim)]),
+            Ok(2)
+        ));
+    }
+
+    #[test]
+    fn ownership_loss_never_hides_other_errors_in_any_result_order() {
+        for stale in 0..3 {
+            for failed in 0..3 {
+                if stale == failed {
+                    continue;
+                }
+                let results = (0..3)
+                    .map(|index| match index {
+                        index if index == stale => Err(Error::StaleClaim),
+                        index if index == failed => Err(Error::Database(sqlx::Error::PoolClosed)),
+                        _ => Ok(()),
+                    })
+                    .collect();
+                assert!(matches!(finish_batch(3, results), Err(Error::Database(_))));
+            }
+        }
+        for error in [
+            Error::RollbackOnly,
+            Error::Invalid("test"),
+            Error::Capacity,
+            Error::IdentityConflict,
+        ] {
+            assert!(finish_batch(2, vec![Err(Error::StaleClaim), Err(error)]).is_err());
+        }
     }
 }
