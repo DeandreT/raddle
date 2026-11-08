@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+// Independently authored native test schemas. Rust tests use matching prost
+// derives; this file is also the language-neutral input for later counterparts.
+// No foreign generator or .NET interoperability is established by this fixture.
+package raddle.serialization.fixtures;
+
+message Text {
+  string text = 1;
+}
+
+message Input {
+  uint32 value = 1;
+  string label = 2;
+}
+
+message FloatValue {
+  double value = 1;
+}

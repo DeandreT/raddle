@@ -8,13 +8,19 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
+[features]
+default = []
+serialization = ["dep:raddle-serialization"]
+
 [dependencies]
 raddle.workspace = true
+raddle-serialization = { path = "../serialization", version = "0.1.0", optional = true }
 tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror.workspace = true
 
 [dev-dependencies]
+prost = "0.14.4"
 chrono.workspace = true
 raddle-postgres.workspace = true
 sqlx.workspace = true

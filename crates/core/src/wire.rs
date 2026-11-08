@@ -94,7 +94,78 @@ struct UntrustedEnvelope {
     payload: Value,
 }
 
+/// Wire metadata without a body. Deserializing metadata does not validate it;
+/// use [`Envelope::from_parts`] before dispatch or persistence. Correlation and
+/// causation are independently optional, and neither authenticates origin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeMetadata {
+    /// Stable, non-nil identity. Never generate a replacement during retry.
+    pub id: Uuid,
+    /// Stable native contract identifier, not a Rust or foreign runtime type name.
+    pub contract: String,
+    /// Positive native schema version.
+    pub version: u32,
+    /// Original creation time, independently projected for external protocols.
+    pub created_at: DateTime<Utc>,
+    /// Conversation identity, if present.
+    pub correlation_id: Option<Uuid>,
+    /// Causal message identity, if present.
+    pub causation_id: Option<Uuid>,
+    /// Unauthenticated application metadata, validated at the envelope boundary.
+    pub headers: BTreeMap<String, String>,
+}
+
 impl Envelope {
+    /// Builds a validated canonical envelope from explicit metadata and JSON
+    /// content. Native codecs must project their typed models into this canonical
+    /// representation, diagnosing unsupported/lossy conversions themselves.
+    pub fn from_parts(
+        metadata: EnvelopeMetadata,
+        payload: Value,
+        limits: EnvelopeLimits,
+    ) -> Result<Self, WireError> {
+        let envelope = Self {
+            id: metadata.id,
+            contract: metadata.contract,
+            version: metadata.version,
+            created_at: metadata.created_at,
+            correlation_id: metadata.correlation_id,
+            causation_id: metadata.causation_id,
+            headers: metadata.headers,
+            payload,
+        };
+        envelope.validate(limits)?;
+        Ok(envelope)
+    }
+
+    /// Copies metadata without exposing a mutable path around validation.
+    pub fn metadata(&self) -> EnvelopeMetadata {
+        EnvelopeMetadata {
+            id: self.id,
+            contract: self.contract.clone(),
+            version: self.version,
+            created_at: self.created_at,
+            correlation_id: self.correlation_id,
+            causation_id: self.causation_id,
+            headers: self.headers.clone(),
+        }
+    }
+
+    /// Replaces a body/schema through a typed canonical projection, retaining all
+    /// identity, time, correlation, causation and application headers. Upcasters
+    /// can use this before custody; it never mutates the original envelope.
+    pub fn rebody<M: WireMessage>(
+        &self,
+        message: &M,
+        limits: EnvelopeLimits,
+    ) -> Result<Self, WireError> {
+        let mut metadata = self.metadata();
+        metadata.contract = M::NAME.to_owned();
+        metadata.version = M::VERSION;
+        Self::from_parts(metadata, serde_json::to_value(message)?, limits)
+    }
+
     /// Encodes a typed contract with a new stable identity.
     pub fn encode<M: WireMessage>(message: &M) -> Result<Self, WireError> {
         Self::with_identity(Uuid::new_v4(), Utc::now(), message)

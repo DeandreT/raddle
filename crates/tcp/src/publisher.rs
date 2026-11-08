@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
+use crate::codec::Codec;
 use crate::config::{Endpoint, Error, Limits};
 use crate::framing;
 
@@ -26,6 +27,7 @@ pub struct Publisher {
     endpoints: BTreeMap<String, Endpoint>,
     limits: Limits,
     admission: Semaphore,
+    codecs: BTreeMap<String, Codec>,
 }
 
 impl Publisher {
@@ -44,7 +46,29 @@ impl Publisher {
             endpoints,
             limits,
             admission: Semaphore::new(limits.connections),
+            codecs: BTreeMap::new(),
         })
+    }
+
+    /// Selects opt-in body framing/codecs for one configured alias. Untouched
+    /// aliases keep RDTC1 JSON. Both peers must explicitly enable RDTC2; there is
+    /// no unsafe retry/fallback to another protocol after an uncertain outcome.
+    #[cfg(feature = "serialization")]
+    pub fn with_codecs(
+        mut self,
+        destination: &str,
+        codecs: std::sync::Arc<raddle_serialization::EndpointCodecs>,
+    ) -> Result<Self, Error> {
+        if !self.endpoints.contains_key(destination) {
+            return Err(Error::Configuration);
+        }
+        self.codecs.insert(
+            destination.to_owned(),
+            Codec {
+                selected: Some(codecs),
+            },
+        );
+        Ok(self)
     }
 
     /// Sends a finite batch with per-item custody results. A refused or malformed
@@ -68,6 +92,8 @@ impl Publisher {
         // Admission precedes serialization, so excess callers cannot each retain
         // an encoded batch while the finite socket capacity is already occupied.
         let _permit = self.admission.try_acquire().map_err(|_| Error::Uncertain)?;
+        let codec = self.codecs.get(destination).cloned().unwrap_or_default();
+        let selected = codec.selected();
         let mut results: Vec<_> = envelopes.iter().map(|_| Err(Error::Uncertain)).collect();
         let mut frames = Vec::new();
         let mut remaining = self.limits.batch_bytes;
@@ -76,11 +102,14 @@ impl Publisher {
             if tokio::time::Instant::now() >= deadline {
                 return Err(Error::Uncertain);
             }
-            match envelope.validate(self.limits.envelope) {
-                Ok(()) => {
-                    let length = envelope.to_vec().map_err(|_| Error::Rejected)?.len();
-                    remaining = remaining.checked_sub(length).ok_or(Error::Configuration)?;
-                    frames.push((index, envelope));
+            match codec.encode(envelope, self.limits.envelope, selected) {
+                Ok(bytes) => {
+                    remaining = remaining
+                        .checked_sub(bytes.len())
+                        .ok_or(Error::Configuration)?;
+                    // Serialize once: a custom codec must not change the bytes
+                    // after budget accounting. Retention is batch-byte bounded.
+                    frames.push((index, bytes));
                 }
                 Err(_) => results[index] = Err(Error::Rejected),
             }
@@ -94,17 +123,19 @@ impl Publisher {
                 .map_err(|_| Error::Uncertain)?;
             stream.set_nodelay(true).map_err(|_| Error::Uncertain)?;
             stream
-                .write_all(framing::MAGIC)
+                .write_all(if selected {
+                    framing::SELECTED_MAGIC
+                } else {
+                    framing::MAGIC
+                })
                 .await
                 .map_err(|_| Error::Uncertain)?;
             stream
                 .write_u16(frames.len() as u16)
                 .await
                 .map_err(|_| Error::Uncertain)?;
-            for (index, envelope) in &frames {
-                // Only one encoded item is retained per admitted connection.
-                let bytes = envelope.to_vec().map_err(|_| Error::Rejected)?;
-                framing::write_frame(&mut stream, &bytes).await?;
+            for (index, bytes) in &frames {
+                framing::write_frame(&mut stream, bytes).await?;
                 let status = stream.read_u8().await.map_err(|_| Error::Uncertain)?;
                 results[*index] = match status {
                     framing::ACCEPTED => Ok(Receipt::Accepted),
@@ -117,7 +148,8 @@ impl Publisher {
                         )
                         .await?;
                         remaining -= bytes.len();
-                        let reply = Envelope::from_slice(&bytes, self.limits.envelope)
+                        let reply = codec
+                            .decode(&bytes, self.limits.envelope, selected)
                             .map_err(|_| Error::Uncertain)?;
                         if reply.correlation_id() != Some(envelopes[*index].id())
                             || reply.causation_id() != Some(envelopes[*index].id())
