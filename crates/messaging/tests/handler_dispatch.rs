@@ -1,6 +1,9 @@
 //! Native bus execution, real SQL custody and explicit receiving ownership.
 #![allow(clippy::unwrap_used)]
 
+#[path = "handler_dispatch/separated_routes.rs"]
+mod separated_routes;
+
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

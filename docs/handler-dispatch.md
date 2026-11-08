@@ -72,6 +72,15 @@ owner for the same alias. When adopting an existing durable bus alias, register
 through this API before starting any receiver. Repeated owner selection is
 rejected rather than silently creating competing receivers.
 
+Every preconfigured receiving route in separated mode must select exactly one
+group: use the group's endpoint name, bind one group explicitly with `sticky`,
+or register a pre-built endpoint-only override before the set. Each group is
+registered only at its selected destination. An extra unassigned receiving route
+is a startup error, as is assigning several groups to the same endpoint. Rejected
+registration leaves the existing builder, routes and receiving owners untouched;
+the application chooses its explicit bindings before registration. Outgoing-only
+remote routes remain producer routes and do not need a receiving handler.
+
 Send/Publish performs real independent admissions to these subscriptions.
 Successful inbox completion persists; a failed sibling retries alone. A native
 handler using `Scope::saga`/`save_saga` participates in the same way. There is no
@@ -100,9 +109,9 @@ durable. The application receives and must attach the runner. A producer-only
 remote alias is rejected because it cannot own native handler execution.
 
 Only the selected sticky groups run there, not all global handlers for the
-message. Unassigned leftovers run on the default endpoint and other endpoints
-already routed for that contract at registration time. Configure those routes
-before registering the set; this is frozen startup composition, not runtime
+message. In classic mode, unassigned leftovers run on the default endpoint and
+other endpoints already routed for that contract at registration time. Configure
+those routes before registering the set; this is frozen startup composition, not runtime
 discovery. Sticky selections and leftover target aliases cannot collide.
 Existing outgoing-only remote routes are preserved without attaching a local
 handler or creating a broker listener for them.

@@ -239,14 +239,27 @@ where
                 .or_default()
                 .push(id.clone());
         }
-        // Unassigned leftovers run on other already-routed endpoints too. Explicit
-        // pre-built overrides registered first keep their endpoint-only chain.
-        if !global.is_empty() {
+        if self.behavior == MultipleHandlerBehavior::Separated
+            && selected.values().any(|groups| groups.len() != 1)
+        {
+            return Err(BusError::Invalid(
+                "separated endpoints require exactly one native handler group",
+            ));
+        }
+        // Only classic mode installs a global leftover chain. Separated routes
+        // must already select one group or an explicit endpoint-only override;
+        // a second global chain would duplicate committed independent work.
+        if self.behavior == MultipleHandlerBehavior::Separated || !global.is_empty() {
             for name in builder.route_names::<M>()? {
                 if !selected.contains_key(&name)
                     && !matches!(builder.endpoints.get(&name), Some(Endpoint::Remote(_)))
                     && !builder.has_endpoint_handler::<M>(&name)?
                 {
+                    if self.behavior == MultipleHandlerBehavior::Separated {
+                        return Err(BusError::Invalid(
+                            "separated receiving routes need an explicit group binding or endpoint handler",
+                        ));
+                    }
                     selected.insert(name, global.clone());
                 }
             }
