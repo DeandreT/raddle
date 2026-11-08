@@ -1,7 +1,8 @@
 //! Opt-in failure handling with explicit retry ownership and endpoint custody.
 //!
-//! This crate does not install policies into `Runtime` or PostgreSQL workers.
-//! Applications must use an executor driver; no arbitrary handler is replayed.
+//! This crate does not change legacy `Runtime` or PostgreSQL workers. The
+//! `raddle-messaging` opt-in managed policy queues and durable endpoints bind
+//! these drivers to actual application execution with explicit replay safety.
 
 mod circuit;
 mod driver;

@@ -3,6 +3,7 @@
 pub mod cluster;
 mod conversation;
 mod dead_letters;
+pub mod endpoint_policies;
 mod error;
 pub mod events;
 pub mod http_responses;

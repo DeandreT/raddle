@@ -91,6 +91,13 @@ Host stop cancels unfinished durable pre-commit work, joins cleanup, and leaves
 the uncompleted lease recoverable. This is not cluster ownership, leader election
 or broker-native acknowledgement orchestration.
 
+Policy-driven local queues use `PolicyQueueBuilder`, `BusBuilder::policy_queue`
+and its Host-attached runner. Durable queues opt in before registration with
+`DurableEndpoint::policies` and `handle_policy`. Both preserve concrete handler
+errors and require explicit replay safety. See [endpoint policies](native-policy-crypto.md)
+for retry budgets, custody transitions, strict rollback and uncertainty recovery.
+Legacy registrations retain their existing defaults.
+
 ## Context and resources
 
 Authenticated ingress explicitly supplies `TrustedOrigin`. Creating that value

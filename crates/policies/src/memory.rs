@@ -180,6 +180,56 @@ impl InMemoryEndpoint {
     pub fn deliveries(&self) -> &[MemoryDelivery] {
         &self.deliveries
     }
+    /// The next eligible queue identity in actual queue-tail order. An endpoint
+    /// pause or active claim makes no additional work eligible.
+    pub fn next_ready(&self, now: Duration) -> Option<&MemoryDelivery> {
+        if self.active.is_some() || now < self.paused_until {
+            return None;
+        }
+        self.queue.iter().find_map(|index| {
+            let delivery = &self.deliveries[*index];
+            (delivery.due <= now).then_some(delivery)
+        })
+    }
+    /// Places an already-ready delivery behind newly merged admissions without
+    /// changing its due time or counters. Managed receivers use this after
+    /// merging buffered custody accepted during the previous active operation.
+    pub fn move_ready_to_tail(&mut self, id: uuid::Uuid) -> Result<(), DriverError> {
+        if self.active.is_some() {
+            return Err(DriverError::Custody);
+        }
+        let position = self
+            .queue
+            .iter()
+            .position(|index| {
+                self.deliveries[*index].envelope.id() == id
+                    && self.deliveries[*index].status == MemoryStatus::Ready
+            })
+            .ok_or(DriverError::Custody)?;
+        let index = self.queue.remove(position).ok_or(DriverError::Custody)?;
+        self.queue.push_back(index);
+        Ok(())
+    }
+    /// Quarantines the next eligible item after application wire/body validation
+    /// failed. This bypasses ordinary handler policies and attempt counters.
+    pub async fn reject_next(&mut self, now: Duration) -> Result<(), DriverError> {
+        let id = self
+            .next_ready(now)
+            .map(|d| d.envelope.id())
+            .ok_or(DriverError::Custody)?;
+        let position = self
+            .queue
+            .iter()
+            .position(|index| self.deliveries[*index].envelope.id() == id)
+            .ok_or(DriverError::Custody)?;
+        let index = self.queue.remove(position).ok_or(DriverError::Custody)?;
+        self.active = Some(index);
+        self.deliveries[index].status = MemoryStatus::Active;
+        self.transition(Transition::DeadLetter {
+            replay_denied: false,
+        })
+        .await
+    }
     /// Explicit operator retry affects only a failed item, retaining attempts.
     pub fn retry_dead_letter(&mut self, id: uuid::Uuid, now: Duration) -> Result<(), DriverError> {
         let index = self
@@ -282,6 +332,46 @@ impl InMemoryEndpoint {
         F: FnMut(Envelope) -> Fut + Send,
         Fut: Future<Output = Result<(), PolicyError>> + Send,
     {
+        self.run_managed(executor, now, stop, false, move |envelope| {
+            let operation = operation(envelope);
+            async move { Ok(operation.await) }
+        })
+        .await
+    }
+
+    /// Managed application boundary: join the operation's cancellation cleanup
+    /// instead of dropping it. The owner must propagate stop into that operation.
+    /// An outer driver error retains uncertain work without applying a handler
+    /// policy or sampling the circuit. An inner error is a typed handler failure.
+    /// Successful commit wins over a concurrent stop; it is never replayed.
+    /// Quota admission uses the quota-owned clock shared across managed owners;
+    /// the supplied clock still controls this endpoint's scheduling and circuit.
+    pub async fn run_joined<F, Fut>(
+        &mut self,
+        executor: &PolicyExecutor,
+        now: Duration,
+        stop: &mut watch::Receiver<bool>,
+        operation: F,
+    ) -> Result<bool, DriverError>
+    where
+        F: FnMut(Envelope) -> Fut + Send,
+        Fut: Future<Output = Result<Result<(), PolicyError>, DriverError>> + Send,
+    {
+        self.run_managed(executor, now, stop, true, operation).await
+    }
+
+    async fn run_managed<F, Fut>(
+        &mut self,
+        executor: &PolicyExecutor,
+        now: Duration,
+        stop: &mut watch::Receiver<bool>,
+        joined: bool,
+        mut operation: F,
+    ) -> Result<bool, DriverError>
+    where
+        F: FnMut(Envelope) -> Fut + Send,
+        Fut: Future<Output = Result<Result<(), PolicyError>, DriverError>> + Send,
+    {
         if driver::stopped(stop) || now < self.paused_until {
             return Ok(false);
         }
@@ -331,22 +421,40 @@ impl InMemoryEndpoint {
             }
             let outcome = tokio::select! {
                 biased;
-                _ = driver::wait_for_stop(stop) => AttemptOutcome::Cancelled,
+                _ = driver::wait_for_stop(stop), if !joined => AttemptOutcome::Cancelled,
                 outcome = async {
                     // Admission belongs to each actual call, not to the outer
                     // delivery/retry loop. Release concurrency admission before
                     // recovery/cooldown; never acquire a second permit while
                     // retaining the first one.
                     let _permit = match &quota {
-                        Some(quota) => match quota.acquire(current).map_err(|_| DriverError::Invalid)? {
+                        Some(quota) => {
+                            let (admission, quota_now) = if joined {
+                                quota.acquire_current().map_err(|_| DriverError::Invalid)?
+                            } else { (quota.acquire(current).map_err(|_| DriverError::Invalid)?, current) };
+                            match admission {
                             crate::QuotaAdmission::Granted(permit) => Some(permit),
-                            crate::QuotaAdmission::Limited { retry_at } => return Ok(AttemptOutcome::Limited(retry_at)),
-                        },
+                            crate::QuotaAdmission::Limited { retry_at } => {
+                                let retry_at = if joined {
+                                    let local_now = now.checked_add(started.elapsed()).ok_or(DriverError::Invalid)?;
+                                    retry_at.map(|due| local_now.checked_add(due.saturating_sub(quota_now)).ok_or(DriverError::Invalid)).transpose()?
+                                } else { retry_at };
+                                return Ok(AttemptOutcome::Limited(retry_at));
+                            }
+                        }},
                         None => None,
                     };
                     self.deliveries[index].attempts.begin(self.direction).map_err(|_| DriverError::Invalid)?;
                     executed = true;
-                    Ok::<_, DriverError>(AttemptOutcome::Completed(operation(self.deliveries[index].envelope.clone()).await))
+                    let result = match operation(self.deliveries[index].envelope.clone()).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            if let Some(circuit) = &mut self.circuit { circuit.cancel_probe(); }
+                            self.transition(Transition::Retain).await?;
+                            return Err(error);
+                        }
+                    };
+                    Ok::<_, DriverError>(AttemptOutcome::Completed(result))
                 } => outcome?,
             };
             let result = match outcome {
@@ -370,6 +478,13 @@ impl InMemoryEndpoint {
                     return Ok(executed);
                 }
             };
+            if result.is_err() && driver::stopped(stop) {
+                if let Some(circuit) = &mut self.circuit {
+                    circuit.cancel_probe();
+                }
+                self.transition(Transition::Retain).await?;
+                return Ok(executed);
+            }
             let current = now
                 .checked_add(started.elapsed())
                 .ok_or(DriverError::Invalid)?;

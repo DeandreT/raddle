@@ -44,6 +44,9 @@ pub enum BusError {
     /// Local queue admission failed.
     #[error("local queue admission failed")]
     Queue(#[from] QueueError),
+    /// Policy queue refused invalid identity, closed custody or a full retained budget.
+    #[error("policy queue admission failed")]
+    Policy(#[from] raddle_policies::DriverError),
     /// Message encoding/decoding failed.
     #[error("message envelope failed validation")]
     Wire(#[from] WireError),
@@ -125,6 +128,7 @@ impl<T: Transport> Publisher for TypedPublisher<T> {
 #[derive(Clone)]
 pub(crate) enum Endpoint {
     Local(LocalQueue),
+    Policy(crate::PolicyQueue),
     Durable(Store),
     Remote(Arc<dyn Publisher>),
 }
@@ -193,6 +197,12 @@ impl BusBuilder {
     /// Adds an inline/buffered named local queue. Attach its runner to the host separately.
     pub fn local(&mut self, name: &str, queue: LocalQueue) -> Result<(), BusError> {
         self.endpoint(name, Endpoint::Local(queue))
+    }
+    /// Installs an explicitly registered typed-error policy queue. Attach its
+    /// sole runner to Host; Send/Publish acknowledge bounded volatile custody.
+    pub fn policy_queue(&mut self, queue: crate::PolicyQueue) -> Result<(), BusError> {
+        let name = queue.name().to_owned();
+        self.endpoint(&name, Endpoint::Policy(queue))
     }
     /// Adds PostgreSQL custody, using the alias as an independent subscription.
     /// Register the matching handler on `DurableEndpoint` and attach it to the host.
@@ -559,6 +569,15 @@ impl MessageBus {
         for destination in routes {
             let result = async {
                 match &self.0.endpoints[destination] {
+                    Endpoint::Policy(queue) => {
+                        queue
+                            .submit(
+                                context
+                                    .clone()
+                                    .with_cancellation(crate::Cancellation::new()),
+                            )
+                            .await?
+                    }
                     Endpoint::Local(queue) => {
                         let handler = Arc::clone(
                             self.0
@@ -624,7 +643,9 @@ impl MessageBus {
         if let Some(routes) = self.0.routes.get(&key::<M>()?) {
             for destination in routes {
                 let kind = match &self.0.endpoints[destination] {
-                    Endpoint::Local(_) => return Err(BusError::NonAtomicRoute),
+                    Endpoint::Local(_) | Endpoint::Policy(_) => {
+                        return Err(BusError::NonAtomicRoute);
+                    }
                     Endpoint::Durable(_) => DeliveryKind::Local,
                     Endpoint::Remote(_) => DeliveryKind::Remote,
                 };

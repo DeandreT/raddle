@@ -164,7 +164,12 @@ async fn unknown_observers_are_additive_failure_isolated_and_keep_exact_original
             .unwrap();
         assert_eq!(handler.records().len(), 1);
         assert_eq!(handler.records()[0].envelope().id(), next.id());
-        assert!(!format!("{:?}", handler.records()[0]).contains("100"));
+        // The allowed random UUID may itself contain the payload digits. Check
+        // the full identity-only representation so no payload field can leak.
+        assert_eq!(
+            format!("{:?}", handler.records()[0]),
+            format!("UnknownRecord {{ message_id: {}, .. }}", next.id())
+        );
     }
 }
 
