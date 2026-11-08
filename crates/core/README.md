@@ -11,6 +11,10 @@ parent admission is released. Owned retry decisions require an application
 rollback or idempotency assertion; ordinary handlers are never silently replayed.
 Typed route tables resolve stable wire contracts only to configured aliases.
 
+Declared request and event families share one typed behavior across explicit
+concrete variants, with atomic registration and ordinary bounded execution.
+They use native enums/adapters, not reflection or inherited wire contracts.
+
 The local runtime is volatile. Durable execution belongs to the separate
 PostgreSQL and SQLite adapters; it is not implied by invoking a local handler.
 All crates are independently implemented and MIT licensed.
@@ -22,6 +26,8 @@ cargo run -p raddle --example local
 ```
 
 - [Runnable request/event example](https://github.com/DeandreT/raddle/blob/main/crates/core/examples/local.rs)
+- [Runnable declared-family example](https://github.com/DeandreT/raddle/blob/main/crates/core/examples/families.rs)
+- [Declared message-family contracts](https://github.com/DeandreT/raddle/blob/main/docs/message-families.md)
 - [Architecture and execution guarantees](https://github.com/DeandreT/raddle/blob/main/docs/architecture.md)
 - [Pipelines, cascades, retry policy, and typed routing](https://github.com/DeandreT/raddle/blob/main/docs/pipelines.md)
 - [Durable orchestration](https://github.com/DeandreT/raddle/blob/main/docs/orchestration.md)
