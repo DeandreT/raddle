@@ -199,6 +199,14 @@ impl NativeApiBuilder {
         for (path, version) in pending {
             let mut operation = operation.clone();
             operation["x-native-route-template"] = json!(path);
+            // The hex suffix is an injective path encoding, not an expansion
+            // index: IDs stay unique and stable across optional/version paths.
+            let path_id: String = path
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            operation["operationId"] = json!(format!("{}.{path_id}", contract.name));
             // Optional route expansion removes absent path members from metadata.
             if let Some(parameters) = operation["parameters"].as_array_mut() {
                 parameters.retain(|parameter| {
@@ -222,7 +230,6 @@ impl NativeApiBuilder {
                 && url_reader
             {
                 operation["x-api-version"] = json!(version);
-                operation["operationId"] = json!(format!("{}.v{}", contract.name, version));
             }
             let key = if contract.method == HttpMethod::Query {
                 "x-http-query-operation".into()

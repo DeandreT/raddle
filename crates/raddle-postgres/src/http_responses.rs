@@ -74,6 +74,22 @@ pub struct StoredResponse {
     /// Original Location only.
     pub location: Option<String>,
 }
+impl StoredResponse {
+    /// Validates the complete persisted subset before business work is committed.
+    /// Persistence repeats this check so direct callers cannot bypass its bounds.
+    pub fn validate(&self) -> Result<(), Error> {
+        if !(200..400).contains(&self.status)
+            || self.body.len() > 1_048_576
+            || self
+                .location
+                .as_ref()
+                .is_some_and(|value| value.len() > 8192)
+        {
+            return Err(Error::Invalid("invalid stored HTTP response"));
+        }
+        Ok(())
+    }
+}
 impl std::fmt::Debug for StoredResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoredResponse")
@@ -161,7 +177,7 @@ pub async fn complete(
         success: false,
     };
     let result=async {
-        if !(200..400).contains(&response.status) || response.body.len()>1_048_576 || response.location.as_ref().is_some_and(|value|value.len()>8192) {return Err(Error::Invalid("invalid stored HTTP response"));}
+        response.validate()?;
         let changed=sqlx::query("UPDATE raddle_http_responses SET status=$1,body=$2,location=$3 WHERE scope_hash=$4 AND key=$5 AND owner=$6 AND status IS NULL").bind(response.status as i16).bind(&response.body).bind(&response.location).bind(claim.key.scope.as_slice()).bind(&claim.key.key).bind(claim.owner).execute(operation.scope.connection()).await?;
         if changed.rows_affected()!=1 {return Err(Error::IdentityConflict);}
         Ok(())
@@ -188,5 +204,32 @@ impl Store {
             return Err(Error::Invalid("invalid HTTP response cleanup bound"));
         }
         Ok(sqlx::query("WITH old AS (SELECT scope_hash,key FROM raddle_http_responses WHERE expires_at<=$1 ORDER BY expires_at LIMIT $2 FOR UPDATE SKIP LOCKED) DELETE FROM raddle_http_responses r USING old WHERE r.scope_hash=old.scope_hash AND r.key=old.key").bind(before.min(Utc::now())).bind(limit as i64).execute(&self.pool).await?.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoredResponse;
+
+    #[test]
+    fn response_validation_covers_each_persisted_bound_inclusively() {
+        let mut response = StoredResponse {
+            status: 200,
+            body: vec![0; 1_048_576],
+            location: Some("x".repeat(8192)),
+        };
+        assert!(response.validate().is_ok());
+        response.status = 399;
+        assert!(response.validate().is_ok());
+        for status in [199, 400] {
+            response.status = status;
+            assert!(response.validate().is_err());
+        }
+        response.status = 200;
+        response.body.push(0);
+        assert!(response.validate().is_err());
+        response.body.clear();
+        response.location = Some("x".repeat(8193));
+        assert!(response.validate().is_err());
     }
 }
