@@ -214,3 +214,11 @@ compatibility. The reply frame uses bounded JSON and can have a smaller effectiv
 payload limit than a bare envelope. This native foundation does not establish
 .NET integration, conventional discovery, all endpoint modes, batching, cluster
 or complete Wolverine behavioral parity.
+
+The optional `serialization-rpc` feature adds an explicit `SelectedRpc` profile
+to both peers using `with_selected_rpc`. Its native v2 JSON outer reply frame
+carries a selected RDSB1 **application** response, decoded and canonically bounded
+before a waiter can be consumed. It does not change the existing v1 JSON mode.
+Configure selected request aliases and JSON outer reply aliases independently;
+see the [codec RPC guide](codec-rpc.md). A generic transport is opaque, and this
+profile neither inspects it nor supports an encrypted/selected-body stack.

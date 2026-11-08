@@ -4,6 +4,8 @@
 //! returned effects. This crate opts into managed application behavior explicitly.
 
 mod bus;
+#[cfg(feature = "serialization-rpc")]
+mod codec_rpc;
 mod context;
 mod durable;
 pub mod effects;
@@ -15,6 +17,8 @@ pub mod scoped;
 pub use bus::ScopedRegistration;
 pub use bus::{BusBuilder, BusError, InvokeError, InvokeOptions, MessageBus, RemoteInvoker};
 pub use bus::{InputStream, LocalStream, StreamError, StreamOptions};
+#[cfg(feature = "serialization-rpc")]
+pub use codec_rpc::SelectedRpc;
 pub use context::{Cancellation, HeaderError, MessageContext, TrustedOrigin};
 pub use durable::{DurableControl, DurableEndpoint};
 pub use ingress::{IngressDecoder, IngressError, JsonIngress};

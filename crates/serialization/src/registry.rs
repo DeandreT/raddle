@@ -183,6 +183,19 @@ impl EndpointCodecs {
             .unwrap_or("application/json")
     }
 
+    /// Checks codec availability for an exact media type and **canonical**
+    /// contract/version, the same key used by `encode_body` and `decode_body`.
+    /// Resolves endpoint-local first, then application registrations. Invalid or
+    /// missing keys return false, without fallback, model construction, callback
+    /// execution or mutation. This says nothing about transport configuration,
+    /// authentication, authority, or whether a particular value is representable.
+    pub fn supports(&self, media: &str, contract: &str, version: u32) -> bool {
+        validate_media(media).is_ok()
+            && raddle::SubscriptionName::try_new(contract).is_ok()
+            && version > 0
+            && self.lookup(media, contract, version).is_ok()
+    }
+
     /// Validates an already-canonical plaintext envelope, e.g. a legacy JSON
     /// transport bridge. Protected raddle crypto envelopes are an unsupported
     /// composition, not typed application models. This does not decode a body,
