@@ -1,0 +1,25 @@
+[package]
+name = "raddle-mqtt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Caller-polled MQTT 5 protocol acceptance for raddle"
+
+[dependencies]
+raddle.workspace = true
+rumqttc = { version = "0.25", default-features = false, features = ["websocket", "use-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio = { workspace = true, features = ["time", "rt", "macros"] }
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[lints]
+workspace = true
