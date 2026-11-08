@@ -26,8 +26,12 @@ use uuid::Uuid;
 
 #[path = "durable_policies/commit_rejection.rs"]
 mod commit_rejection;
+#[path = "durable_policies/completion_schema.rs"]
+mod completion_schema;
 #[path = "durable_policies/policy_clock.rs"]
 mod policy_clock;
+#[path = "durable_policies/recovery_fences.rs"]
+mod recovery_fences;
 #[path = "durable_policies/uncertainty_isolation.rs"]
 mod uncertainty_isolation;
 
@@ -617,9 +621,18 @@ async fn commit_io_failure_retains_custody_without_blocking_healthy_siblings(poo
             .await
             .unwrap()
     );
+    // Recovery advances this injected clock through its own admission waits.
+    // Resume at its recorded canonical time, not the stale pre-recovery instant.
+    let recovered_at: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT replayed_at FROM raddle_replay_audit WHERE job_id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(recovered_at >= future);
     assert_eq!(
         store
-            .claim_policy_for("uncertain", 1, Duration::from_secs(30), future)
+            .claim_policy_for("uncertain", 1, Duration::from_secs(30), recovered_at)
             .await
             .unwrap()
             .len(),

@@ -326,11 +326,16 @@ where
                         post_commit,
                     })
                 }
-                Err(error) => Err(if strict_rollback && !known_commit_rejection(&error) {
-                    Failure::UncertainDatabase(error)
-                } else {
-                    Failure::Database(error)
-                }),
+                Err(error) => Err(
+                    if strict_rollback
+                        && !known_commit_rejection(&error)
+                        && !shared_completion_failure(&error)
+                    {
+                        Failure::UncertainDatabase(error)
+                    } else {
+                        Failure::Database(error)
+                    },
+                ),
             }
         }
         Err(error) => {
@@ -387,6 +392,25 @@ fn known_commit_rejection(error: &raddle_postgres::Error) -> bool {
         .is_some_and(|error| {
             error.severity() == sqlx::postgres::PgSeverity::Error
                 && (error.code().starts_with("23") || matches!(error.code(), "40001" | "40P01"))
+        })
+}
+
+// A server-reported invalid completion query/schema, unsupported query feature,
+// or read-only transaction is a shared prerequisite defect, not evidence of one
+// lost connection/unknown acknowledgement. Propagate it as Database so the runner
+// reports infrastructure failure. This classification does NOT attest rollback
+// or authorize recovery: existing tainted custody stays untouched. In particular,
+// do not include data/constraint errors, 40003, transport errors or FATAL here.
+fn shared_completion_failure(error: &raddle_postgres::Error) -> bool {
+    let raddle_postgres::Error::Database(sqlx::Error::Database(error)) = error else {
+        return false;
+    };
+    error
+        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+        .is_some_and(|error| {
+            error.severity() == sqlx::postgres::PgSeverity::Error
+                && (error.code().starts_with("42")
+                    || matches!(error.code(), "3F000" | "0A000" | "25006"))
         })
 }
 

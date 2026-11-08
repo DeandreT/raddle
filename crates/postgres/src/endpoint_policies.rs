@@ -256,6 +256,8 @@ impl Store {
     /// Explicit tenant-scoped, audited resolution of uncertain execution after
     /// its lease expires. Never revives expired input or resets policy counters.
     /// The caller must establish the asserted safety before authorizing replay.
+    /// Advances caller time through pool/job/attempt-row waits and rechecks both
+    /// lease and message expiry under lock before changing custody or audit.
     pub async fn recover_policy_uncertain(
         &self,
         tenant: &str,
@@ -265,13 +267,33 @@ impl Store {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, Error> {
+        let clock = EffectiveNow::new(now);
         if actor.is_empty() || actor.len() > 128 || reason.is_empty() || reason.len() > 1024 {
             return Err(Error::Invalid("invalid policy recovery audit"));
         }
         let mut tx = self.pool.begin().await?;
-        let held: Option<Uuid> = sqlx::query_scalar("SELECT j.id FROM raddle_jobs j JOIN raddle_policy_attempts p ON p.job_id=j.id WHERE j.id=$1 AND j.tenant=$2 AND j.status='active' AND j.lease_until<=$3 AND (j.expires_at IS NULL OR j.expires_at>$3) AND p.uncertain FOR UPDATE OF j")
-            .bind(id).bind(tenant).bind(now).fetch_optional(&mut *tx).await?;
-        if held.is_none() {
+        // Use job -> attempt lock order, as attempt/settlement operations do.
+        // Predicates sampled before FOR UPDATE cannot establish post-wait TTLs.
+        let held = sqlx::query("SELECT j.lease_until,j.expires_at FROM raddle_jobs j WHERE j.id=$1 AND j.tenant=$2 AND j.status='active' FOR UPDATE")
+            .bind(id).bind(tenant).fetch_optional(&mut *tx).await?;
+        let Some(held) = held else {
+            return Ok(false);
+        };
+        let uncertain: Option<bool> = sqlx::query_scalar(
+            "SELECT uncertain FROM raddle_policy_attempts WHERE job_id=$1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // Both actual lock waits and pool admission have completed. No marker,
+        // state or audit mutation is permitted until caller time is refreshed.
+        let now = clock.current()?;
+        let lease: Option<DateTime<Utc>> = held.try_get("lease_until")?;
+        let expiry: Option<DateTime<Utc>> = held.try_get("expires_at")?;
+        if uncertain != Some(true)
+            || lease.is_none_or(|until| until > now)
+            || expiry.is_some_and(|until| until <= now)
+        {
             return Ok(false);
         }
         sqlx::query("UPDATE raddle_policy_attempts SET uncertain=false WHERE job_id=$1")

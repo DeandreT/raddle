@@ -230,9 +230,16 @@ Strict execution distinguishes a PostgreSQL transaction rejection from uncertain
 completion. A server `ERROR` with integrity SQLSTATE class `23`, serialization
 failure `40001`, or deadlock `40P01` from the fenced completion/COMMIT path cannot
 have committed the root. It remains an order-local `Failure::Database`, allowing
-policy disposition without terminating the receiving service. Other commit
-errors, including connection loss and statement-completion-unknown `40003`, and
-all failed rollback attempts use `UncertainDatabase` and bypass handler recovery.
+policy disposition without terminating the receiving service. Shared completion
+prerequisites are diagnosed separately: PostgreSQL ERROR
+SQLSTATE class `42` (query/schema/access), `3F000` (invalid schema), `0A000`
+(unsupported feature), and `25006` (read-only transaction) remain shared
+`Failure::Database` errors that propagate to the Host. They are not suppressed as
+one delivery's lost connection. This diagnosis does not attest rollback or clear
+tainted custody; recovery still needs independent verification and authorization.
+Other commit errors, including connection loss and statement-completion-unknown
+`40003`, and all failed rollback attempts use `UncertainDatabase` and bypass
+handler recovery.
 After a successful pre-commit rollback, invalid
 returned intent, identity conflict, capacity refusal and SQL data/integrity/
 transaction-rollback errors remain order-local policy failures. Genuine backend
@@ -270,6 +277,15 @@ expiry. An operator must reconcile and explicitly call the tenant-scoped audited
 deliberately conservative even for SQL-only crashes. A small crash window between
 attempt recording and handler entry can consume a policy slot. Inspection's
 legacy attempt field is separate from the persisted policy handling counter.
+
+Uncertain recovery locks the matching active tenant job and then its attempt
+record before sampling effective caller time. The lease must have expired, the
+whole message must still be live, and the uncertainty marker must still be set
+after actual pool/job/attempt-row waits. Denial leaves custody, counters, marker
+and audit unchanged. Authorized recovery uses that same post-wait microsecond
+timestamp for scheduling and audit, without mixing in server wall time. Audit
+validation and shared database errors still propagate rather than becoming a
+false denial. Recovery never relaxes the active-status or tenant boundary.
 
 Lease expiry during cooldown or asynchronous cleanup can end this owner's retry
 permission. Stale ownership affects only that claim, never the Host's cancellation
