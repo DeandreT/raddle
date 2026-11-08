@@ -42,6 +42,61 @@ def command(args, *, timeout=300, check=True, env=None):
     return result
 
 
+def read_exact(connection, size):
+    data = bytearray()
+    while len(data) < size:
+        part = connection.recv(size - len(data))
+        if not part:
+            raise OSError("Broker closed its readiness connection")
+        data.extend(part)
+    return bytes(data)
+
+
+def broker_ready(family, connection):
+    # Docker's port proxy may accept before the broker is listening. Require an
+    # actual protocol response instead of treating that proxy socket as readiness.
+    if family == "redis":
+        connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+        if read_exact(connection, 7) != b"+PONG\r\n":
+            raise OSError("Redis is not ready for commands")
+    elif family == "nats":
+        banner = bytearray()
+        while not banner.endswith(b"\r\n"):
+            if len(banner) >= 8192:
+                raise OSError("Oversized NATS readiness banner")
+            banner.extend(read_exact(connection, 1))
+        try:
+            if not banner.startswith(b"INFO ") or not json.loads(banner[5:])["server_id"]:
+                raise ValueError("Missing NATS server identity")
+        except (ValueError, KeyError, TypeError) as error:
+            raise OSError("NATS did not return its protocol banner") from error
+    elif family == "mqtt":
+        client = b"raddle-fixture-readiness"
+        # MQTT 5 CONNECT, clean start, 10-second keep-alive, no properties.
+        body = b"\x00\x04MQTT\x05\x02\x00\x0a\x00" + len(client).to_bytes(2, "big") + client
+        connection.sendall(b"\x10" + bytes([len(body)]) + body)
+        if read_exact(connection, 1) != b"\x20":
+            raise OSError("MQTT did not return CONNACK")
+        size = 0
+        multiplier = 1
+        for _ in range(4):
+            byte = read_exact(connection, 1)[0]
+            size += (byte & 127) * multiplier
+            if not byte & 128:
+                break
+            multiplier *= 128
+        else:
+            raise OSError("Malformed MQTT readiness length")
+        if not 3 <= size <= 4096:
+            raise OSError("Invalid MQTT readiness CONNACK size")
+        reply = read_exact(connection, size)
+        if reply[0] & 254 or reply[1] != 0:
+            raise OSError("MQTT refused readiness CONNECT")
+        connection.sendall(b"\xe0\x00")
+    else:
+        raise ValueError("Unknown broker family")
+
+
 def phase(family, run, directory, target):
     images = {
         "nats": ["nats:2.14.7-alpine", "nats:2.12.5-alpine"],
@@ -138,12 +193,7 @@ def phase(family, run, directory, target):
         while True:
             try:
                 with socket.create_connection(("127.0.0.1", bound_port), timeout=1) as connection:
-                    if family == "redis":
-                        connection.sendall(b"*1\r\n$4\r\nPING\r\n")
-                        with connection.makefile("rb") as response:
-                            pong = response.readline(64)
-                        if pong != b"+PONG\r\n":
-                            raise OSError("Redis is not ready for commands")
+                    broker_ready(family, connection)
                     break
             except OSError:
                 if time.monotonic() >= deadline:

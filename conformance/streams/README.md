@@ -13,7 +13,9 @@ as the invoking Linux UID so retained fixture state remains inspectable.
 Build targets are checkout-specific by default. `--target-dir <path>` selects an
 explicit directory on the verified perok volume; do not reuse another checkout's
 target directory.
-Mount/target guards can be checked without Docker:
+Readiness requires a broker protocol response, not just Docker's open port proxy:
+NATS INFO, Redis PONG, or a successful MQTT5 CONNECT/CONNACK exchange.
+Mount/target and readiness guards can be checked without Docker:
 `python3 -B -m unittest discover -s conformance/streams -p 'test_*.py'`.
 Standard pulled images remain Docker's shared cache; there are no run-created
 networks, volumes or private image tags. Retained state/receipts are under
