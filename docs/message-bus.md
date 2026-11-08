@@ -69,6 +69,11 @@ Durable queue aliases use `BusBuilder::durable` and a matching
 It claims only its own subscription, and pause/resume never creates another
 receiving owner. Endpoint execution and memory-queue admission are independent.
 The SQL worker keeps successful inbox completion across failed sibling retries.
+Malformed persisted envelopes or origins quarantine only their delivery. Lost
+ownership is not a successful acknowledgement. Failure settlement requires an
+unexpired lease and cannot release a successor's lease. Other store failures are
+reported after healthy claims in the current batch finish. `run_once` counts
+observed claims, not completions.
 Host stop cancels unfinished durable pre-commit work, joins cleanup, and leaves
 the uncompleted lease recoverable. This is not cluster ownership, leader election
 or broker-native acknowledgement orchestration.
