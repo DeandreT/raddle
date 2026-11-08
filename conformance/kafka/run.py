@@ -14,6 +14,8 @@ import subprocess
 import sys
 import uuid
 
+from wire import WireProxy
+
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path('/mnt/perok/build/raddle/parity-native/kafka-fixtures')
 IMAGE = 'apache/kafka:4.1.2'
@@ -62,7 +64,7 @@ def compose(state, *arguments, timeout=600):
     return docker('compose', '-p', state['project'], '-f', state['compose'], *arguments, timeout=timeout)
 
 
-def up():
+def up(proxy=None):
     mounted()
     build_directory(FIXTURES)
     if shutil.disk_usage(FIXTURES.parent).free < 5 * 1024**3:
@@ -78,13 +80,16 @@ def up():
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
+    if proxy is not None:
+        proxy.backend = port
+    advertised = port if proxy is None else proxy.port
     environment = {
         'CLUSTER_ID': base64.urlsafe_b64encode(uuid.uuid4().bytes).decode().rstrip('='),
         'KAFKA_NODE_ID': '1', 'KAFKA_PROCESS_ROLES': 'broker,controller',
         'KAFKA_CONTROLLER_QUORUM_VOTERS': '1@broker:9093',
         'KAFKA_CONTROLLER_LISTENER_NAMES': 'CONTROLLER',
         'KAFKA_LISTENERS': 'INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092',
-        'KAFKA_ADVERTISED_LISTENERS': f'INTERNAL://broker:9092,EXTERNAL://127.0.0.1:{port}',
+        'KAFKA_ADVERTISED_LISTENERS': f'INTERNAL://broker:9092,EXTERNAL://127.0.0.1:{advertised}',
         'KAFKA_LISTENER_SECURITY_PROTOCOL_MAP': 'INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT',
         'KAFKA_INTER_BROKER_LISTENER_NAME': 'INTERNAL',
         'KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR': '1',
@@ -111,8 +116,10 @@ def up():
     compose_file = directory / 'compose.json'
     compose_file.write_text(json.dumps(config, indent=2) + '\n')
     state = {'schema': 1, 'run': run, 'project': 'raddle-kafka-' + run,
-             'compose': str(compose_file), 'image': image, 'bootstrap': f'127.0.0.1:{port}',
+             'compose': str(compose_file), 'image': image, 'bootstrap': f'127.0.0.1:{advertised}',
              'directory': str(directory), 'containers': []}
+    if proxy is not None:
+        state.update(mode='crc', proxy=proxy.descriptor())
     state_file = directory / 'state.json'
     state_file.write_text(json.dumps(state, indent=2) + '\n')
     try:
@@ -157,7 +164,7 @@ def down(path):
         shutil.rmtree(data)
 
 
-def build_inputs(target):
+def build_inputs(target, mode='broker'):
     mounted()
     target = target.resolve()
     if not target.is_relative_to(Path('/mnt/perok/build')):
@@ -167,17 +174,28 @@ def build_inputs(target):
     for key in ['CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR', 'CARGO_BUILD_JOBS', 'CARGO_INCREMENTAL']:
         env.pop(key, None)
     env['TMPDIR'] = '/mnt/perok/build/scratch/raddle'
-    command = ['cargo', 'test', '-p', 'raddle-kafka', '--test', 'broker', '--locked', '-j1', '--target-dir', str(target), '--config', 'profile.dev.debug=0']
+    test_target = 'crc_wire' if mode == 'crc' else 'broker'
+    command = ['cargo', 'test', '-p', 'raddle-kafka', '--test', test_target, '--locked', '-j1', '--target-dir', str(target), '--config', 'profile.dev.debug=0']
     return command, env
 
 
-def test(path, command, env):
+def test(path, command, env, proxy=None):
     state = load(path)
+    mode = 'crc' if proxy is not None else 'broker'
+    if state.get('mode', 'broker') != mode:
+        raise RuntimeError('CRC tests require the explicit live one-shot CRC fixture mode')
     if len(state['containers']) != 1:
         raise RuntimeError('Expected one owned Kafka fixture container for broker diagnostics')
     env = env.copy()
     env['RADDLE_KAFKA_TEST_BROKERS'] = state['bootstrap']
     env['RADDLE_KAFKA_TEST_CONTAINER'] = state['containers'][0]
+    for key in ['RADDLE_KAFKA_CRC_CONTROL', 'RADDLE_KAFKA_CRC_TOKEN']:
+        env.pop(key, None)
+    if proxy is not None:
+        if state['proxy'] != proxy.descriptor() or state['bootstrap'] != proxy.descriptor()['bootstrap']:
+            raise RuntimeError('Live CRC proxy ownership/routing mismatch')
+        env['RADDLE_KAFKA_CRC_CONTROL'] = proxy.descriptor()['control']
+        env['RADDLE_KAFKA_CRC_TOKEN'] = proxy.token
     return subprocess.run([*command, '--', '--ignored', '--test-threads=1', '--show-output'], cwd=ROOT, env=env).returncode
 
 
@@ -185,9 +203,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['up', 'down', 'test'])
     parser.add_argument('--state', type=Path)
+    parser.add_argument('--mode', choices=['broker', 'crc'], default='broker')
     checkout = hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
     parser.add_argument('--target-dir', type=Path, default=Path('/mnt/perok/build/raddle/kafka') / checkout / 'target')
     args = parser.parse_args()
+    if args.mode == 'crc' and (args.action != 'test' or args.state is not None):
+        parser.error('CRC mode requires one-shot test without --state')
     if args.action == 'up':
         print(up(), flush=True)
         return 0
@@ -202,17 +223,28 @@ def main():
     lock = build_directory(FIXTURES.parent) / 'compile.lock'
     with lock.open('a') as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
-        command, env = build_inputs(args.target_dir)
+        command, env = build_inputs(args.target_dir) if args.mode == 'broker' else build_inputs(args.target_dir, args.mode)
         built = subprocess.run([*command, '--no-run'], cwd=ROOT, env=env)
         if built.returncode:
             return built.returncode
         owned = args.state is None
-        state = up() if owned else args.state
+        proxy = WireProxy().start() if args.mode == 'crc' else None
+        state = None
         try:
-            return test(state, command, env)
+            state = (up() if proxy is None else up(proxy)) if owned else args.state
+            result = test(state, command, env) if proxy is None else test(state, command, env, proxy)
+            if proxy is not None and (proxy.errors or len(proxy.receipts) != 3 or proxy.arm is not None):
+                return result or 1
+            return result
         finally:
-            if owned:
-                down(state)
+            try:
+                if proxy is not None:
+                    proxy.close()
+                    if state is not None:
+                        (state.parent / 'wire-receipt.json').write_text(json.dumps(proxy.status(), indent=2) + '\n')
+            finally:
+                if owned and state is not None:
+                    down(state)
 
 
 if __name__ == '__main__':

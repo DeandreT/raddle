@@ -106,6 +106,15 @@ receiver instead. Ordinary application validation failures keep their known
 per-record barriers and do not enter this shared native failure state. Partition-
 scoped recovery for opaque SDK errors is not provided by this profile.
 
+The opt-in `tests/crc_wire.rs` requires the run-owned Kafka 4 wire proxy selected
+by `python3 conformance/kafka/run.py test --mode crc` in the source checkout. It
+checks a single CRC-field bit fault, an unfinished held-record settlement fence,
+unchanged broker watermark and explicit unmodified redelivery/recovery. Its
+test-only disabled-CRC control and raw native BadMessage observation distinguish
+actual CRC rejection from application validation or a mocked SDK error. This
+narrow PerMessage/classic Fetch-v4 profile does not qualify every Kafka mode or
+remove the native allocation and teardown limitations below.
+
 **Application limits are not a hard bound on native decompression memory.**
 librdkafka decompresses batches before this adapter can validate or detach their
 records; a small compressed batch can expand beyond the application record and
