@@ -17,8 +17,9 @@ impl Drop for OwnedChild {
 #[test]
 #[ignore = "build routing_node and set RADDLE_ROUTING_NODE to its absolute executable path"]
 fn two_shipping_processes_deliver_by_destination_and_publication_rule() {
-    let executable =
-        std::env::var_os("RADDLE_ROUTING_NODE").expect("explicit shipping example executable");
+    let Some(executable) = std::env::var_os("RADDLE_ROUTING_NODE") else {
+        panic!("set RADDLE_ROUTING_NODE to the built routing_node example");
+    };
     let mut receiver = OwnedChild(
         Command::new(&executable)
             .arg("receiver")
