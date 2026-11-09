@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
+use crate::clock::Clock;
 use crate::execution::Execution;
 use crate::{Claim, DeliveryKind, Error, FailureDisposition, Job, Scope};
 
@@ -67,19 +68,81 @@ impl Store {
         lease: Duration,
         now: DateTime<Utc>,
     ) -> Result<Vec<Claim>, Error> {
+        self.claim_inner(kind, None, limit, lease, now).await
+    }
+
+    /// Claims one configured destination, including its expiry/exhaustion sweep.
+    /// Other destinations' custody and attempts remain untouched.
+    pub async fn claim_for(
+        &self,
+        kind: DeliveryKind,
+        destination: &str,
+        limit: u32,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Claim>, Error> {
+        raddle::SubscriptionName::try_new(destination)
+            .map_err(|_| Error::Invalid("invalid destination"))?;
+        self.claim_inner(kind, Some(&[destination]), limit, lease, now)
+            .await
+    }
+
+    pub(crate) async fn claim_registered(
+        &self,
+        destinations: &[&str],
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Claim>, Error> {
+        self.claim_inner(DeliveryKind::Local, Some(destinations), 1, lease, now)
+            .await
+    }
+
+    async fn claim_inner(
+        &self,
+        kind: DeliveryKind,
+        destinations: Option<&[&str]>,
+        limit: u32,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Claim>, Error> {
+        let clock = Clock::new(now);
         if !(1..=256).contains(&limit)
             || !(Duration::from_millis(1)..=Duration::from_secs(7200)).contains(&lease)
         {
             return Err(Error::Invalid("invalid claim limits"));
         }
-        let now = now.timestamp_millis();
+        if destinations.is_some_and(<[&str]>::is_empty) {
+            return Ok(Vec::new());
+        }
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = clock.now()?;
         let until = now
             .checked_add(lease.as_millis() as i64)
             .ok_or(Error::Invalid("lease overflow"))?;
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("UPDATE raddle_jobs SET status='dead',last_error='expired-or-exhausted',lease_until=NULL WHERE kind=? AND (expires_at<=? OR attempts>=max_attempts) AND (status='ready' OR (status='active' AND lease_until<=?))").bind(kind.as_str()).bind(now).bind(now).execute(&mut *transaction).await?;
-        let rows=sqlx::query("UPDATE raddle_jobs SET status='active',generation=generation+1,attempts=attempts+1,lease_until=? WHERE id IN (SELECT j.id FROM raddle_jobs j WHERE j.kind=? AND j.available_at<=? AND (j.status='ready' OR (j.status='active' AND j.lease_until<=?)) AND NOT EXISTS(SELECT 1 FROM raddle_jobs previous WHERE j.partition_key IS NOT NULL AND previous.tenant=j.tenant AND previous.kind=j.kind AND previous.destination=j.destination AND previous.partition_key=j.partition_key AND previous.sequence<j.sequence AND previous.status NOT IN ('completed','dead')) ORDER BY j.sequence LIMIT ?) RETURNING id,generation,envelope,destination,tenant,attempts,max_attempts")
-            .bind(until).bind(kind.as_str()).bind(now).bind(now).bind(i64::from(limit)).fetch_all(&mut *transaction).await?;
+        let mut expired = QueryBuilder::<Sqlite>::new(
+            "UPDATE raddle_jobs SET status='dead',last_error='expired-or-exhausted',lease_until=NULL WHERE kind=",
+        );
+        expired.push_bind(kind.as_str());
+        restrict_destinations(&mut expired, "destination", destinations);
+        expired.push(" AND (expires_at<=").push_bind(now)
+            .push(" OR attempts>=max_attempts) AND (status='ready' OR (status='active' AND lease_until<=")
+            .push_bind(now).push("))");
+        expired.build().execute(&mut *transaction).await?;
+        let mut selection = QueryBuilder::<Sqlite>::new(
+            "UPDATE raddle_jobs SET status='active',generation=generation+1,attempts=attempts+1,lease_until=",
+        );
+        selection
+            .push_bind(until)
+            .push(" WHERE id IN (SELECT j.id FROM raddle_jobs j WHERE j.kind=")
+            .push_bind(kind.as_str());
+        restrict_destinations(&mut selection, "j.destination", destinations);
+        selection.push(" AND j.available_at<=").push_bind(now)
+            .push(" AND (j.status='ready' OR (j.status='active' AND j.lease_until<=")
+            .push_bind(now)
+            .push(")) AND NOT EXISTS(SELECT 1 FROM raddle_jobs previous WHERE j.partition_key IS NOT NULL AND previous.tenant=j.tenant AND previous.kind=j.kind AND previous.destination=j.destination AND previous.partition_key=j.partition_key AND previous.sequence<j.sequence AND previous.status NOT IN ('completed','dead')) ORDER BY j.sequence LIMIT ")
+            .push_bind(i64::from(limit))
+            .push(") RETURNING id,generation,envelope,destination,tenant,attempts,max_attempts");
+        let rows = selection.build().fetch_all(&mut *transaction).await?;
         let claims = rows
             .into_iter()
             .map(|row| {
@@ -103,7 +166,9 @@ impl Store {
         claim: &Claim,
         now: DateTime<Utc>,
     ) -> Result<Scope<'static>, Error> {
-        Self::fence_execution(self.begin().await?, claim, now).await
+        let clock = Clock::new(now);
+        let scope = self.begin().await?;
+        Self::fence_execution(scope, claim, clock.now()?).await
     }
 
     pub(crate) async fn worker_execution(
@@ -112,8 +177,10 @@ impl Store {
         now: DateTime<Utc>,
         timeout: Duration,
     ) -> Result<Scope<'static>, Error> {
+        let clock = Clock::new(now);
         let execution = Execution::begin(&self.pool).await?;
-        let mut scope = Self::fence_execution(Scope::execution(execution), claim, now).await?;
+        let mut scope =
+            Self::fence_execution(Scope::execution(execution), claim, clock.now()?).await?;
         scope.start_deadline(timeout).await?;
         Ok(scope)
     }
@@ -121,10 +188,10 @@ impl Store {
     async fn fence_execution(
         mut scope: Scope<'static>,
         claim: &Claim,
-        now: DateTime<Utc>,
+        now: i64,
     ) -> Result<Scope<'static>, Error> {
         let held:Option<String>=sqlx::query_scalar("SELECT id FROM raddle_jobs WHERE id=? AND generation=? AND status='active' AND lease_until>?")
-            .bind(&claim.id).bind(claim.generation).bind(now.timestamp_millis()).fetch_optional(scope.connection()).await?;
+            .bind(&claim.id).bind(claim.generation).bind(now).fetch_optional(scope.connection()).await?;
         if held.is_none() {
             return Err(Error::StaleClaim);
         }
@@ -132,10 +199,15 @@ impl Store {
     }
     /// Completes an acknowledged outgoing delivery only while its generation is owned.
     pub async fn complete(&self, claim: &Claim, now: DateTime<Utc>) -> Result<(), Error> {
-        let result=sqlx::query("UPDATE raddle_jobs SET status='completed',completed_at=?,lease_until=NULL WHERE id=? AND generation=? AND status='active' AND lease_until>?").bind(now.timestamp_millis()).bind(&claim.id).bind(claim.generation).bind(now.timestamp_millis()).execute(&self.pool).await?;
+        let clock = Clock::new(now);
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = clock.now()?;
+        let result=sqlx::query("UPDATE raddle_jobs SET status='completed',completed_at=?,lease_until=NULL WHERE id=? AND generation=? AND status='active' AND lease_until>?").bind(now).bind(&claim.id).bind(claim.generation).bind(now).execute(&mut *transaction).await?;
         if result.rows_affected() == 1 {
+            transaction.commit().await?;
             Ok(())
         } else {
+            transaction.rollback().await?;
             Err(Error::StaleClaim)
         }
     }
@@ -146,20 +218,24 @@ impl Store {
         disposition: FailureDisposition,
         now: DateTime<Utc>,
     ) -> Result<(), Error> {
+        let clock = Clock::new(now);
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = clock.now()?;
         let terminal =
             disposition == FailureDisposition::Reject || claim.attempts >= claim.max_attempts;
         let delay = 1000i64
             .saturating_mul(1 << claim.attempts.saturating_sub(1).min(18))
             .min(300000);
         let due = now
-            .timestamp_millis()
             .checked_add(delay)
             .ok_or(Error::Invalid("retry overflow"))?;
-        let result=sqlx::query("UPDATE raddle_jobs SET status=?,available_at=?,lease_until=NULL,last_error=? WHERE id=? AND generation=? AND status='active'")
-            .bind(if terminal{"dead"}else{"ready"}).bind(due).bind(if terminal{"rejected-or-exhausted"}else{"retry"}).bind(&claim.id).bind(claim.generation).execute(&self.pool).await?;
+        let result=sqlx::query("UPDATE raddle_jobs SET status=?,available_at=?,lease_until=NULL,last_error=? WHERE id=? AND generation=? AND status='active' AND lease_until>?")
+            .bind(if terminal{"dead"}else{"ready"}).bind(due).bind(if terminal{"rejected-or-exhausted"}else{"retry"}).bind(&claim.id).bind(claim.generation).bind(now).execute(&mut *transaction).await?;
         if result.rows_affected() == 1 {
+            transaction.commit().await?;
             Ok(())
         } else {
+            transaction.rollback().await?;
             Err(Error::StaleClaim)
         }
     }
@@ -231,5 +307,20 @@ impl Store {
             return Err(Error::Invalid("invalid retention batch"));
         }
         Ok(sqlx::query("DELETE FROM raddle_jobs WHERE id IN(SELECT j.id FROM raddle_jobs j WHERE j.tenant=? AND j.status='completed' AND j.completed_at<? AND NOT EXISTS(SELECT 1 FROM raddle_replay_audit a WHERE a.job_id=j.id) ORDER BY j.sequence LIMIT ?)").bind(tenant).bind(before.timestamp_millis()).bind(i64::from(limit)).execute(&self.pool).await?.rows_affected())
+    }
+}
+
+fn restrict_destinations<'args>(
+    query: &mut QueryBuilder<'args, Sqlite>,
+    column: &'static str,
+    destinations: Option<&'args [&'args str]>,
+) {
+    if let Some(destinations) = destinations {
+        query.push(" AND ").push(column).push(" IN (");
+        let mut values = query.separated(",");
+        for destination in destinations {
+            values.push_bind(*destination);
+        }
+        values.push_unseparated(")");
     }
 }
