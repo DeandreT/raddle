@@ -80,8 +80,19 @@ impl MessageBus {
     ) -> Result<(), BusError> {
         envelope.require_legacy_dispatch()?;
         let key = (envelope.contract().to_owned(), envelope.version());
-        if self.0.resolver.grouping_active(&key) || self.0.resolver.routes(&key).iter().any(|route| matches!(&self.0.endpoints[&route.destination],Endpoint::Local(queue) if queue.is_partitioned())) {
-            return Err(BusError::Invalid("grouped contracts require buffered Send/Publish execution"));
+        let partitioned_handler = self.0.handlers.keys().any(|(endpoint, handled)| {
+            handled == &key
+                && matches!(&self.0.endpoints[endpoint], Endpoint::Local(queue) if queue.is_partitioned())
+        });
+        if partitioned_handler
+            || self.0.resolver.grouping_active(&key)
+            || self.0.resolver.routes(&key).iter().any(|route| {
+                matches!(&self.0.endpoints[&route.destination], Endpoint::Local(queue) if queue.is_partitioned())
+            })
+        {
+            return Err(BusError::Invalid(
+                "grouped contracts require buffered Send/Publish execution",
+            ));
         }
         Ok(())
     }
@@ -169,10 +180,16 @@ impl MessageBus {
         let mut admissions = Vec::new();
         // Resolve and capability-check every branch before admitting any. A later
         // unsupported profile must not leave an earlier buffer acknowledging it.
-        let grouped = routes.iter().any(|route| matches!(&self.0.endpoints[&route.destination], Endpoint::Local(queue) if queue.is_partitioned()));
+        let mut grouped_paths = BTreeMap::new();
         for route in routes {
+            let grouped = matches!(&self.0.endpoints[&route.destination], Endpoint::Local(queue) if queue.is_partitioned());
+            *grouped_paths.entry(route.path_key()).or_insert(false) |= grouped;
+        }
+        for route in routes {
+            let path = route.path_key();
+            let grouped = grouped_paths[&path];
             let envelope = prepared
-                .entry(route.path_key())
+                .entry(path)
                 .or_insert_with(|| {
                     let envelope =
                         route.prepare(context.envelope(), context.origin(), &self.0.propagated)?;

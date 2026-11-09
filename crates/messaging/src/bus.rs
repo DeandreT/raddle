@@ -543,6 +543,7 @@ impl MessageBus {
             )
             .await
             .map_err(|_| InvokeError::TimedOut)??;
+            reply.require_legacy_dispatch().map_err(BusError::from)?;
             reply
                 .decode::<M::Reply>()
                 .map_err(|error| BusError::Wire(error).into())

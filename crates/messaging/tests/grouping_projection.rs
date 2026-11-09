@@ -39,6 +39,187 @@ impl WireMessage for Child {
     const NAME: &'static str = "group.child";
     const VERSION: u32 = 1;
 }
+#[derive(Serialize, Deserialize)]
+struct LegacyChild;
+impl WireMessage for LegacyChild {
+    const NAME: &'static str = "group.legacy-child";
+    const VERSION: u32 = 1;
+}
+
+#[tokio::test]
+async fn independent_projected_branches_keep_grouping_local_and_fanout_prepares_once() {
+    let slots = SlotSet::new("branches", 1).unwrap();
+    let settings = QueueSettings {
+        mode: QueueMode::Buffered,
+        capacity: 4,
+        parallelism: 2,
+    };
+    let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+    let mut host = Host::new(Duration::from_secs(5)).unwrap();
+    let (tx, mut rx) = mpsc::channel(3);
+    for endpoint in ["a", "a-copy", "b"] {
+        let (queue, runner) = if endpoint == "b" {
+            LocalQueue::new(settings).unwrap()
+        } else {
+            LocalQueue::partitioned(settings, slots.clone()).unwrap()
+        };
+        builder.local(endpoint, queue).unwrap();
+        runner.attach(&mut host, endpoint).unwrap();
+        let tx = tx.clone();
+        if endpoint == "b" {
+            builder
+                .handle::<LegacyChild, _, _>(endpoint, move |_, context| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(("b", context.envelope().clone())).await.unwrap();
+                        Ok(())
+                    }
+                })
+                .unwrap();
+        } else {
+            builder
+                .handle::<Child, _, _>(endpoint, move |_, context| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send((endpoint, context.envelope().clone()))
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                })
+                .unwrap();
+        }
+    }
+    let mut config = RoutingConfig::default();
+    config
+        .declare(MessageDeclaration::of::<Work>(MessageRole::PublishOnly).unwrap())
+        .unwrap();
+    config
+        .declare(MessageDeclaration::of::<Child>(MessageRole::Handled).unwrap())
+        .unwrap();
+    config
+        .declare(MessageDeclaration::of::<LegacyChild>(MessageRole::Handled).unwrap())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    config
+        .topology(
+            "grouped-a",
+            MessageSelector::exact::<Child>().unwrap(),
+            vec![],
+            vec![GroupingRule::typed::<Child>(move |child| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                RuleMatch::Matched(GroupId::new(&child.key))
+            })],
+            vec![
+                EndpointAlias::try_new("a").unwrap(),
+                EndpointAlias::try_new("a-copy").unwrap(),
+            ],
+        )
+        .unwrap();
+    config
+        .rule(
+            "legacy-b",
+            "Legacy branch",
+            MessageSelector::exact::<LegacyChild>().unwrap(),
+            vec![EndpointAlias::try_new("b").unwrap()],
+        )
+        .unwrap();
+    config
+        .transform::<Work, Child>("to-a", 1, |work| {
+            Ok(Child {
+                id: work.id,
+                key: "g".into(),
+            })
+        })
+        .unwrap();
+    config
+        .transform::<Work, LegacyChild>("to-b", 1, |_| Ok(LegacyChild))
+        .unwrap();
+    let bus = builder.build_routed(config).unwrap();
+    let shutdown = host.handle();
+    let task = tokio::spawn(host.run());
+    let root = Envelope::encode(&Work { id: 1 }).unwrap();
+    bus.dispatch(
+        MessageContext::new(origin(), root.clone(), Utc::now()),
+        true,
+    )
+    .await
+    .unwrap();
+    let mut outputs = std::collections::BTreeMap::new();
+    for _ in 0..3 {
+        let (endpoint, envelope) = next(&mut rx).await;
+        outputs.insert(endpoint, envelope);
+    }
+    let a = &outputs["a"];
+    let copy = &outputs["a-copy"];
+    let b = &outputs["b"];
+    assert_ne!(a.id(), root.id());
+    assert_ne!(b.id(), root.id());
+    assert_ne!(a.id(), b.id());
+    assert_eq!(a.to_vec().unwrap(), copy.to_vec().unwrap());
+    assert_eq!(a.dispatch().unwrap().group().unwrap().as_str(), "g");
+    assert!(b.dispatch().is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    shutdown.shutdown();
+    join(task).await;
+}
+
+#[tokio::test]
+async fn same_projected_envelope_cannot_fanout_to_incompatible_legacy_receiver() {
+    let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+    let (queue, _runner) = queue();
+    let grouped = queue.clone();
+    builder.local("orders", queue).unwrap();
+    let (queue, _legacy_runner) = LocalQueue::new(QueueSettings {
+        mode: QueueMode::Buffered,
+        capacity: 4,
+        parallelism: 2,
+    })
+    .unwrap();
+    let legacy = queue.clone();
+    builder.local("legacy", queue).unwrap();
+    for endpoint in ["orders", "legacy"] {
+        builder
+            .handle::<Child, _, _>(endpoint, |_, _| async { Ok(()) })
+            .unwrap();
+    }
+    let mut config = RoutingConfig::default();
+    config
+        .declare(MessageDeclaration::of::<Work>(MessageRole::PublishOnly).unwrap())
+        .unwrap();
+    config
+        .declare(MessageDeclaration::of::<Child>(MessageRole::Handled).unwrap())
+        .unwrap();
+    config
+        .rule(
+            "both",
+            "Same prepared envelope",
+            MessageSelector::exact::<Child>().unwrap(),
+            vec![
+                EndpointAlias::try_new("orders").unwrap(),
+                EndpointAlias::try_new("legacy").unwrap(),
+            ],
+        )
+        .unwrap();
+    config
+        .transform::<Work, Child>("child", 1, |work| {
+            Ok(Child {
+                id: work.id,
+                key: "unused".into(),
+            })
+        })
+        .unwrap();
+    let bus = builder.build_routed(config).unwrap();
+    assert!(matches!(
+        bus.send(&Work { id: 1 }, origin()).await,
+        Err(raddle_messaging::BusError::Invalid(
+            "native dispatch unsupported by destination"
+        ))
+    ));
+    assert_eq!(grouped.snapshot().buffered, 0);
+    assert_eq!(legacy.snapshot().buffered, 0);
+}
 fn origin() -> TrustedOrigin {
     TrustedOrigin::authenticated("tenant", "source", None).unwrap()
 }

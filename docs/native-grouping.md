@@ -99,6 +99,11 @@ together. Busy-slot waiters do not occupy handler concurrency. Accepted runnable
 cold-slot and exempt work can pass a hot-slot backlog; work not yet accepted can
 still face ordinary finite-buffer backpressure. No state grows per historical key.
 
+A handler sending recursively to its own full slot backlog also backpressures:
+waiting work cannot run until that handler releases the slot. Bound or cancel
+that send instead of waiting indefinitely; an abandoned pending send enqueues
+nothing, and shutdown closes waiting admission while draining accepted jobs.
+
 Pause retains accepted work without starting new handlers. Shutdown closes
 admission and drains accepted buffered work even when paused, including sends
 through previously approved permits. Completion requires receiver exhaustion,

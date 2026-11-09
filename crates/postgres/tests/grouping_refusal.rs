@@ -21,6 +21,11 @@ impl WireMessage for Work {
 #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
 async fn direct_admission_refuses_before_any_custody_write_and_poisons_scope(pool: PgPool) {
     let original = Envelope::encode(&Work).unwrap();
+    let request = original
+        .clone()
+        .with_header("reply-endpoint".into(), "replies".into())
+        .unwrap();
+    let allowed = [raddle::SubscriptionName::try_new("replies").unwrap()];
     let now = Utc::now();
     for group in [None, Some(GroupId::new("")), Some(GroupId::new("g"))] {
         let envelope = original
@@ -60,7 +65,7 @@ async fn direct_admission_refuses_before_any_custody_write_and_poisons_scope(poo
                 }
                 4 => {
                     scope
-                        .reply("tenant", &original, envelope.clone(), &[], now)
+                        .reply("tenant", &request, envelope.clone(), &allowed, now)
                         .await
                 }
                 5 => scope
@@ -78,6 +83,14 @@ async fn direct_admission_refuses_before_any_custody_write_and_poisons_scope(poo
                     .map_err(|_| Error::Invalid("event refusal")),
             };
             assert!(result.is_err());
+            if operation == 4 {
+                assert!(matches!(
+                    result,
+                    Err(Error::Wire(raddle::wire::WireError::Invalid(
+                        "native dispatch is unsupported by this profile"
+                    )))
+                ));
+            }
             for table in [
                 "raddle_jobs",
                 "raddle_idempotency",
@@ -95,4 +108,18 @@ async fn direct_admission_refuses_before_any_custody_write_and_poisons_scope(poo
             assert!(matches!(scope.commit(now).await, Err(Error::RollbackOnly)));
         }
     }
+    // The same authorized request and allowlist admit a legacy response.
+    let mut scope = Scope::enroll(pool.begin().await.unwrap());
+    scope
+        .reply("tenant", &request, original, &allowed, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM raddle_jobs")
+            .fetch_one(scope.connection())
+            .await
+            .unwrap(),
+        1
+    );
+    scope.commit(now).await.unwrap();
 }

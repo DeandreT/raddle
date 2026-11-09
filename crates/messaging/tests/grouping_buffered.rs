@@ -87,6 +87,100 @@ async fn next<T>(receiver: &mut mpsc::Receiver<T>) -> T {
         .unwrap()
 }
 
+#[tokio::test(start_paused = true)]
+async fn reentrant_send_to_full_same_slot_backlog_backpressures_then_cancels_or_closes_cleanly() {
+    for close in [false, true] {
+        let slots = SlotSet::new("reentrant", 1).unwrap();
+        let (queue, runner) = LocalQueue::partitioned(settings(1, 2), slots.clone()).unwrap();
+        let observed = queue.clone();
+        let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+        builder.local("orders", queue).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let gate = Arc::new(Semaphore::new(0));
+        let held = gate.clone();
+        builder
+            .handle::<Work, _, _>("orders", move |work, context| {
+                let tx = tx.clone();
+                let gate = held.clone();
+                async move {
+                    tx.send(work.id).await.unwrap();
+                    if work.id == 1 {
+                        gate.acquire().await.unwrap().forget();
+                        let bus = context.bus().unwrap();
+                        let child = Work { id: 99, key: None };
+                        let mut send = Box::pin(bus.send_to("orders", &child, origin()));
+                        // Actually poll admission with a full waiting budget, rather
+                        // than inferring backpressure from a missing completion.
+                        assert!(futures_util::poll!(send.as_mut()).is_pending());
+                        tx.send(10).await.unwrap();
+                        if close {
+                            assert!(matches!(
+                                tokio::time::timeout(Duration::from_secs(2), send)
+                                    .await
+                                    .unwrap(),
+                                Err(raddle_messaging::BusError::Queue(
+                                    raddle_messaging::QueueError::Closed
+                                ))
+                            ));
+                        } else {
+                            assert!(
+                                tokio::time::timeout(Duration::from_millis(50), send)
+                                    .await
+                                    .is_err()
+                            );
+                        }
+                        tx.send(11).await.unwrap();
+                    }
+                    Ok(())
+                }
+            })
+            .unwrap();
+        let bus = builder.build();
+        let mut host = Host::new(Duration::from_secs(5)).unwrap();
+        runner.attach(&mut host, "orders").unwrap();
+        let shutdown = host.handle();
+        let task = tokio::spawn(host.run());
+        bus.send_to("orders", &Work { id: 1, key: None }, origin())
+            .await
+            .unwrap();
+        assert_eq!(next(&mut rx).await, 1);
+        bus.send_to("orders", &Work { id: 2, key: None }, origin())
+            .await
+            .unwrap();
+        assert_eq!(observed.snapshot().buffered, 1);
+        gate.add_permits(1);
+        assert_eq!(next(&mut rx).await, 10);
+        assert_eq!(observed.snapshot().active, 1);
+        assert_eq!(observed.snapshot().buffered, 1);
+        if close {
+            shutdown.shutdown();
+        }
+        assert_eq!(next(&mut rx).await, 11);
+        assert_eq!(next(&mut rx).await, 2);
+        if !close {
+            // A cancelled, never-admitted recursive child must neither execute
+            // later nor leak the waiting reservation needed by this new sender.
+            bus.send_to("orders", &Work { id: 3, key: None }, origin())
+                .await
+                .unwrap();
+            assert_eq!(next(&mut rx).await, 3);
+            shutdown.shutdown();
+        }
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(observed.snapshot().completed, if close { 2 } else { 3 });
+        assert_eq!(observed.snapshot().failed, 0);
+        assert_eq!(observed.snapshot().cancelled, 0);
+        assert_eq!(observed.snapshot().active, 0);
+        assert_eq!(observed.snapshot().buffered, 0);
+        assert!(slots.try_reserve(0).is_some());
+    }
+}
+
 #[tokio::test]
 async fn send_publish_direct_receive_share_slots_and_exemptions_overlap() {
     let slots = SlotSet::new("orders", 7).unwrap();

@@ -53,6 +53,182 @@ impl raddle_messaging::scoped::ScopedHandler<Work> for Scoped {
     }
 }
 
+struct AdapterReply(Envelope, Arc<AtomicUsize>);
+static RESPONSE_DECODES: AtomicUsize = AtomicUsize::new(0);
+#[derive(Serialize)]
+struct AdapterAnswer;
+impl<'de> Deserialize<'de> for AdapterAnswer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        RESPONSE_DECODES.fetch_add(1, Ordering::SeqCst);
+        <()>::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+impl WireMessage for AdapterAnswer {
+    const NAME: &'static str = "group.adapter-answer";
+    const VERSION: u32 = 1;
+}
+#[derive(Serialize, Deserialize)]
+struct AdapterCall;
+impl WireMessage for AdapterCall {
+    const NAME: &'static str = "group.adapter-call";
+    const VERSION: u32 = 1;
+}
+impl raddle::Request for AdapterCall {
+    type Reply = AdapterAnswer;
+    type Error = std::convert::Infallible;
+}
+impl raddle_messaging::RemoteInvoker for AdapterReply {
+    fn request<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a MessageContext,
+        _: &'a str,
+    ) -> raddle_messaging::BoxFuture<'a, Result<Envelope, BusError>> {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(self.0.clone()) })
+    }
+}
+
+#[tokio::test]
+async fn custom_rpc_adapter_replies_refuse_all_dispatch_forms_before_typed_decode() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    for dispatch in [
+        None,
+        Some(Dispatch::resolved(None, None)),
+        Some(Dispatch::resolved(Some(GroupId::new("")), None)),
+        Some(Dispatch::resolved(Some(GroupId::new("g")), None)),
+        Some(Dispatch::resolved(None, Some("key".into()))),
+    ] {
+        let mut reply = Envelope::encode(&AdapterAnswer).unwrap();
+        if let Some(dispatch) = dispatch.clone() {
+            reply = reply.with_dispatch(dispatch).unwrap();
+        }
+        let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+        builder.remote("peer", Publisher(calls.clone())).unwrap();
+        builder.route::<AdapterCall>("peer").unwrap();
+        builder.remote_invoker(Arc::new(AdapterReply(reply, calls.clone())), true);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            builder.build().invoke(AdapterCall, origin()),
+        )
+        .await
+        .unwrap();
+        if dispatch.is_some() {
+            assert!(matches!(
+                result,
+                Err(raddle_messaging::InvokeError::Bus(BusError::Wire(
+                    raddle::wire::WireError::Invalid(
+                        "native dispatch is unsupported by this profile"
+                    )
+                )))
+            ));
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(RESPONSE_DECODES.load(Ordering::SeqCst), 1);
+    }
+    // Only the custom adapter ran, never its publication transport.
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn direct_only_partitioned_handler_refuses_invoke_and_scoped_but_send_to_owns_slots() {
+    use raddle_host::Host;
+    use tokio::sync::{Semaphore, mpsc};
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let called = callbacks.clone();
+    let mut runtime = RuntimeBuilder::default();
+    runtime
+        .handle(move |_: Work| {
+            called.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Work) }
+        })
+        .unwrap();
+    let slots = SlotSet::new("direct", 1).unwrap();
+    let (queue, runner) = LocalQueue::partitioned(
+        QueueSettings {
+            mode: QueueMode::Buffered,
+            capacity: 2,
+            parallelism: 2,
+        },
+        slots.clone(),
+    )
+    .unwrap();
+    let observed = queue.clone();
+    let mut builder = BusBuilder::new(runtime.build());
+    builder.local("direct", queue).unwrap();
+    let gate = Arc::new(Semaphore::new(0));
+    let held = gate.clone();
+    let (tx, mut rx) = mpsc::channel(2);
+    builder
+        .handle::<Work, _, _>("direct", move |_, _| {
+            let tx = tx.clone();
+            let gate = held.clone();
+            let slots = slots.clone();
+            async move {
+                assert!(slots.try_reserve(0).is_none(), "handler must own its slot");
+                tx.send(()).await.unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(())
+            }
+        })
+        .unwrap();
+    let bus = builder.build();
+    let explanation = bus.explain::<Work>().unwrap();
+    assert!(explanation.routes.is_empty());
+    assert!(explanation.invocation.is_empty());
+    let mut host = Host::new(Duration::from_secs(5)).unwrap();
+    runner.attach(&mut host, "direct").unwrap();
+    let shutdown = host.handle();
+    let task = tokio::spawn(host.run());
+    bus.send_to("direct", &Work, origin()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        bus.invoke(Work, origin()).await,
+        Err(raddle_messaging::InvokeError::Bus(BusError::Invalid(
+            "grouped contracts require buffered Send/Publish execution"
+        )))
+    ));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
+        .unwrap();
+    pool.close().await;
+    assert!(matches!(
+        bus.execute::<Work, _>(
+            Arc::new(Scoped(callbacks.clone())),
+            MessageContext::new(origin(), Envelope::encode(&Work).unwrap(), Utc::now()),
+            raddle_postgres::Store::new(pool),
+            Arc::new(raddle_messaging::scoped::LocalOnlyFlush),
+        )
+        .await,
+        Err(raddle_messaging::scoped::Failure::Wire(_))
+    ));
+    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+    bus.send_to("direct", &Work, origin()).await.unwrap();
+    assert_eq!(observed.snapshot().active, 1);
+    assert_eq!(observed.snapshot().buffered, 1);
+    assert!(rx.try_recv().is_err());
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    gate.add_permits(1);
+    shutdown.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.snapshot().completed, 2);
+    assert_eq!(observed.snapshot().active, 0);
+    assert_eq!(observed.snapshot().buffered, 0);
+}
+
 #[tokio::test]
 async fn direct_scoped_execution_and_rpc_refuse_before_factory_waiter_or_publication() {
     use raddle_messaging::{RemoteInvoker, RemoteResponder, ReplyHubInvoker};
