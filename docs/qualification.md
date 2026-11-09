@@ -51,9 +51,10 @@ own compilation lease must not be wrapped in a second copy of that lease.
 
 The normal workspace suite covers typed runtime behavior, independent fan-out,
 cancellation, wire framing/upcasting, HTTP schema contracts, and real-file SQLite
-transactions. PostgreSQL tests require an explicitly selected disposable server
-with database-create permission. They allocate isolated databases and cover
-transaction rollback, concurrent claims, process exits, upgrades from the
+transactions. Unignored Axum PostgreSQL tests run in the normal suite, so supply
+`DATABASE_URL` for an explicitly selected disposable server with database-create
+permission even without `--ignored`. PostgreSQL tests allocate isolated databases
+and cover transaction rollback, concurrent claims, process exits, upgrades from the
 initial schema, saga state, and request/reply races.
 
 Do not run the same SQLx PostgreSQL test concurrently from different checkouts
@@ -108,11 +109,61 @@ these reusable instructions.
 Verify the publishable package archives as well as the workspace checkout:
 
 ```sh
-cargo package --workspace --exclude raddle-servicebus --locked
+cargo +1.95.0 package --workspace --exclude raddle-servicebus --locked \
+  --target-dir "$FRESH_PACKAGE_TARGET"
 ```
 
-This creates and builds local archives; it does not upload them. Check that each
-archive includes its package README, license, and required migration files.
+Use the pinned toolchain explicitly when running outside the checkout, where
+`rust-toolchain.toml` does not select it. Start from a clean committed head and a
+new head-specific package target, including its temporary registry. Cargo treats
+registry package versions as immutable; reusing staging for a different source
+head with the same version can select stale internal dependencies. Do not clear
+shared Cargo caches to achieve this isolation.
+
+This creates and builds local archives; it does not upload them. Inspect each
+`.crate` archive, not an existing extracted directory. Verify that
+`.cargo_vcs_info.json` names the exact committed head without a dirty flag,
+compare the license bytes with the source license, and check the README, declared
+targets and required protocol or migration files. Compare archived source content
+with that revision and record archive digests and actual command exits outside
+the repository. Packaging's library build does not compile every test target.
+
+### Isolated HTTP archive tests
+
+Extract verified archives into a fresh fixture outside any source checkout. Use
+their normalized `Cargo.toml` files, not `Cargo.toml.orig`. If internal packages
+are not published, a temporary root workspace with `[patch.crates-io]` entries
+may resolve them only to other extracted archives verified against the same
+head. Do not point dependencies at a source checkout or recreate sibling source
+directories. Check dependency metadata to confirm that every internal package
+comes from the verified fixture.
+
+Prepare the fixture's lock resolution before using `--locked`; when starting
+with the packaged lockfile, `cargo +1.95.0 update --offline --workspace` can adjust
+internal package sources without updating external dependencies. Record any
+resolution or toolchain failure separately from test compilation failures. Use
+a separate fresh target for each fixture, then run from its workspace root:
+
+```sh
+cargo +1.95.0 test -p raddle-axum --all-targets --no-run --locked \
+  --target-dir "$FRESH_FIXTURE_TARGET"
+# Supply DATABASE_URL securely for an explicitly selected disposable PostgreSQL
+# server with database-create permission before executing the tests.
+cargo +1.95.0 test -p raddle-axum --all-targets --locked \
+  --target-dir "$FRESH_FIXTURE_TARGET" -- --include-ignored --test-threads=1
+```
+
+Storage owns the checksummed migrations: they belong in the `raddle-postgres`
+archive and are embedded by its public `Store::migrate` method. HTTP SQLx replay
+fixtures use `#[sqlx::test(migrations = false)]` and explicitly call that migrator
+before creating application tables or accessing storage. Do not copy migrations
+into the HTTP archive or depend on `../postgres/migrations`. Keep the tests'
+activation unchanged; unignored database tests also require `DATABASE_URL`.
+Serialize the entire runtime against other checkouts using the same server, as
+described above. Exercise replay, compensation, cancellation, process-crash
+boundaries and successful-neighbor/failed-only retry assertions from the archives,
+not just from the checkout.
+
 Examples marked as test targets are also exercised by the workspace test suite;
 the PostgreSQL walkthrough additionally needs the isolated database gate.
 

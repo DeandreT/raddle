@@ -6,9 +6,10 @@ use raddle_postgres::http_responses::{self, ClaimResult, ResponseKey};
 use raddle_postgres::{Error, Store};
 use sqlx::PgPool;
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn failed_business_open_releases_only_the_confirmed_prebusiness_claim(pool: PgPool) {
     let store = Store::new(pool.clone());
+    store.migrate().await.unwrap();
     let key = ResponseKey::new(None, None, Some("opening"), "retry").unwrap();
     let mut scope = store.begin().await.unwrap();
     let claim = match http_responses::claim(&mut scope, &key, &[0; 32], Utc::now())
