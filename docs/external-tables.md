@@ -139,6 +139,13 @@ ordinary external-table handler-to-DLQ/replay path.
 failed occurrences inside the listener's bound tenant/source. The application must
 separately authorize private payload access and operator actions. Pass one occurrence
 to `replay_quarantined`, with an optional bounded `Correction`, actor and reason.
+Recovery projections also enforce the listener's **current** body and alias limits,
+including snapshots written with larger limits before a restart. Search returns
+bounded metadata with `snapshot_available = false` when a complete snapshot cannot
+be returned; the stored original is not truncated or changed. Replay without a
+correction returns `Unavailable` for that item and leaves it unresolved. An explicit
+small correction selects no old snapshot body/alias and can proceed under the normal
+identity, audit and admission checks without raising the transfer limits.
 Known type resolution, protected-frame checks and canonical validation still apply.
 The original UUID and persisted first-observation time remain stable.
 

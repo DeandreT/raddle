@@ -153,7 +153,7 @@ impl Listener {
         now: DateTime<Utc>,
     ) -> Result<bool, Error> {
         let mut tx = connection.begin().await?;
-        let Some(input) = self.select(&mut tx, id).await? else {
+        let Some(input) = self.select_metadata(&mut tx, id).await? else {
             return Ok(false);
         };
         self.observe(&mut tx, &input, now).await?;

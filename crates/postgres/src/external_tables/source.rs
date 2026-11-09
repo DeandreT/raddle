@@ -129,6 +129,23 @@ impl Listener {
         connection: &mut PgConnection,
         id: Uuid,
     ) -> Result<Option<Input>, Error> {
+        self.select_inner(connection, id, true).await
+    }
+
+    pub(super) async fn select_metadata(
+        &self,
+        connection: &mut PgConnection,
+        id: Uuid,
+    ) -> Result<Option<Input>, Error> {
+        self.select_inner(connection, id, false).await
+    }
+
+    async fn select_inner(
+        &self,
+        connection: &mut PgConnection,
+        id: Uuid,
+        include_payload: bool,
+    ) -> Result<Option<Input>, Error> {
         let c = &self.config;
         let body = quote(&c.body_column)?;
         let alias = match &c.alias_column {
@@ -137,7 +154,7 @@ impl Listener {
         };
         let time = quote(&c.timestamp_column)?;
         let sql = format!(
-            "SELECT {key} AS id,sha256(convert_to(jsonb_build_array({key},{body} IS NULL,{body},{alias},{time}::text)::text,'UTF8')) AS fingerprint,sha256(convert_to(jsonb_build_array({body} IS NULL,{body},{alias})::text,'UTF8')) AS content_hash, CASE WHEN octet_length(convert_to({body}::text,'UTF8'))<=$2 THEN {body}::text END AS body, CASE WHEN octet_length(convert_to({alias},'UTF8'))<=$3 THEN {alias} END AS alias,octet_length(convert_to({body}::text,'UTF8'))::bigint AS body_bytes,octet_length(convert_to({alias},'UTF8'))::bigint AS alias_bytes,left({time}::text,64) AS diagnostic_time FROM {table} WHERE {key}=$1 FOR UPDATE SKIP LOCKED",
+            "SELECT {key} AS id,sha256(convert_to(jsonb_build_array({key},{body} IS NULL,{body},{alias},{time}::text)::text,'UTF8')) AS fingerprint,sha256(convert_to(jsonb_build_array({body} IS NULL,{body},{alias})::text,'UTF8')) AS content_hash, CASE WHEN $4::boolean AND octet_length(convert_to({body}::text,'UTF8'))<=$2 THEN {body}::text END AS body, CASE WHEN $4::boolean AND octet_length(convert_to({alias},'UTF8'))<=$3 THEN {alias} END AS alias,octet_length(convert_to({body}::text,'UTF8'))::bigint AS body_bytes,octet_length(convert_to({alias},'UTF8'))::bigint AS alias_bytes,left({time}::text,64) AS diagnostic_time FROM {table} WHERE {key}=$1 FOR UPDATE SKIP LOCKED",
             key = quote(&c.id_column)?,
             table = c.qualified()?
         );
@@ -145,6 +162,7 @@ impl Listener {
             .bind(id)
             .bind(i64::from(self.options.body_bytes))
             .bind(i64::from(self.options.alias_bytes))
+            .bind(include_payload)
             .fetch_optional(connection)
             .await?;
         row.map(|r| {

@@ -21,9 +21,10 @@ pub struct QuarantinedInput {
     pub diagnostic_time: Option<String>,
     /// Bounded classification, never a formatted application error.
     pub code: String,
-    /// Complete bounded stored JSON text, or none for an in-place source reference.
+    /// Complete stored JSON text within the current body budget; none for SQL null,
+    /// an in-place reference, or a snapshot exceeding the current budget.
     pub body: Option<String>,
-    /// Complete bounded original alias, or none for null/in-place source references.
+    /// Complete original alias within the current alias budget; otherwise none.
     pub alias: Option<String>,
     /// Original full stored-value fingerprint, not original producer JSON bytes.
     pub fingerprint: Vec<u8>,
@@ -33,6 +34,10 @@ pub struct QuarantinedInput {
     pub alias_bytes: Option<i64>,
     /// The complete original remains at source; it has not been deleted/acknowledged.
     pub source_retained: bool,
+    /// The complete stored snapshot fits both current transfer budgets and is not
+    /// an in-place reference. False leaves the original evidence untouched and
+    /// requires an explicit bounded correction for replay.
+    pub snapshot_available: bool,
 }
 
 /// Bounded failed-only page. Payload access needs independent application authorization.
@@ -64,6 +69,9 @@ pub enum ReplayOutcome {
     AlreadyResolved,
     /// No such occurrence exists within the bound tenant/source.
     NotFound,
+    /// The failed original is a reference or exceeds current transfer budgets.
+    /// Nothing was admitted/resolved; supply an explicit bounded correction.
+    Unavailable,
 }
 
 impl Listener {
@@ -124,15 +132,16 @@ impl Listener {
             let mut connection=connection::acquire(&self.store.pool,&self.options).await?;
             let mut tx=connection.begin().await?;
             sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
-            let rows=sqlx::query("SELECT sequence,input_id,first_seen,diagnostic_time,code,body,alias,fingerprint,body_bytes,alias_bytes,source_retained FROM raddle_external_inputs WHERE tenant=$1 AND source=$2 AND status='quarantined' AND sequence>$3 ORDER BY sequence LIMIT $4")
-                .bind(&self.config.tenant).bind(&self.config.source).bind(after).bind(i64::from(limit)).fetch_all(&mut *tx).await?;
+            let rows=sqlx::query("SELECT sequence,input_id,first_seen,diagnostic_time,code,CASE WHEN octet_length(convert_to(body,'UTF8'))<=$5 THEN body END AS body,CASE WHEN octet_length(convert_to(alias,'UTF8'))<=$6 THEN alias END AS alias,fingerprint,body_bytes,alias_bytes,source_retained,(NOT source_retained AND coalesce(octet_length(convert_to(body,'UTF8')),0)<=$5 AND coalesce(octet_length(convert_to(alias,'UTF8')),0)<=$6) AS snapshot_available FROM raddle_external_inputs WHERE tenant=$1 AND source=$2 AND status='quarantined' AND sequence>$3 ORDER BY sequence LIMIT $4")
+                .bind(&self.config.tenant).bind(&self.config.source).bind(after).bind(i64::from(limit))
+                .bind(i64::from(self.options.body_bytes)).bind(i64::from(self.options.alias_bytes)).fetch_all(&mut *tx).await?;
             let mut items=Vec::with_capacity(rows.len());
             let mut cursor=after;
             for row in rows {
                 cursor=row.try_get("sequence")?;
                 items.push(QuarantinedInput { sequence:cursor,input_id:row.try_get("input_id")?,first_seen:row.try_get("first_seen")?,diagnostic_time:row.try_get("diagnostic_time")?,code:row.try_get("code")?,
                     body:row.try_get("body")?,alias:row.try_get("alias")?,fingerprint:row.try_get("fingerprint")?,
-                    body_bytes:row.try_get("body_bytes")?,alias_bytes:row.try_get("alias_bytes")?,source_retained:row.try_get("source_retained")? });
+                    body_bytes:row.try_get("body_bytes")?,alias_bytes:row.try_get("alias_bytes")?,source_retained:row.try_get("source_retained")?,snapshot_available:row.try_get("snapshot_available")? });
             }
             let more:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM raddle_external_inputs WHERE tenant=$1 AND source=$2 AND status='quarantined' AND sequence>$3)")
                 .bind(&self.config.tenant).bind(&self.config.source).bind(cursor).fetch_one(&mut *tx).await?;
@@ -195,8 +204,9 @@ impl Listener {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<ReplayOutcome, Error> {
-        let row=sqlx::query("SELECT input_id,fingerprint,content_hash,first_seen,status,body,alias,body_bytes,alias_bytes,source_retained FROM raddle_external_inputs WHERE tenant=$1 AND source=$2 AND sequence=$3 FOR UPDATE")
-            .bind(&self.config.tenant).bind(&self.config.source).bind(sequence).fetch_optional(scope.connection()).await?;
+        let row=sqlx::query("SELECT input_id,fingerprint,content_hash,first_seen,status,CASE WHEN $4::boolean AND status='quarantined' AND octet_length(convert_to(body,'UTF8'))<=$5 THEN body END AS body,CASE WHEN $4::boolean AND status='quarantined' AND octet_length(convert_to(alias,'UTF8'))<=$6 THEN alias END AS alias,body_bytes,alias_bytes,source_retained,(NOT source_retained AND coalesce(octet_length(convert_to(body,'UTF8')),0)<=$5 AND coalesce(octet_length(convert_to(alias,'UTF8')),0)<=$6) AS snapshot_available FROM raddle_external_inputs WHERE tenant=$1 AND source=$2 AND sequence=$3 FOR UPDATE")
+            .bind(&self.config.tenant).bind(&self.config.source).bind(sequence).bind(correction.is_none())
+            .bind(i64::from(self.options.body_bytes)).bind(i64::from(self.options.alias_bytes)).fetch_optional(scope.connection()).await?;
         let Some(row) = row else {
             return Ok(ReplayOutcome::NotFound);
         };
@@ -214,12 +224,15 @@ impl Listener {
         let id: Uuid = row.try_get("input_id")?;
         let fingerprint: Vec<u8> = row.try_get("fingerprint")?;
         if row.try_get::<bool, _>("source_retained")? {
-            let Some(original) = self.select(scope.connection(), id).await? else {
+            let Some(original) = self.select_metadata(scope.connection(), id).await? else {
                 return Err(Error::Conflict);
             };
             if original.fingerprint != fingerprint {
                 return Err(Error::Conflict);
             }
+        }
+        if correction.is_none() && !row.try_get::<bool, _>("snapshot_available")? {
+            return Ok(ReplayOutcome::Unavailable);
         }
         let (body, alias) = match correction {
             Some(c) => (Some(c.body.clone()), c.alias.clone()),

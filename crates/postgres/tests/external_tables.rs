@@ -11,6 +11,8 @@ mod failures;
 mod projection;
 #[path = "external_tables/recovery.rs"]
 mod recovery;
+#[path = "external_tables/recovery_bounds.rs"]
+mod recovery_bounds;
 #[path = "external_tables/redelivery.rs"]
 mod redelivery;
 #[path = "external_tables/registry.rs"]
