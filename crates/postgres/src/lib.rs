@@ -6,6 +6,7 @@ mod dead_letters;
 pub mod endpoint_policies;
 mod error;
 pub mod events;
+pub mod external_tables;
 pub mod http_responses;
 mod job;
 pub mod operations;
