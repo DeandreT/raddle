@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 
+use crate::clock::Clock;
 use crate::execution::Execution;
 use crate::{Claim, Delivery, Error};
 
@@ -43,6 +44,36 @@ pub struct Scope<'connection> {
     poisoned: bool,
     claim: Option<Claim>,
 }
+
+// A caller may drop only the borrowed staging future and retain this Scope.
+// Poison before that borrow is released unless the complete fan-out succeeded.
+struct StagingOperation<'scope, 'connection> {
+    scope: &'scope mut Scope<'connection>,
+    success: bool,
+}
+
+impl<'scope, 'connection> StagingOperation<'scope, 'connection> {
+    fn new(scope: &'scope mut Scope<'connection>) -> Self {
+        Self {
+            scope,
+            success: false,
+        }
+    }
+
+    fn finish<T>(mut self, result: Result<T, Error>) -> Result<T, Error> {
+        self.success = result.is_ok();
+        result
+    }
+}
+
+impl Drop for StagingOperation<'_, '_> {
+    fn drop(&mut self) {
+        if !self.success {
+            self.scope.mark_rollback_only();
+        }
+    }
+}
+
 impl<'connection> Scope<'connection> {
     /// Enrolls an existing transaction. Prefer `BEGIN IMMEDIATE` for read/write operations.
     pub fn enroll(transaction: Transaction<'connection, Sqlite>) -> Self {
@@ -97,6 +128,7 @@ impl<'connection> Scope<'connection> {
     }
 
     /// Stages all local/remote destinations atomically with application writes.
+    /// A failed or cancelled borrowed staging operation makes this scope rollback-only.
     pub async fn stage(
         &mut self,
         source: &str,
@@ -107,11 +139,12 @@ impl<'connection> Scope<'connection> {
         if self.poisoned {
             return Err(Error::RollbackOnly);
         }
-        let result = self.stage_inner(source, tenant, envelope, deliveries).await;
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
+        let operation = StagingOperation::new(self);
+        let result = operation
+            .scope
+            .stage_inner(source, tenant, envelope, deliveries)
+            .await;
+        operation.finish(result)
     }
     async fn stage_inner(
         &mut self,
@@ -191,13 +224,20 @@ impl<'connection> Scope<'connection> {
     }
     /// Commits application writes, messages, and optional inbox completion together.
     pub async fn commit(mut self, now: DateTime<Utc>) -> Result<(), Error> {
+        let clock = Clock::new(now);
         if self.poisoned {
             self.transaction.rollback().await?;
             return Err(Error::RollbackOnly);
         }
         if let Some(claim) = &self.claim {
-            let result=sqlx::query("UPDATE raddle_jobs SET status='completed',completed_at=?,lease_until=NULL WHERE id=? AND generation=? AND status='active'")
-                .bind(now.timestamp_millis()).bind(&claim.id).bind(claim.generation).execute(self.transaction.connection()).await?;
+            // Flush any previously queued SQLite operation before sampling time.
+            // The execution already holds the single-writer transaction.
+            sqlx::query("SELECT 1")
+                .execute(self.transaction.connection())
+                .await?;
+            let now = clock.now()?;
+            let result=sqlx::query("UPDATE raddle_jobs SET status='completed',completed_at=?,lease_until=NULL WHERE id=? AND generation=? AND status='active' AND lease_until>?")
+                .bind(now).bind(&claim.id).bind(claim.generation).bind(now).execute(self.transaction.connection()).await?;
             if result.rows_affected() != 1 {
                 self.transaction.rollback().await?;
                 return Err(Error::StaleClaim);

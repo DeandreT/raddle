@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -7,7 +7,7 @@ use chrono::Utc;
 use raddle::transport::{Transport, TransportError};
 use raddle::wire::{Codecs, Envelope, WireMessage};
 
-use crate::{DeliveryKind, Error, FailureDisposition, Scope, Store};
+use crate::{Claim, DeliveryKind, Error, FailureDisposition, Scope, Store};
 
 /// A borrowed transactional handler, boxed at registration only.
 pub type HandlerFuture<'scope> =
@@ -67,15 +67,26 @@ impl Worker {
         );
         Ok(())
     }
-    /// Executes at most one local job. The deadline interrupts SQLite VM work.
+    /// Observes at most one claim from registered destination queues only.
+    /// Other destinations, including their expiry sweep, remain untouched. Workers
+    /// sharing one destination must register its complete contract set. Ownership
+    /// loss stays local; other errors propagate. `true` does not imply success.
+    ///
+    /// The deadline interrupts SQLite VM work.
     /// Dropping the future interrupts in-flight SQL and closes its connection,
     /// rolling back writes; the claim remains recoverable after lease expiry.
     pub async fn run_once(&self) -> Result<bool, Error> {
+        let destinations = self
+            .handlers
+            .keys()
+            .map(|(destination, _)| destination.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let Some(claim) = self
             .store
-            .claim(
-                DeliveryKind::Local,
-                1,
+            .claim_registered(
+                &destinations,
                 self.timeout + Duration::from_secs(5),
                 Utc::now(),
             )
@@ -84,13 +95,17 @@ impl Worker {
         else {
             return Ok(false);
         };
+        observed(self.process(claim).await)
+    }
+
+    async fn process(&self, claim: Claim) -> Result<(), Error> {
         let envelope = match claim.envelope() {
             Ok(value) => value,
             Err(_) => {
                 self.store
                     .fail(&claim, FailureDisposition::Reject, Utc::now())
                     .await?;
-                return Ok(true);
+                return Ok(());
             }
         };
         let Some(handler) = self.handlers.get(&(
@@ -100,7 +115,7 @@ impl Worker {
             self.store
                 .fail(&claim, FailureDisposition::Reject, Utc::now())
                 .await?;
-            return Ok(true);
+            return Ok(());
         };
         let mut scope = self
             .store
@@ -128,7 +143,7 @@ impl Worker {
                     .await?;
             }
         }
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -158,6 +173,8 @@ impl<T: Transport> OutboxWorker<T> {
     }
 
     /// Publishes at most one due message and preserves its identity across retries.
+    /// `true` reports an observed claim, including ownership loss. A successor's
+    /// custody remains untouched; genuine database and configuration errors propagate.
     pub async fn run_once(&self) -> Result<bool, Error> {
         let Some(claim) = self
             .store
@@ -172,13 +189,17 @@ impl<T: Transport> OutboxWorker<T> {
         else {
             return Ok(false);
         };
+        observed(self.process(claim).await)
+    }
+
+    async fn process(&self, claim: Claim) -> Result<(), Error> {
         let envelope = match claim.envelope() {
             Ok(value) => value,
             Err(_) => {
                 self.store
                     .fail(&claim, FailureDisposition::Reject, Utc::now())
                     .await?;
-                return Ok(true);
+                return Ok(());
             }
         };
         match tokio::time::timeout(
@@ -202,6 +223,13 @@ impl<T: Transport> OutboxWorker<T> {
                     .await?
             }
         }
-        Ok(true)
+        Ok(())
+    }
+}
+
+fn observed(result: Result<(), Error>) -> Result<bool, Error> {
+    match result {
+        Ok(()) | Err(Error::StaleClaim) => Ok(true),
+        Err(error) => Err(error),
     }
 }

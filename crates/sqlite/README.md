@@ -21,6 +21,7 @@ reports `processed=false`. The example's fixed message identity and routing
 snapshot deliberately model redelivery; do not reuse them for different input.
 
 - [Backend guarantees and qualification](https://github.com/DeandreT/raddle/blob/main/docs/adapters.md)
+- [Staging, destination admission and lease boundaries](https://github.com/DeandreT/raddle/blob/main/docs/sqlite-custody.md)
 - [Source repository and Git dependency usage](https://github.com/DeandreT/raddle)
 
 MIT licensed. Source versions are not evidence of a registry release.
