@@ -23,7 +23,7 @@ use raddle_policies::{
 };
 use raddle_postgres::{Delivery, DeliveryKind, Error, JobStatus, RetryPolicy, Scope, Store};
 use sqlx::PgPool;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -339,12 +339,13 @@ fn policies(action: Action) -> EndpointPolicies {
 
 struct Running {
     queue: Option<PolicyQueue>,
+    release: Option<oneshot::Sender<()>>,
     stop: HostHandle,
     task: Option<JoinHandle<Result<(), HostError>>>,
     witness_stopped: Arc<AtomicBool>,
 }
 impl Running {
-    fn start(
+    fn prepare(
         owner: Owner,
         store: &Store,
         name: &str,
@@ -393,12 +394,42 @@ impl Running {
             }
         };
         let stop = host.handle();
+        let (release, start) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            // Accept the complete initial cohort before ANY Host polling. This
+            // is not a post-claim pause and cannot consume handling attempts.
+            tokio::time::timeout(Duration::from_secs(60), start)
+                .await
+                .map_err(|_| HostError::Invalid("test Host startup gate timed out"))?
+                .map_err(|_| HostError::Invalid("test Host startup gate closed"))?;
+            host.run().await
+        });
         Self {
             queue,
+            release: Some(release),
             stop,
-            task: Some(tokio::spawn(host.run())),
+            task: Some(task),
             witness_stopped,
         }
+    }
+    async fn start(&mut self, handler: &Handler) {
+        self.alive();
+        assert_eq!(handler.created.load(Ordering::SeqCst), 0);
+        assert!(handler.calls.lock().await.is_empty());
+        self.release.take().unwrap().send(()).unwrap();
+        // Actual typed handler progress, not an endpoint readiness notification,
+        // proves that the gate released the shipping receiving owner.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                self.alive();
+                if !handler.calls.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
     fn alive(&self) {
         assert!(!self.task.as_ref().unwrap().is_finished());
