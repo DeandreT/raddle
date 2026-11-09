@@ -326,6 +326,11 @@ where
                         post_commit,
                     })
                 }
+                // Scope::commit returns RollbackOnly only after its rollback
+                // succeeds; a rollback I/O failure returns Database instead.
+                Err(raddle_postgres::Error::RollbackOnly) => {
+                    Err(Failure::Database(raddle_postgres::Error::RollbackOnly))
+                }
                 Err(error) => Err(
                     if strict_rollback
                         && !known_commit_rejection(&error)

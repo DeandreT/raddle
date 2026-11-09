@@ -44,6 +44,16 @@ the heterogeneous registry boundary. The handler reports `Retry` or `Reject`;
 formatted domain errors are never persisted. A successful result commits the
 business transaction and inbox completion together.
 
+If a handler returns success after failed or cancelled staging poisoned its
+scope, `Scope::commit` rolls back and returns `RollbackOnly`. The worker records
+a bounded retry for that delivery and continues polling unrelated work. Raw
+`Scope::commit` still reports the error; a rollback or failure-settlement database
+error still propagates. Managed policy endpoints instead pass the confirmed abort
+as `Failure::Database(Error::RollbackOnly)` to their configured policies, including
+discard or dead-letter rules. They do not treat it as an uncertain commit or
+override replay authorization. A staging-time `RollbackOnly` alone is not proof
+of rollback: strict execution must finish rollback before applying those policies.
+
 A worker claims and expires work only for destinations registered through
 `handle` or `handle_saga`. An empty registry does not consume unrelated queues.
 Multiple workers sharing one destination must register its complete contract set;

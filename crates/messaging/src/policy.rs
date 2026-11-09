@@ -173,6 +173,7 @@ fn order_failure(error: &raddle_postgres::Error) -> bool {
         raddle_postgres::Error::Wire(_)
         | raddle_postgres::Error::Invalid(_)
         | raddle_postgres::Error::IdentityConflict
+        | raddle_postgres::Error::RollbackOnly
         | raddle_postgres::Error::Capacity => true,
         raddle_postgres::Error::Database(error) => error.as_database_error().is_some_and(|error| {
             error.code().is_some_and(|code| {
