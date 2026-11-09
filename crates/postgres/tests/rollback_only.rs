@@ -9,6 +9,7 @@ use std::sync::{
 use std::time::Duration;
 
 use chrono::Utc;
+use raddle::grouping::{Dispatch, GroupId};
 use raddle::wire::{Codecs, Envelope, WireMessage};
 use raddle_postgres::{
     Delivery, DeliveryKind, Error, JobStatus, RetryPolicy, Scope, Store, Worker,
@@ -29,6 +30,7 @@ impl WireMessage for Work {
 #[derive(Clone, Copy, Debug)]
 enum Poison {
     Invalid,
+    Dispatch { grouped: bool },
     CancelIdempotent,
     CancelBatch,
     LostConnection,
@@ -41,6 +43,7 @@ struct Handler {
     corrected: AtomicBool,
     calls: Mutex<BTreeMap<i32, usize>>,
     partial: AtomicUsize,
+    dispatch_refused: AtomicUsize,
 }
 impl Handler {
     fn new(pool: &PgPool, poison: Poison, victim: i32) -> Self {
@@ -51,9 +54,11 @@ impl Handler {
             corrected: AtomicBool::new(false),
             calls: Mutex::new(BTreeMap::new()),
             partial: AtomicUsize::new(0),
+            dispatch_refused: AtomicUsize::new(0),
         }
     }
     async fn apply(&self, work: Work, scope: &mut Scope<'static>) {
+        assert!(scope.envelope().unwrap().unwrap().dispatch().is_none());
         *self.calls.lock().unwrap().entry(work.0).or_default() += 1;
         sqlx::query("INSERT INTO business(id) VALUES($1)")
             .bind(work.0)
@@ -73,6 +78,27 @@ impl Handler {
             return;
         }
         match self.poison {
+            Poison::Dispatch { grouped } => {
+                let child = Envelope::encode(&Work(work.0 + 1000))
+                    .unwrap()
+                    .with_dispatch(Dispatch::resolved(
+                        grouped.then(|| GroupId::new("unsupported-child-group")),
+                        None,
+                    ))
+                    .unwrap();
+                child.validate(Default::default()).unwrap();
+                // Only the child has dispatch. Business/direct writes above have
+                // already succeeded with this valid source, tenant and delivery.
+                assert!(matches!(
+                    scope
+                        .stage("source", "tenant", &child, &[remote("unsupported-child")])
+                        .await,
+                    Err(Error::Wire(raddle::wire::WireError::Invalid(
+                        "native dispatch is unsupported by this profile"
+                    )))
+                ));
+                self.dispatch_refused.fetch_add(1, Ordering::SeqCst);
+            }
             Poison::CancelIdempotent | Poison::CancelBatch => self.cancel_stage(scope, &work).await,
             Poison::Invalid | Poison::LostConnection => {
                 assert!(matches!(
@@ -217,6 +243,29 @@ async fn effects(pool: &PgPool, expected: &[i32]) {
             .await
             .unwrap();
     assert_eq!(direct, expected.len() as i64);
+    let direct_envelopes: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT envelope FROM raddle_jobs WHERE destination='direct'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let mut direct_values = direct_envelopes
+        .iter()
+        .map(|bytes| {
+            Envelope::from_slice(bytes, Default::default())
+                .unwrap()
+                .decode::<Work>()
+                .unwrap()
+                .0
+        })
+        .collect::<Vec<_>>();
+    direct_values.sort_unstable();
+    assert_eq!(direct_values, expected);
+    let unsupported: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM raddle_jobs WHERE destination='unsupported-child'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(unsupported, 0);
     let partial: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM raddle_jobs WHERE destination IN ('partial-child','blocked-child')",
     )
@@ -230,21 +279,10 @@ async fn effects(pool: &PgPool, expected: &[i32]) {
     assert_eq!((partial, keys), (0, 0));
 }
 
-#[sqlx::test]
-#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-async fn poisoned_success_and_cancelled_inner_staging_retry_only_failed_first_middle_last(
-    pool: PgPool,
-) {
+async fn matrix(pool: PgPool, poisons: &[Poison]) {
     let store = setup(&pool).await;
     let mut expected = Vec::new();
-    for (mode, poison) in [
-        Poison::Invalid,
-        Poison::CancelIdempotent,
-        Poison::CancelBatch,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (mode, poison) in poisons.iter().copied().enumerate() {
         for position in 0..3 {
             let base = (mode * 100 + position * 10) as i32;
             let name = format!("rollback-{base}");
@@ -289,9 +327,15 @@ async fn poisoned_success_and_cancelled_inner_staging_retry_only_failed_first_mi
             expected.extend((base..base + 4).filter(|id| *id != handler.victim));
             expected.sort_unstable();
             effects(&pool, &expected).await;
-            if !matches!(poison, Poison::Invalid) {
+            if matches!(poison, Poison::CancelIdempotent | Poison::CancelBatch) {
                 assert_eq!(handler.partial.load(Ordering::SeqCst), 2);
             }
+            let refusals = if matches!(poison, Poison::Dispatch { .. }) {
+                2
+            } else {
+                0
+            };
+            assert_eq!(handler.dispatch_refused.load(Ordering::SeqCst), refusals);
             handler.corrected.store(true, Ordering::SeqCst);
             assert!(
                 store
@@ -319,8 +363,37 @@ async fn poisoned_success_and_cancelled_inner_staging_retry_only_failed_first_mi
             expected.push(handler.victim);
             expected.sort_unstable();
             effects(&pool, &expected).await;
+            assert_eq!(handler.dispatch_refused.load(Ordering::SeqCst), refusals);
         }
     }
+}
+
+#[sqlx::test]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn poisoned_success_and_cancelled_inner_staging_retry_only_failed_first_middle_last(
+    pool: PgPool,
+) {
+    matrix(
+        pool,
+        &[
+            Poison::Invalid,
+            Poison::CancelIdempotent,
+            Poison::CancelBatch,
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn swallowed_grouped_child_refusal_retries_only_failed_legacy_input(pool: PgPool) {
+    matrix(pool, &[Poison::Dispatch { grouped: true }]).await;
+}
+
+#[sqlx::test]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn swallowed_resolved_none_child_refusal_retries_only_failed_legacy_input(pool: PgPool) {
+    matrix(pool, &[Poison::Dispatch { grouped: false }]).await;
 }
 
 #[sqlx::test]

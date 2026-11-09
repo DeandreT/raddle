@@ -8,6 +8,7 @@ use std::sync::{
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use raddle::grouping::{Dispatch, GroupId};
 use raddle::wire::Envelope;
 use raddle_host::{Host, HostError, HostHandle, RestartPolicy};
 use raddle_messaging::effects::{Effect, HandlerOutput, Outgoing};
@@ -36,6 +37,7 @@ const GATE: i64 = 58002;
 #[derive(Clone, Copy, Debug)]
 enum Poison {
     Invalid,
+    Dispatch { grouped: bool },
     CancelIdempotent,
     CancelBatch,
     LostConnection,
@@ -54,6 +56,7 @@ struct Handler {
     corrected: AtomicBool,
     calls: Mutex<BTreeMap<i32, u64>>,
     partial: AtomicUsize,
+    dispatch_refused: AtomicUsize,
     created: AtomicUsize,
     rolled_back: AtomicUsize,
     uncertain: AtomicUsize,
@@ -74,6 +77,7 @@ impl Handler {
             corrected: AtomicBool::new(false),
             calls: Mutex::new(BTreeMap::new()),
             partial: AtomicUsize::new(0),
+            dispatch_refused: AtomicUsize::new(0),
             created: AtomicUsize::new(0),
             rolled_back: AtomicUsize::new(0),
             uncertain: AtomicUsize::new(0),
@@ -87,6 +91,31 @@ impl Handler {
     }
     async fn poison(&self, scope: &mut Scope<'static>, work: &Work) {
         match self.poison {
+            Poison::Dispatch { grouped } => {
+                let child = child(work.0 + 20000, false)
+                    .with_dispatch(Dispatch::resolved(
+                        grouped.then(|| GroupId::new("unsupported-child-group")),
+                        None,
+                    ))
+                    .unwrap();
+                child.validate(Default::default()).unwrap();
+                // The incoming root is legacy and its business/direct writes
+                // succeeded. Refusal must be this otherwise-valid child's guard.
+                assert!(matches!(
+                    scope
+                        .stage(
+                            "source",
+                            "tenant",
+                            &child,
+                            &[delivery(DeliveryKind::Remote, "unsupported-child")],
+                        )
+                        .await,
+                    Err(Error::Wire(raddle::wire::WireError::Invalid(
+                        "native dispatch is unsupported by this profile"
+                    )))
+                ));
+                self.dispatch_refused.fetch_add(1, Ordering::SeqCst);
+            }
             Poison::Invalid | Poison::LostConnection => {
                 assert!(matches!(
                     scope.stage("", "tenant", &child(work.0, false), &[]).await,
@@ -179,9 +208,10 @@ impl ScopedHandler<Work> for Handler {
         work: &'a Work,
         _: &'a mut (),
         scope: &'a mut Scope<'static>,
-        _: &'a MessageContext,
+        context: &'a MessageContext,
     ) -> BoxFuture<'a, Result<HandlerOutput<(), ()>, TypedFailure>> {
         Box::pin(async move {
+            assert!(context.envelope().dispatch().is_none());
             *self.calls.lock().await.entry(work.0).or_default() += 1;
             sqlx::query("INSERT INTO business(id) VALUES($1)")
                 .bind(work.0)
@@ -597,4 +627,10 @@ async fn effects(pool: &PgPool, base: i32, expected: &[i32], returned: bool) {
         .await
         .unwrap();
     assert_eq!((partial, keys), (0, 0));
+    let unsupported: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM raddle_jobs WHERE destination='unsupported-child'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(unsupported, 0);
 }

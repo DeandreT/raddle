@@ -53,6 +53,12 @@ async fn matrix(pool: PgPool, poison: Poison) {
                 assert_eq!(handler.rolled_back.load(Ordering::SeqCst), 2);
                 assert_eq!(handler.uncertain.load(Ordering::SeqCst), 0);
                 assert_eq!(running.attempts(&pool, ids[position]).await, 2);
+                let refusals = if matches!(poison, Poison::Dispatch { .. }) {
+                    2
+                } else {
+                    0
+                };
+                assert_eq!(handler.dispatch_refused.load(Ordering::SeqCst), refusals);
                 if matches!(poison, Poison::CancelIdempotent | Poison::CancelBatch) {
                     assert_eq!(handler.partial.load(Ordering::SeqCst), 2);
                 }
@@ -104,6 +110,7 @@ async fn matrix(pool: PgPool, poison: Poison) {
                 handler.assert_cleanup(6, 2, 4);
                 assert_eq!(flush.0.load(Ordering::SeqCst), 4);
                 effects(&pool, base, &(base..base + 4).collect::<Vec<_>>(), returned).await;
+                assert_eq!(handler.dispatch_refused.load(Ordering::SeqCst), refusals);
             }
         }
     }
@@ -129,6 +136,18 @@ async fn cancelled_multi_delivery_inner_stage_success_is_local_in_both_owners_an
     pool: PgPool,
 ) {
     matrix(pool, Poison::CancelBatch).await;
+}
+
+#[sqlx::test(migrations = "../postgres/migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn swallowed_grouped_child_refusal_obeys_typed_policy_in_both_owners(pool: PgPool) {
+    matrix(pool, Poison::Dispatch { grouped: true }).await;
+}
+
+#[sqlx::test(migrations = "../postgres/migrations")]
+#[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+async fn swallowed_resolved_none_child_refusal_obeys_typed_policy_in_both_owners(pool: PgPool) {
+    matrix(pool, Poison::Dispatch { grouped: false }).await;
 }
 
 #[sqlx::test(migrations = "../postgres/migrations")]
