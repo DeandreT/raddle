@@ -2,6 +2,8 @@
 
 See [native handler dispatch](handler-dispatch.md) for opt-in ordered classic
 composition, independent subscriptions and endpoint-specific sticky selections.
+See [declared routing sources](routing-sources.md) for opt-in publication source
+precedence, selectors, plaintext projections and shared delivery explanations.
 
 `raddle-messaging` is an explicit application layer above the low-level runtime.
 It does not change `Runtime::invoke`, `Runtime::publish`, or the caller-driven

@@ -182,6 +182,7 @@ async fn serve(api: &Api) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 async fn setup(pool: &PgPool) {
+    Store::new(pool.clone()).migrate().await.unwrap();
     sqlx::query(
         "CREATE TABLE http_business(tenant text NOT NULL,subject text NOT NULL,item text NOT NULL)",
     )
@@ -211,7 +212,7 @@ async fn send(
         .unwrap()
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn persisted_status_body_location_replays_after_restart_without_other_headers(pool: PgPool) {
     setup(&pool).await;
     for mode in [ReplayMode::SeparateClaim, ReplayMode::SameTransaction] {
@@ -304,7 +305,7 @@ fn api_builder_after_restart(store: Store, mode: ReplayMode, calls: Arc<AtomicUs
     api(store, mode, Write::<0>::new(calls))
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn concurrent_duplicates_failures_and_corrected_retry_only_repeat_failed_work(pool: PgPool) {
     setup(&pool).await;
     let client = reqwest::Client::new();
@@ -390,7 +391,7 @@ async fn concurrent_duplicates_failures_and_corrected_retry_only_repeat_failed_w
     assert_eq!(count, 20);
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn owned_process_crashes_before_and_after_commit_observe_explicit_boundaries(pool: PgPool) {
     setup(&pool).await;
     for (mode, stage, expected_status, expected_writes) in [
@@ -512,7 +513,7 @@ fn replay_crash_child() {
         });
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn confirmed_rollback_only_commit_failure_releases_key_without_repeating_neighbors(
     pool: PgPool,
 ) {
@@ -563,7 +564,7 @@ async fn confirmed_rollback_only_commit_failure_releases_key_without_repeating_n
     }
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn expired_rows_require_explicit_cleanup_and_optional_keys_still_commit_business_work(
     pool: PgPool,
 ) {
@@ -673,13 +674,14 @@ async fn expired_rows_require_explicit_cleanup_and_optional_keys_still_commit_bu
     let _ = task.await;
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn response_fences_immutability_unicode_null_fields_and_batched_cleanup_preserve_live_claims(
     pool: PgPool,
 ) {
     use chrono::Utc;
     use raddle_postgres::http_responses::{self, ClaimResult, ResponseKey, StoredResponse};
     let store = Store::new(pool.clone());
+    store.migrate().await.unwrap();
     let expired = Utc::now() - chrono::Duration::hours(1);
     let future = Utc::now() + chrono::Duration::hours(1);
     let key = ResponseKey::new(Some("tenant"), None, Some("corpus"), "reused").unwrap();

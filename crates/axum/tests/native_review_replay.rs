@@ -151,6 +151,7 @@ async fn send(api: &Api, key: Option<&str>, item: &str, status: u16) -> Response
         .unwrap()
 }
 async fn setup(pool: &PgPool) {
+    Store::new(pool.clone()).migrate().await.unwrap();
     sqlx::query("CREATE TABLE review_work(item text NOT NULL)")
         .execute(pool)
         .await
@@ -176,7 +177,7 @@ async fn effect_count(pool: &PgPool, item: &str) -> i64 {
         .unwrap()
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn optional_key_redirects_commit_but_400_plus_refusals_rollback(pool: PgPool) {
     setup(&pool).await;
     for mode in [ReplayMode::SeparateClaim, ReplayMode::SameTransaction] {
@@ -209,7 +210,7 @@ async fn optional_key_redirects_commit_but_400_plus_refusals_rollback(pool: PgPo
     }
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn all_stored_response_bounds_are_checked_before_business_commit_and_allow_corrected_retry(
     pool: PgPool,
 ) {
@@ -248,7 +249,7 @@ async fn all_stored_response_bounds_are_checked_before_business_commit_and_allow
     }
 }
 
-#[sqlx::test(migrations = "../postgres/migrations")]
+#[sqlx::test(migrations = false)]
 async fn aborting_the_actual_request_future_preserves_pre_and_postcommit_replay_boundaries(
     pool: PgPool,
 ) {

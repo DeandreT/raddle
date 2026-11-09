@@ -195,6 +195,24 @@ impl MessageContext {
             .intent(message, self, required)
     }
 
+    /// Resolves every payload branch of returned work without sending before
+    /// commit. Wrap each intent in `Effect::Outgoing` in the normal effect budget.
+    pub fn returned_many<M: raddle::wire::WireMessage>(
+        &self,
+        message: &M,
+        required: bool,
+    ) -> Result<Vec<crate::effects::Outgoing>, crate::BusError> {
+        self.bus
+            .as_ref()
+            .ok_or(crate::BusError::Invalid("contextual bus is not bound"))?
+            .intents(message, self, required)
+    }
+
+    pub(crate) fn with_envelope(mut self, envelope: Envelope) -> Self {
+        self.envelope = envelope;
+        self
+    }
+
     pub(crate) fn with_bus(mut self, bus: crate::MessageBus) -> Self {
         self.bus = Some(bus);
         self

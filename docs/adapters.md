@@ -77,8 +77,10 @@ listener configuration/authentication, never from message headers.
 
 ## Qualification
 
-Normal workspace tests are offline except real-file SQLite tests. PostgreSQL
-and RabbitMQ integration tests are opt-in and must target disposable resources.
+Normal workspace tests include real-file SQLite and unignored Axum PostgreSQL
+tests. Supply `DATABASE_URL` for an explicitly selected disposable PostgreSQL
+server with database-create permission. Ignored PostgreSQL and RabbitMQ
+integration tests remain opt-in and must target disposable resources.
 The RabbitMQ suite creates uniquely named queues and exercises confirms,
 mandatory returns, prefetch, settlement, and a complete PostgreSQL durable
 request/reply workflow. Set `RADDLE_RABBITMQ_TEST_URI` and `DATABASE_URL` through

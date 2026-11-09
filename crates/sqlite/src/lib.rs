@@ -3,6 +3,7 @@
 //! SQLite serializes writers. Execution transactions use `BEGIN IMMEDIATE`,
 //! rather than pretending to have PostgreSQL's independent row-level locks.
 
+mod clock;
 mod execution;
 mod model;
 mod scope;

@@ -6,13 +6,14 @@ use chrono::Utc;
 use raddle::transport::{Transport, TransportError};
 use raddle::wire::{Envelope, WireError, WireMessage};
 use raddle::{ExecutionError, Request, Runtime};
-use raddle_postgres::{Delivery, DeliveryKind, Store};
+use raddle_postgres::Store;
 use tokio::sync::oneshot;
 
 use crate::effects::Outgoing;
 use crate::scoped::{self, Committed, Failure, Flush, ScopedHandler};
 use crate::{BoxFuture, LocalQueue, MessageContext, QueueError, QueueMode, TrustedOrigin};
 
+mod routed;
 mod streaming;
 pub use streaming::{InputStream, LocalStream, StreamError, StreamOptions};
 
@@ -53,6 +54,9 @@ pub enum BusError {
     /// Durable staging failed; the enclosing transaction was rolled back.
     #[error("durable message admission failed")]
     Storage(#[from] raddle_postgres::Error),
+    /// Invalid routing startup or a failed plaintext projection for this input.
+    #[error(transparent)]
+    Routing(#[from] crate::routing::RoutingError),
 }
 
 /// Local domain failures stay typed; remote failures are acknowledgements, not deserialized exceptions.
@@ -153,7 +157,9 @@ pub struct ScopedRegistration<M, H> {
 pub struct BusBuilder {
     runtime: Runtime,
     pub(crate) endpoints: BTreeMap<String, Endpoint>,
-    routes: BTreeMap<Key, Vec<String>>,
+    pub(crate) routes: BTreeMap<Key, Vec<String>>,
+    resolver: crate::routing::Resolver,
+    pub(crate) routed_receivers: BTreeMap<Key, BTreeSet<String>>,
     handlers: BTreeMap<(String, Key), Handler>,
     remote: Option<Arc<dyn RemoteInvoker>>,
     timeout: Duration,
@@ -173,6 +179,8 @@ impl BusBuilder {
             runtime,
             endpoints: BTreeMap::new(),
             routes: BTreeMap::new(),
+            resolver: crate::routing::Resolver::default(),
+            routed_receivers: BTreeMap::new(),
             handlers: BTreeMap::new(),
             remote: None,
             timeout: Duration::from_secs(60),
@@ -406,7 +414,8 @@ impl BusBuilder {
         Ok(())
     }
     /// Freezes registrations. This opens no connections and starts no tasks.
-    pub fn build(self) -> MessageBus {
+    pub fn build(mut self) -> MessageBus {
+        self.resolver = crate::routing::Resolver::legacy(&self.routes);
         MessageBus(Arc::new(self))
     }
 }
@@ -501,7 +510,10 @@ impl MessageBus {
             if !options.allow_remote || !self.0.allow_remote {
                 return Err(BusError::RemoteDisabled.into());
             }
-            let routes = self.0.routes.get(&key::<M>()?).ok_or(BusError::NoRoute)?;
+            let routes = self.0.resolver.invocation(&key::<M>()?);
+            if routes.is_empty() {
+                return Err(BusError::NoRoute.into());
+            }
             if routes.len() != 1 {
                 return Err(BusError::Ambiguous.into());
             }
@@ -553,81 +565,12 @@ impl MessageBus {
         context: MessageContext,
         require_route: bool,
     ) -> Result<(), BusError> {
-        let context = context.with_bus(self.clone());
         let key = (
             context.envelope().contract().to_owned(),
             context.envelope().version(),
         );
-        let Some(routes) = self.0.routes.get(&key) else {
-            return if require_route {
-                Err(BusError::NoRoute)
-            } else {
-                Ok(())
-            };
-        };
-        let mut failure = None;
-        for destination in routes {
-            let result = async {
-                match &self.0.endpoints[destination] {
-                    Endpoint::Policy(queue) => {
-                        queue
-                            .submit(
-                                context
-                                    .clone()
-                                    .with_cancellation(crate::Cancellation::new()),
-                            )
-                            .await?
-                    }
-                    Endpoint::Local(queue) => {
-                        let handler = Arc::clone(
-                            self.0
-                                .handlers
-                                .get(&(destination.clone(), key.clone()))
-                                .ok_or(BusError::Invalid("local route has no handler"))?,
-                        );
-                        // Custody creates an independent execution. A timeout in
-                        // one subscriber must not cancel another subscriber.
-                        let context = context
-                            .clone()
-                            .with_cancellation(crate::Cancellation::new());
-                        let timeout = self
-                            .0
-                            .endpoint_timeouts
-                            .get(&(destination.clone(), key.clone()))
-                            .copied()
-                            .or_else(|| self.0.timeouts.get(&key).copied())
-                            .unwrap_or(self.0.timeout);
-                        let deadline = tokio::time::Instant::now() + timeout;
-                        queue
-                            .submit(async move { handler(context, deadline).await })
-                            .await?;
-                    }
-                    Endpoint::Durable(store) => {
-                        let mut scope = store.begin().await?;
-                        scope
-                            .stage_received(
-                                context.origin().source(),
-                                context.origin().tenant(),
-                                context.envelope(),
-                                &[Delivery::new(DeliveryKind::Local, destination, Utc::now())],
-                            )
-                            .await?;
-                        scope.commit(Utc::now()).await?;
-                    }
-                    Endpoint::Remote(transport) => {
-                        transport.publish(destination, context.envelope()).await?
-                    }
-                }
-                Ok::<(), BusError>(())
-            }
-            .await;
-            if let Err(error) = result
-                && failure.is_none()
-            {
-                failure = Some(error);
-            }
-        }
-        failure.map_or(Ok(()), Err)
+        self.dispatch_routes(context, self.0.resolver.routes(&key), require_route)
+            .await
     }
 
     /// Resolves returned messages using the same route table as Send/Publish.
@@ -639,25 +582,14 @@ impl MessageBus {
         required: bool,
     ) -> Result<Outgoing, BusError> {
         let envelope = context.outgoing(Envelope::encode(message)?, &self.0.propagated)?;
-        let mut deliveries = Vec::new();
-        if let Some(routes) = self.0.routes.get(&key::<M>()?) {
-            for destination in routes {
-                let kind = match &self.0.endpoints[destination] {
-                    Endpoint::Local(_) | Endpoint::Policy(_) => {
-                        return Err(BusError::NonAtomicRoute);
-                    }
-                    Endpoint::Durable(_) => DeliveryKind::Local,
-                    Endpoint::Remote(_) => DeliveryKind::Remote,
-                };
-                deliveries.push(Delivery::new(kind, destination, context.now()));
-            }
-        } else if required {
-            return Err(BusError::NoRoute);
+        let mut outgoing = self.envelope_intents(envelope.clone(), context, required)?;
+        if outgoing.len() > 1 {
+            return Err(crate::routing::RoutingError::MultipleEnvelopes.into());
         }
-        Ok(Outgoing {
+        Ok(outgoing.pop().unwrap_or(Outgoing {
             envelope,
-            deliveries,
-        })
+            deliveries: Vec::new(),
+        }))
     }
 
     pub(crate) fn deadline<M: WireMessage>(&self) -> Result<Duration, BusError> {
