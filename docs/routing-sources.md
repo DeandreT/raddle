@@ -80,6 +80,8 @@ HandlerSet will create; each routed operation validates its complete current sna
 The routed APIs clone both builder and configuration and swap them only after
 preflight succeeds. Selected classic/sticky/separated chains use the existing
 engines, policies, endpoint deadlines and explicit returned queue owners.
+Successful registrations retain prior validated receivers for the same concrete
+contract/version; later independent pre-built overrides do not replace them.
 All candidate receiving targets are considered, including currently suppressed
 ones. Separated targets need an explicit group binding or pre-built override;
 they never gain a duplicate global chain. A later unbound receiver fails final

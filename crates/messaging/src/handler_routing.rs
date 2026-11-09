@@ -362,7 +362,13 @@ fn conventionalize<M: WireMessage>(
             builder.routes.remove(&key);
         }
     }
-    builder.routed_receivers.insert(key, receivers);
+    // Earlier conventionalized bindings live in config.locals, not these
+    // temporary exact routes. Retain their already validated receiving owners.
+    builder
+        .routed_receivers
+        .entry(key)
+        .or_default()
+        .extend(receivers);
     Ok(())
 }
 

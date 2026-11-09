@@ -8,10 +8,11 @@ use raddle::wire::{Envelope, WireMessage};
 use raddle_messaging::composition::{Group, Then};
 use raddle_messaging::effects::HandlerOutput;
 use raddle_messaging::handler_routing::{EndpointOptions, HandlerSet, MultipleHandlerBehavior};
+use raddle_messaging::routing::RoutingError;
 use raddle_messaging::routing::{MessageDeclaration, MessageRole, MessageSelector, RoutingConfig};
 use raddle_messaging::scoped::{HandleFuture, LocalOnlyFlush, ScopedHandler};
 use raddle_messaging::{
-    BoxFuture, BusBuilder, LocalQueue, QueueMode, QueueSettings, TrustedOrigin,
+    BoxFuture, BusBuilder, BusError, LocalQueue, QueueMode, QueueSettings, TrustedOrigin,
 };
 use raddle_postgres::{Scope, Store};
 use serde::{Deserialize, Serialize};
@@ -242,4 +243,350 @@ async fn prebuilt_override_sticky_dedup_classic_and_late_unbound_guard() {
         )
         .unwrap();
     assert!(builder.build_routed(config).is_err());
+}
+
+#[tokio::test]
+async fn sequential_routed_prebuilt_preserve_prior_receivers() {
+    let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+    let mut config = config();
+    let first = builder
+        .sticky_handler_routed::<Work, _>(
+            &mut config,
+            "first",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    let second = builder.sticky_handler_routed::<Work, _>(
+        &mut config,
+        "second",
+        Arc::new(Handler),
+        store(),
+        Arc::new(LocalOnlyFlush),
+        EndpointOptions::default(),
+    );
+    assert!(
+        second.is_ok(),
+        "second independent pre-built registration rejected: {:?}",
+        second.as_ref().err()
+    );
+    let second = second.unwrap();
+    assert_eq!(first.local.len(), 1);
+    assert_eq!(second.local.len(), 1);
+    let before = builder
+        .clone()
+        .build_routed(config.clone())
+        .unwrap()
+        .explain::<Work>()
+        .unwrap();
+    assert_eq!(
+        before
+            .routes
+            .iter()
+            .map(|route| route.endpoint.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert!(
+        builder
+            .sticky_handler_routed::<Work, _>(
+                &mut config,
+                "first",
+                Arc::new(Handler),
+                store(),
+                Arc::new(LocalOnlyFlush),
+                EndpointOptions::default(),
+            )
+            .is_err()
+    );
+    let bus = builder.build_routed(config).unwrap();
+    assert_eq!(bus.explain::<Work>().unwrap(), before);
+    bus.send(
+        &Work,
+        TrustedOrigin::authenticated("tenant", "source", None).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.local[0].1.snapshot().buffered, 1);
+    assert_eq!(second.local[0].1.snapshot().buffered, 1);
+}
+
+async fn append_prebuilt_to_routed_set(behavior: MultipleHandlerBehavior) {
+    let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+    let mut config = config();
+    let selected = set()
+        .behavior(behavior)
+        .register_routed(
+            &mut builder,
+            &mut config,
+            "combined",
+            store(),
+            Arc::new(LocalOnlyFlush),
+        )
+        .unwrap();
+    let additional = builder.sticky_handler_routed::<Work, _>(
+        &mut config,
+        "additional",
+        Arc::new(Handler),
+        store(),
+        Arc::new(LocalOnlyFlush),
+        EndpointOptions::default(),
+    );
+    assert!(
+        additional.is_ok(),
+        "pre-built registration after routed {behavior:?} set rejected: {:?}",
+        additional.as_ref().err()
+    );
+    let additional = additional.unwrap();
+    assert_eq!(additional.local.len(), 1);
+    let expected: &[&str] = if behavior == MultipleHandlerBehavior::Classic {
+        assert!(selected.global.is_some());
+        assert_eq!(builder.combined_handlers().len(), 1);
+        &["combined", "additional"]
+    } else {
+        assert!(selected.global.is_none());
+        builder.assert_no_combined_handlers().unwrap();
+        &["a", "b", "additional"]
+    };
+    let bus = builder.build_routed(config).unwrap();
+    assert_eq!(
+        bus.explain::<Work>()
+            .unwrap()
+            .routes
+            .iter()
+            .map(|route| route.endpoint.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    bus.send(
+        &Work,
+        TrustedOrigin::authenticated("tenant", "source", None).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        selected
+            .owners
+            .local
+            .iter()
+            .all(|(_, queue, _)| queue.snapshot().buffered == 1)
+    );
+    assert_eq!(additional.local[0].1.snapshot().buffered, 1);
+}
+
+#[tokio::test]
+async fn routed_classic_set_then_prebuilt_preserve_prior_receivers() {
+    append_prebuilt_to_routed_set(MultipleHandlerBehavior::Classic).await;
+}
+
+#[tokio::test]
+async fn routed_separated_set_then_prebuilt_preserve_prior_receivers() {
+    append_prebuilt_to_routed_set(MultipleHandlerBehavior::Separated).await;
+}
+
+#[tokio::test]
+async fn cumulative_receivers_still_reject_suppressed_unowned_targets_atomically() {
+    let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+    let mut config = config();
+    let first = builder
+        .sticky_handler_routed::<Work, _>(
+            &mut config,
+            "first",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    let second = builder
+        .sticky_handler_routed::<Work, _>(
+            &mut config,
+            "second",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    builder.durable("unowned", store()).unwrap();
+    let before = builder
+        .clone()
+        .build_routed(config.clone())
+        .unwrap()
+        .explain::<Work>()
+        .unwrap();
+    let mut suppressed = config.clone();
+    suppressed
+        .convention(
+            "late-unowned",
+            "Suppressed is not permission to take custody",
+            |_: &MessageDeclaration| Ok(vec![EndpointAlias::try_new("unowned").unwrap()]),
+        )
+        .unwrap();
+    let failure = builder.sticky_handler_routed::<Work, _>(
+        &mut suppressed,
+        "additional",
+        Arc::new(Handler),
+        store(),
+        Arc::new(LocalOnlyFlush),
+        EndpointOptions::default(),
+    );
+    assert!(matches!(
+        failure,
+        Err(BusError::Routing(RoutingError::Invalid(
+            "late unbound receiving target"
+        )))
+    ));
+    assert_eq!(
+        builder
+            .clone()
+            .build_routed(config.clone())
+            .unwrap()
+            .explain::<Work>()
+            .unwrap(),
+        before
+    );
+    assert_eq!(first.local[0].1.snapshot().buffered, 0);
+    assert_eq!(second.local[0].1.snapshot().buffered, 0);
+
+    // The failed registration must not add `additional` to either snapshot.
+    // Legitimately bind the previously unowned target, then reuse the rejected
+    // config: any leaked local binding would now fail on its missing endpoint.
+    let bound = builder
+        .sticky_handler_routed::<Work, _>(
+            &mut config,
+            "unowned",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(bound.durable.len(), 1);
+    assert_eq!(
+        builder
+            .clone()
+            .build_routed(suppressed)
+            .unwrap()
+            .explain::<Work>()
+            .unwrap()
+            .routes,
+        before.routes
+    );
+    let retried = builder
+        .sticky_handler_routed::<Work, _>(
+            &mut config,
+            "additional",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(retried.local.len(), 1);
+    assert_eq!(
+        builder
+            .build_routed(config)
+            .unwrap()
+            .explain::<Work>()
+            .unwrap()
+            .routes
+            .len(),
+        4
+    );
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkV2;
+impl WireMessage for WorkV2 {
+    const NAME: &'static str = Work::NAME;
+    const VERSION: u32 = 2;
+}
+impl ScopedHandler<WorkV2> for Handler {
+    type Resources = ();
+    type Reply = ();
+    type Error = Fault;
+    fn create<'a>(
+        &'a self,
+        _: &'a mut Scope<'static>,
+        _: &'a raddle_messaging::MessageContext,
+    ) -> BoxFuture<'a, Result<(), Fault>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn handle<'a>(
+        &'a self,
+        _: &'a WorkV2,
+        _: &'a mut (),
+        _: &'a mut Scope<'static>,
+        _: &'a raddle_messaging::MessageContext,
+    ) -> HandleFuture<'a, (), (), Fault> {
+        Box::pin(async { Ok(HandlerOutput::reply(())) })
+    }
+}
+
+#[tokio::test]
+async fn cumulative_receiving_ownership_is_scoped_to_concrete_contract_version() {
+    let mut builder = BusBuilder::new(RuntimeBuilder::default().build());
+    let mut config = config();
+    let first = builder
+        .sticky_handler_routed::<Work, _>(
+            &mut config,
+            "first",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    builder.durable("versioned", store()).unwrap();
+    let versioned = builder
+        .sticky_handler_routed::<WorkV2, _>(
+            &mut config,
+            "versioned",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    let second = builder
+        .sticky_handler_routed::<Work, _>(
+            &mut config,
+            "second",
+            Arc::new(Handler),
+            store(),
+            Arc::new(LocalOnlyFlush),
+            EndpointOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(versioned.durable.len(), 1);
+    assert_eq!(first.local.len() + second.local.len(), 2);
+    let bus = builder.clone().build_routed(config.clone()).unwrap();
+    assert_eq!(bus.explain::<Work>().unwrap().routes.len(), 2);
+    assert_eq!(bus.explain::<WorkV2>().unwrap().routes[0].version, 2);
+    assert_eq!(
+        bus.explain::<WorkV2>().unwrap().routes[0].endpoint,
+        "versioned"
+    );
+    config
+        .convention(
+            "wrong-version",
+            "Another schema's receiver is not an owned receiver",
+            |message: &MessageDeclaration| {
+                Ok(if message.contract().version().get() == 1 {
+                    vec![EndpointAlias::try_new("versioned").unwrap()]
+                } else {
+                    Vec::new()
+                })
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        builder.build_routed(config),
+        Err(BusError::Routing(RoutingError::Invalid(
+            "late unbound receiving target"
+        )))
+    ));
 }
