@@ -18,7 +18,7 @@ async fn matrix(pool: PgPool, poison: Poison) {
                     returned,
                 ));
                 let flush = Arc::new(TrackedFlush::default());
-                let running = Running::start(
+                let mut running = Running::prepare(
                     owner,
                     &store,
                     &name,
@@ -31,6 +31,7 @@ async fn matrix(pool: PgPool, poison: Poison) {
                 for value in base..base + 3 {
                     ids.push(running.admit(&store, &name, value).await);
                 }
+                running.start(&handler).await;
                 let mut expected = ids
                     .iter()
                     .enumerate()
@@ -48,6 +49,7 @@ async fn matrix(pool: PgPool, poison: Poison) {
                     })
                     .collect::<Vec<_>>();
                 running.wait(&store, &expected).await;
+                running.wait_cleanup(&handler, 4).await;
                 assert_eq!(handler.rolled_back.load(Ordering::SeqCst), 2);
                 assert_eq!(handler.uncertain.load(Ordering::SeqCst), 0);
                 assert_eq!(running.attempts(&pool, ids[position]).await, 2);
@@ -140,7 +142,7 @@ async fn exact_rollback_only_terminal_policy_can_discard_without_committing_root
             let name = format!("discard-{base}");
             let handler = Arc::new(Handler::new(&pool, base, Poison::Invalid, returned));
             let flush = Arc::new(TrackedFlush::default());
-            let running = Running::start(
+            let mut running = Running::prepare(
                 owner,
                 &store,
                 &name,
@@ -150,6 +152,7 @@ async fn exact_rollback_only_terminal_policy_can_discard_without_committing_root
                 ReplaySafety::Transactional,
             );
             let failed = running.admit(&store, &name, base).await;
+            running.start(&handler).await;
             running
                 .wait(
                     &store,
@@ -190,7 +193,7 @@ async fn confirmed_abort_does_not_override_never_replay_authorization(pool: PgPo
             let name = format!("never-{base}");
             let handler = Arc::new(Handler::new(&pool, base, Poison::Invalid, returned));
             let flush = Arc::new(TrackedFlush::default());
-            let running = Running::start(
+            let mut running = Running::prepare(
                 owner,
                 &store,
                 &name,
@@ -200,6 +203,7 @@ async fn confirmed_abort_does_not_override_never_replay_authorization(pool: PgPo
                 ReplaySafety::Never,
             );
             let failed = running.admit(&store, &name, base).await;
+            running.start(&handler).await;
             running
                 .wait(
                     &store,

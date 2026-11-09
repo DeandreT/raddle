@@ -23,7 +23,7 @@ async fn poisoned_connection_rollback_failure_stays_uncertain_in_both_owners_and
                 returned,
             ));
             let flush = Arc::new(TrackedFlush::default());
-            let running = Running::start(
+            let mut running = Running::prepare(
                 owner,
                 &store,
                 &name,
@@ -35,6 +35,7 @@ async fn poisoned_connection_rollback_failure_stays_uncertain_in_both_owners_and
             let first = running.admit(&store, &name, base).await;
             let failed = running.admit(&store, &name, base + 1).await;
             let last = running.admit(&store, &name, base + 2).await;
+            running.start(&handler).await;
             let failed_state = if matches!(owner, Owner::Durable) {
                 MemoryStatus::Active
             } else {
