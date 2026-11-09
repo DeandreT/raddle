@@ -125,6 +125,7 @@ struct Plan {
 /// Publication and operation-specific legacy invocation views share this snapshot.
 #[derive(Clone, Default)]
 pub(crate) struct Resolver {
+    grouping: super::grouping::GroupingPlans,
     plans: BTreeMap<Key, Plan>,
     pub targets: BTreeMap<Key, BTreeSet<String>>,
 }
@@ -171,13 +172,23 @@ impl Resolver {
         config: &RoutingConfig,
         legacy: &BTreeMap<Key, Vec<String>>,
         endpoints: &BTreeSet<String>,
+        handled: &BTreeSet<Key>,
     ) -> Result<Self, RoutingError> {
+        if config.grouping.configured()
+            && legacy.keys().any(|key| !config.messages.contains_key(key))
+        {
+            return Err(RoutingError::Invalid(
+                "grouping requires concrete message declarations",
+            ));
+        }
         let mut compiler = Compiler {
             config,
             legacy,
             raw: BTreeMap::new(),
             resolver: Self::legacy(legacy),
         };
+        compiler.resolver.grouping =
+            super::grouping::GroupingPlans::compile(&config.grouping, &config.messages, handled)?;
         let all: BTreeSet<_> = config
             .messages
             .keys()
@@ -236,6 +247,23 @@ impl Resolver {
     }
     pub fn routes(&self, key: &Key) -> &[Route] {
         self.plans.get(key).map_or(&[], |plan| &plan.routes)
+    }
+    pub fn prepare_group(
+        &self,
+        envelope: &Envelope,
+        origin: &TrustedOrigin,
+        enabled: bool,
+    ) -> Result<Envelope, RoutingError> {
+        self.grouping.prepare(envelope, origin, enabled)
+    }
+    pub fn exempt(&self, envelope: &Envelope) -> bool {
+        self.grouping.exempt(envelope)
+    }
+    pub fn check_grouping(&self, key: &Key) -> Result<(), RoutingError> {
+        self.grouping.check(key)
+    }
+    pub fn grouping_active(&self, key: &Key) -> bool {
+        self.grouping.active(key)
     }
     pub fn invocation(&self, key: &Key) -> &[String] {
         self.plans

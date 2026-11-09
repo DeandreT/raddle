@@ -89,6 +89,7 @@ impl<'connection> Scope<'connection> {
         }
         let operation = StagingOperation::new(self);
         let result = async {
+            envelope.require_legacy_dispatch()?;
             if source.is_empty() || source.len() > 128 || tenant.is_empty() || tenant.len() > 128 || key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_graphic()) { return Err(Error::Invalid("invalid idempotency key")); }
             let fingerprint = Sha256::digest(envelope.content_bytes()?).to_vec();
             let inserted = sqlx::query("INSERT INTO raddle_idempotency(tenant,source,key,request_hash,message_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
@@ -177,6 +178,7 @@ impl<'connection> Scope<'connection> {
         deliveries: &[Delivery],
         received: bool,
     ) -> Result<Vec<Uuid>, Error> {
+        envelope.require_legacy_dispatch()?;
         if source.is_empty()
             || source.len() > 128
             || tenant.is_empty()

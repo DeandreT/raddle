@@ -153,6 +153,7 @@ impl<'connection> Scope<'connection> {
         envelope: &Envelope,
         deliveries: &[Delivery],
     ) -> Result<Vec<Uuid>, Error> {
+        envelope.require_legacy_dispatch()?;
         if source.is_empty()
             || source.len() > 128
             || tenant.is_empty()

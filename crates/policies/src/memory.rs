@@ -159,6 +159,10 @@ impl InMemoryEndpoint {
     }
     /// Enqueues one validated identity. Duplicate identities are refused.
     pub fn enqueue(&mut self, delivery: MemoryDelivery) -> Result<(), DriverError> {
+        delivery
+            .envelope
+            .require_legacy_dispatch()
+            .map_err(|_| DriverError::Invalid)?;
         if self.deliveries.len() == self.capacity
             || delivery.status != MemoryStatus::Ready
             || self

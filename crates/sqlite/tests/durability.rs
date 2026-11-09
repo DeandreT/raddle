@@ -531,7 +531,13 @@ async fn sub_millisecond_leases_cannot_consume_a_claim_attempt() {
         .await
         .unwrap()
         .remove(0);
-    store.complete(&claim, now).await.unwrap();
+    // This tests admission at the exact minimum, not completion within a 1ms
+    // wall-clock budget. The lease may legitimately expire during another async
+    // database round trip; completion/fencing is covered separately.
+    assert_eq!(claim.id().unwrap(), id);
+    let job = store.inspect("tenant", id).await.unwrap().unwrap();
+    assert_eq!(job.status, "active");
+    assert_eq!(job.attempts, 1);
     store.close().await;
 }
 

@@ -68,6 +68,10 @@ pub struct Envelope {
     causation_id: Option<Uuid>,
     headers: BTreeMap<String, String>,
     payload: Value,
+    // Keep the opt-in extension out of line: Envelope also inhabits existing
+    // public transport reply enums whose default representation must stay small.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch: Option<Box<crate::grouping::Dispatch>>,
 }
 
 impl std::fmt::Debug for Envelope {
@@ -92,6 +96,8 @@ struct UntrustedEnvelope {
     causation_id: Option<Uuid>,
     headers: BTreeMap<String, String>,
     payload: Value,
+    #[serde(default)]
+    dispatch: Option<crate::grouping::Dispatch>,
 }
 
 /// Wire metadata without a body. Deserializing metadata does not validate it;
@@ -117,6 +123,61 @@ pub struct EnvelopeMetadata {
 }
 
 impl Envelope {
+    /// Optional native grouping/key metadata; it never authenticates origin.
+    pub fn dispatch(&self) -> Option<&crate::grouping::Dispatch> {
+        self.dispatch.as_deref()
+    }
+
+    /// Adds validated immutable dispatch metadata without changing legacy metadata literals.
+    pub fn with_dispatch(mut self, dispatch: crate::grouping::Dispatch) -> Result<Self, WireError> {
+        self.dispatch = Some(Box::new(dispatch));
+        self.validate(EnvelopeLimits::default())?;
+        Ok(self)
+    }
+
+    /// Companion construction for codecs that explicitly preserve dispatch metadata.
+    pub fn from_parts_with_dispatch(
+        metadata: EnvelopeMetadata,
+        payload: Value,
+        dispatch: Option<crate::grouping::Dispatch>,
+        limits: EnvelopeLimits,
+    ) -> Result<Self, WireError> {
+        let mut envelope = Self::from_parts(metadata, payload, limits)?;
+        envelope.dispatch = dispatch.map(Box::new);
+        envelope.validate(limits)?;
+        Ok(envelope)
+    }
+
+    /// Refuses profiles without native dispatch custody/sequencing integration.
+    pub fn require_legacy_dispatch(&self) -> Result<(), WireError> {
+        if self.dispatch.is_some() {
+            return Err(WireError::Invalid(
+                "native dispatch is unsupported by this profile",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses protected framing before a permissive typed/property/custom extractor.
+    pub fn require_plaintext(&self) -> Result<(), WireError> {
+        if self
+            .payload
+            .get("format")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("raddle-aes"))
+        {
+            return Err(WireError::Invalid(
+                "protected message requires canonical decoding",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Canonical body for explicit property access, after protection refusal.
+    pub fn plaintext_payload(&self) -> Result<&Value, WireError> {
+        self.require_plaintext()?;
+        Ok(&self.payload)
+    }
     /// Builds a validated canonical envelope from explicit metadata and JSON
     /// content. Native codecs must project their typed models into this canonical
     /// representation, diagnosing unsupported/lossy conversions themselves.
@@ -134,6 +195,7 @@ impl Envelope {
             causation_id: metadata.causation_id,
             headers: metadata.headers,
             payload,
+            dispatch: None,
         };
         envelope.validate(limits)?;
         Ok(envelope)
@@ -163,7 +225,12 @@ impl Envelope {
         let mut metadata = self.metadata();
         metadata.contract = M::NAME.to_owned();
         metadata.version = M::VERSION;
-        Self::from_parts(metadata, serde_json::to_value(message)?, limits)
+        Self::from_parts_with_dispatch(
+            metadata,
+            serde_json::to_value(message)?,
+            self.dispatch().cloned(),
+            limits,
+        )
     }
 
     /// Encodes a typed contract with a new stable identity.
@@ -186,6 +253,7 @@ impl Envelope {
             causation_id: None,
             headers: BTreeMap::new(),
             payload: serde_json::to_value(message)?,
+            dispatch: None,
         };
         envelope.validate(EnvelopeLimits::default())?;
         Ok(envelope)
@@ -206,6 +274,7 @@ impl Envelope {
             causation_id: raw.causation_id,
             headers: raw.headers,
             payload: raw.payload,
+            dispatch: raw.dispatch.map(Box::new),
         };
         envelope.validate(limits)?;
         Ok(envelope)
@@ -219,6 +288,18 @@ impl Envelope {
     /// Canonical application content, excluding retry-independent identity and creation time.
     /// Persistence adapters use this for scoped HTTP idempotency comparisons.
     pub fn content_bytes(&self) -> Result<Vec<u8>, WireError> {
+        if let Some(dispatch) = &self.dispatch {
+            return Ok(serde_json::to_vec(&(
+                "raddle.dispatch.v1",
+                &self.contract,
+                self.version,
+                self.correlation_id,
+                self.causation_id,
+                &self.headers,
+                &self.payload,
+                dispatch,
+            ))?);
+        }
         Ok(serde_json::to_vec(&(
             &self.contract,
             self.version,
@@ -231,6 +312,9 @@ impl Envelope {
 
     /// Validates explicit limits without trusting application headers.
     pub fn validate(&self, limits: EnvelopeLimits) -> Result<(), WireError> {
+        if self.dispatch.as_ref().is_some_and(|d| !d.validate()) {
+            return Err(WireError::Invalid("unsupported dispatch version"));
+        }
         if self.id.is_nil() || self.version == 0 {
             return Err(WireError::Invalid("nil identity or zero version"));
         }

@@ -80,6 +80,12 @@ fn reject_invalid_frames(
     for body in [
         Envelope::encode(&WrongReply).unwrap().to_vec().unwrap(),
         b"not an envelope".to_vec(),
+        Envelope::encode(&Reply(42))
+            .unwrap()
+            .with_dispatch(raddle::grouping::Dispatch::resolved(None, None))
+            .unwrap()
+            .to_vec()
+            .unwrap(),
     ] {
         assert!(
             !invoker

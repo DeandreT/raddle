@@ -379,6 +379,9 @@ impl Mapper {
     }
 
     fn check_outbound(&self, envelope: &Envelope, external: &EventMetadata) -> Result<(), Error> {
+        envelope
+            .require_legacy_dispatch()
+            .map_err(|_| Error::Unsupported)?;
         validate_external(external, self.limits)?;
         let (contract, version) = self
             .aliases

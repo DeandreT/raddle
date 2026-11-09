@@ -109,6 +109,9 @@ impl<P: KeyProvider> EncryptionCodec<P> {
     /// envelope, so failures/retries cannot accidentally replay ciphertext.
     pub async fn encode(&self, envelope: &Envelope) -> Result<Envelope, CryptoError> {
         envelope
+            .require_legacy_dispatch()
+            .map_err(|_| CryptoError::Framing)?;
+        envelope
             .validate(self.limits)
             .map_err(|_| CryptoError::Limits)?;
         let mut value = serde_json::to_value(envelope).map_err(|_| CryptoError::Framing)?;
@@ -161,6 +164,9 @@ impl<P: KeyProvider> EncryptionCodec<P> {
 
     /// Receiver codec for a transport's already validated envelope.
     pub async fn decode(&self, envelope: &Envelope) -> Result<Envelope, CryptoError> {
+        envelope
+            .require_legacy_dispatch()
+            .map_err(|_| CryptoError::Framing)?;
         envelope
             .validate(self.limits)
             .map_err(|_| CryptoError::Limits)?;

@@ -6,18 +6,23 @@
 
 mod compiler;
 mod config;
+mod grouping;
 mod metadata;
 mod projection;
 
 pub use compiler::{ExplainedRoute, RoutingExplanation, RoutingStep};
 pub(crate) use compiler::{Resolver, Route};
 pub use config::{LocalRouting, RouteSource, RoutingConfig, SourceOptions};
+pub use grouping::{GroupingConfig, GroupingRule, RuleMatch};
 pub use metadata::{MessageDeclaration, MessageRole, MessageSelector};
 
 /// Startup or per-input projection failure. Diagnostics never contain payloads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RoutingError {
+    /// Per-input grouping extraction failed or panicked; siblings remain independent.
+    #[error("message grouping failed")]
+    Grouping,
     /// Invalid, duplicate, conflicting or unbounded configuration.
     #[error("invalid routing configuration: {0}")]
     Invalid(&'static str),
