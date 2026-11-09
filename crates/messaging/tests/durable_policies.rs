@@ -32,6 +32,8 @@ mod completion_schema;
 mod policy_clock;
 #[path = "durable_policies/recovery_fences.rs"]
 mod recovery_fences;
+#[path = "durable_policies/rollback_only.rs"]
+mod rollback_only;
 #[path = "durable_policies/uncertainty_isolation.rs"]
 mod uncertainty_isolation;
 

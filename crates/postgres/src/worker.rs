@@ -144,7 +144,23 @@ impl Worker {
                 match tokio::time::timeout(self.policy.timeout(), handler(&envelope, &mut scope))
                     .await
                 {
-                    Ok(Ok(())) => scope.commit(Utc::now()).await,
+                    Ok(Ok(())) => match scope.commit(Utc::now()).await {
+                        // This commit result follows a successful rollback, so
+                        // only this claim needs failure settlement. A rollback
+                        // or settlement database error must still propagate.
+                        Err(Error::RollbackOnly) => {
+                            self.store
+                                .fail(
+                                    &claim,
+                                    FailureDisposition::Retry,
+                                    self.policy,
+                                    "rollback-only",
+                                    Utc::now(),
+                                )
+                                .await
+                        }
+                        result => result,
+                    },
                     outcome => {
                         scope.rollback().await?;
                         let permanent = matches!(outcome, Ok(Err(HandlerFailure::Reject)));
