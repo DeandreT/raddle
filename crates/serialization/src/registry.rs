@@ -255,6 +255,11 @@ impl EndpointCodecs {
 
     /// Produces real body bytes for a binding that carries metadata separately.
     pub fn encode_body(&self, envelope: &Envelope, media: &str) -> Result<Vec<u8>, Error> {
+        // The legacy metadata/body bindings cannot carry native dispatch yet.
+        // Refuse before invoking even a permissive application codec callback.
+        envelope
+            .require_legacy_dispatch()
+            .map_err(|_| Error::Unsupported)?;
         let registration = self.lookup(media, envelope.contract(), envelope.version())?;
         (registration.encode)(envelope, self.limits)
     }
@@ -282,6 +287,9 @@ impl EndpointCodecs {
         if let Some(canonicalize) = &self.canonicalize {
             let before = envelope.metadata();
             let envelope = canonicalize(envelope)?;
+            envelope
+                .require_legacy_dispatch()
+                .map_err(|_| Error::Unsupported)?;
             let after = envelope.metadata();
             if before.id != after.id
                 || before.created_at != after.created_at

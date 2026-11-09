@@ -75,6 +75,7 @@ pub(crate) struct Source {
 /// pinned in that same stage. Only routed registrations add conventional locals.
 #[derive(Clone, Default)]
 pub struct RoutingConfig {
+    pub(crate) grouping: super::GroupingConfig,
     pub(crate) messages: BTreeMap<Key, MessageDeclaration>,
     pub(crate) custom: Vec<Source>,
     pub(crate) explicit: Vec<Source>,
@@ -85,6 +86,36 @@ pub struct RoutingConfig {
     ids: BTreeSet<String>,
 }
 impl RoutingConfig {
+    /// Additive grouping configuration; consumed by the same compiled resolver.
+    pub fn grouping(&mut self) -> &mut super::GroupingConfig {
+        &mut self.grouping
+    }
+
+    /// Adds local topology routes and its ordered grouping rules atomically.
+    /// Exclusions win before inclusion; one envelope can have only one rule owner.
+    pub fn topology(
+        &mut self,
+        id: &str,
+        include: MessageSelector,
+        exclude: Vec<MessageSelector>,
+        rules: Vec<super::GroupingRule>,
+        targets: Vec<EndpointAlias>,
+    ) -> Result<(), RoutingError> {
+        if self.grouping.topologies.len() >= 32 || exclude.len() > 32 || rules.len() > 32 {
+            return Err(RoutingError::Invalid("topology capacity exceeded"));
+        }
+        let selector = MessageSelector::predicate(move |message| {
+            !exclude.iter().any(|s| s.matches(message)) && include.matches(message)
+        });
+        let mut candidate = self.clone();
+        candidate.rule(id, "Native partitioned topology", selector.clone(), targets)?;
+        candidate
+            .grouping
+            .topologies
+            .push(super::grouping::TopologyGrouping { selector, rules });
+        *self = candidate;
+        Ok(())
+    }
     /// Adds concrete metadata. Conflicting serializer ownership is never merged.
     pub fn declare(&mut self, declaration: MessageDeclaration) -> Result<(), RoutingError> {
         if self.messages.len() >= 1024 || self.messages.contains_key(&declaration.key) {

@@ -61,6 +61,10 @@ impl PolicyQueue {
     pub async fn submit(&self, context: MessageContext) -> Result<(), DriverError> {
         context
             .envelope()
+            .require_legacy_dispatch()
+            .map_err(|_| DriverError::Invalid)?;
+        context
+            .envelope()
             .validate(Default::default())
             .map_err(|_| DriverError::Invalid)?;
         let bytes = context

@@ -10,6 +10,10 @@ queue ownership, transaction phases, cancellation, post-commit outcomes and the
 remaining behavior boundaries. This crate is not a claim of full Wolverine or
 .NET wire compatibility.
 
+Opt-in [buffered native grouping](../../docs/native-grouping.md) adds logical
+group resolution and finite process-local slots over the same publication
+resolver. Unsupported custody and codec profiles are explicitly refused.
+
 ## Local streaming
 
 The application bus also supports caller-polled typed output streams and

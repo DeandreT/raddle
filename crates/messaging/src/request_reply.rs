@@ -122,6 +122,7 @@ impl<T: Transport> ReplyHubInvoker<T> {
     /// tenant/source/token/contract, duplicate or unrequested; acknowledge/drop
     /// those according to the application's receive policy, never upgrade trust.
     pub fn accept_reply(&self, origin: &TrustedOrigin, reply: Envelope) -> Result<bool, BusError> {
+        reply.require_legacy_dispatch()?;
         #[cfg(feature = "serialization-rpc")]
         if let Some(selected) = &self.selected {
             return self.accept_selected(origin, reply, selected);
@@ -148,6 +149,9 @@ impl<T: Transport> ReplyHubInvoker<T> {
             let Ok(inner) = Envelope::from_slice(&bytes, Default::default()) else {
                 return Ok(false);
             };
+            if inner.require_legacy_dispatch().is_err() {
+                return Ok(false);
+            }
             if inner.contract() != expected_reply.contract {
                 return Ok(false);
             }
@@ -247,6 +251,7 @@ impl<T: Transport + 'static> RemoteInvoker for ReplyHubInvoker<T> {
         reply_contract: &'a str,
     ) -> BoxFuture<'a, Result<Envelope, BusError>> {
         Box::pin(async move {
+            context.envelope().require_legacy_dispatch()?;
             raddle::SubscriptionName::try_new(reply_contract)
                 .map_err(|_| BusError::Invalid("invalid reply contract"))?;
             let responder = self
@@ -419,6 +424,7 @@ impl<T: Transport> RemoteResponder<T> {
     /// or negative acknowledgement. Settle the request only after this confirms.
     /// Request/reply is volatile; a caller timeout does not undo peer business work.
     pub async fn respond(&self, context: &MessageContext) -> Result<(), BusError> {
+        context.envelope().require_legacy_dispatch()?;
         self.validate_mode(context)?;
         let reply_to = context
             .envelope()

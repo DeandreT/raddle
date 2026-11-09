@@ -85,6 +85,7 @@ impl Scope<'_> {
             deadline,
         } = options;
         let result = async {
+            request.require_legacy_dispatch()?;
             for name in [destination, reply_endpoint, responder, reply_contract] { raddle::SubscriptionName::try_new(name).map_err(|_| Error::Invalid("invalid conversation routing"))?; }
             if *deadline <= request.created_at() { return Err(Error::Invalid("request deadline must follow creation")); }
             let request = request.clone().with_header("reply-endpoint".into(), reply_endpoint.into())?.with_header("reply-deadline".into(), deadline.to_rfc3339())?;
@@ -112,6 +113,8 @@ impl Scope<'_> {
         now: DateTime<Utc>,
     ) -> Result<(), Error> {
         let result = async {
+            request.require_legacy_dispatch()?;
+            response.require_legacy_dispatch()?;
             let endpoint = request
                 .headers()
                 .get("reply-endpoint")
@@ -144,6 +147,10 @@ impl Scope<'_> {
         reply: &Envelope,
         now: DateTime<Utc>,
     ) -> Result<ReplyDisposition, Error> {
+        if let Err(error) = reply.require_legacy_dispatch() {
+            self.mark_rollback_only();
+            return Err(error.into());
+        }
         let Some(id) = reply.correlation_id() else {
             return Ok(ReplyDisposition::Rejected);
         };

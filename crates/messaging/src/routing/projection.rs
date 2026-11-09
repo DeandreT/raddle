@@ -67,6 +67,23 @@ impl Projection {
                     .map_err(|_| RoutingError::Projection)?;
             }
         }
+        if let Some(dispatch) = root.dispatch() {
+            // A projection creates a child identity, but never silently loses an
+            // explicitly supplied/stamped group or outgoing transport key.
+            let inherited = if dispatch.group().is_none() {
+                // A projected child is a new identity: an upstream negative
+                // resolution cannot suppress its final contract's rules.
+                raddle::grouping::Dispatch::explicit(raddle::grouping::DispatchOptions {
+                    group: None,
+                    partition_key: dispatch.partition_key().map(str::to_owned),
+                })
+            } else {
+                dispatch.clone()
+            };
+            output = output
+                .with_dispatch(inherited)
+                .map_err(|_| RoutingError::Projection)?;
+        }
         output
             .correlated(
                 root.correlation_id().unwrap_or(root.id()),
@@ -112,14 +129,7 @@ fn identity(root: &Envelope, origin: &TrustedOrigin, path: &[std::sync::Arc<Proj
 }
 
 fn plaintext(envelope: &Envelope) -> Result<(), RoutingError> {
-    let value = serde_json::to_value(envelope).map_err(|_| RoutingError::Projection)?;
-    if value
-        .get("payload")
-        .and_then(|payload| payload.get("format"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|format| format.starts_with("raddle-aes"))
-    {
-        return Err(RoutingError::Protected);
-    }
-    Ok(())
+    envelope
+        .require_plaintext()
+        .map_err(|_| RoutingError::Protected)
 }

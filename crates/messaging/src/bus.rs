@@ -194,6 +194,21 @@ impl BusBuilder {
         }
     }
     fn endpoint(&mut self, name: &str, endpoint: Endpoint) -> Result<(), BusError> {
+        if let Endpoint::Local(queue) = &endpoint
+            && let Some(slots) = queue.slot_set()
+        {
+            for existing in self.endpoints.values() {
+                if let Endpoint::Local(other) = existing
+                    && let Some(other) = other.slot_set()
+                    && slots.domain() == other.domain()
+                    && !Arc::ptr_eq(slots, other)
+                {
+                    return Err(BusError::Invalid(
+                        "slot domain already has a different execution owner",
+                    ));
+                }
+            }
+        }
         raddle::SubscriptionName::try_new(name)
             .map_err(|_| BusError::Invalid("invalid endpoint name"))?;
         if self.endpoints.len() >= 256 || self.endpoints.contains_key(name) {
@@ -363,7 +378,7 @@ impl BusBuilder {
         M: WireMessage,
         H: ScopedHandler<M>,
     {
-        if !matches!(self.endpoints.get(endpoint), Some(Endpoint::Local(queue)) if queue.mode() == QueueMode::Buffered)
+        if !matches!(self.endpoints.get(endpoint), Some(Endpoint::Local(queue)) if queue.mode() == QueueMode::Buffered && !queue.is_partitioned())
         {
             return Err(BusError::Invalid(
                 "scoped routes require managed buffered execution",
@@ -405,7 +420,7 @@ impl BusBuilder {
 
     /// Designates a separate bounded host-owned admission queue for scoped Invoke.
     pub fn execution_queue(&mut self, queue: LocalQueue) -> Result<(), BusError> {
-        if queue.mode() != QueueMode::Buffered {
+        if queue.mode() != QueueMode::Buffered || queue.is_partitioned() {
             return Err(BusError::Invalid(
                 "scoped execution requires managed buffering",
             ));
@@ -481,6 +496,7 @@ impl MessageBus {
         M: Request + WireMessage,
         M::Reply: WireMessage,
     {
+        self.require_unpartitioned_execution(context.envelope())?;
         // Compare typed application content only: ingress owns metadata, not a
         // newly encoded envelope. This also validates the exact declared contract.
         let supplied = context.envelope().decode::<M>().map_err(BusError::from)?;
@@ -527,6 +543,7 @@ impl MessageBus {
             )
             .await
             .map_err(|_| InvokeError::TimedOut)??;
+            reply.require_legacy_dispatch().map_err(BusError::from)?;
             reply
                 .decode::<M::Reply>()
                 .map_err(|error| BusError::Wire(error).into())
@@ -569,6 +586,7 @@ impl MessageBus {
             context.envelope().contract().to_owned(),
             context.envelope().version(),
         );
+        self.0.resolver.check_grouping(&key)?;
         self.dispatch_routes(context, self.0.resolver.routes(&key), require_route)
             .await
     }
@@ -620,6 +638,12 @@ impl MessageBus {
         M: WireMessage,
         H: ScopedHandler<M>,
     {
+        self.require_unpartitioned_execution(context.envelope())
+            .map_err(|_| {
+                Failure::Wire(WireError::Invalid(
+                    "grouped scoped execution is unsupported",
+                ))
+            })?;
         // Caller/host cancellation flows down, but this execution's deadline or
         // abandoned response must never cancel that shared parent or siblings.
         let execution_cancellation = context.cancellation().child();

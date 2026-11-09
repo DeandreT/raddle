@@ -299,6 +299,7 @@ impl Scope<'_> {
         let mut identities = HashSet::with_capacity(events.len());
         let mut bytes = Vec::with_capacity(events.len());
         for event in events {
+            event.require_legacy_dispatch()?;
             event.validate(Default::default())?;
             if !identities.insert(event.id()) {
                 return Err(EventError::DuplicateEvent);

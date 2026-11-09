@@ -268,6 +268,7 @@ where
     M: WireMessage,
     H: ScopedHandler<M>,
 {
+    context.envelope().require_legacy_dispatch()?;
     let message = context.envelope().decode::<M>()?;
     let mut scope = scope;
     let mut resources = match bounded(deadline, &context, async {
