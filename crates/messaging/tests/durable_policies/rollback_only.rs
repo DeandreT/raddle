@@ -627,10 +627,11 @@ async fn effects(pool: &PgPool, base: i32, expected: &[i32], returned: bool) {
         .await
         .unwrap();
     assert_eq!((partial, keys), (0, 0));
-    let unsupported: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM raddle_jobs WHERE destination='unsupported-child'")
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let unsupported: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM raddle_jobs WHERE destination='unsupported-child'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
     assert_eq!(unsupported, 0);
 }

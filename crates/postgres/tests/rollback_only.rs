@@ -260,11 +260,12 @@ async fn effects(pool: &PgPool, expected: &[i32]) {
         .collect::<Vec<_>>();
     direct_values.sort_unstable();
     assert_eq!(direct_values, expected);
-    let unsupported: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM raddle_jobs WHERE destination='unsupported-child'")
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let unsupported: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM raddle_jobs WHERE destination='unsupported-child'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
     assert_eq!(unsupported, 0);
     let partial: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM raddle_jobs WHERE destination IN ('partial-child','blocked-child')",
