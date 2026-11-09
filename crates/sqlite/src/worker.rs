@@ -124,7 +124,18 @@ impl Worker {
         let result = tokio::time::timeout(self.timeout, handler(&envelope, &mut scope)).await;
         let expired = scope.stop_deadline().await?;
         match (result, expired) {
-            (Ok(Ok(())), false) => scope.commit(Utc::now()).await?,
+            (Ok(Ok(())), false) => match scope.commit(Utc::now()).await {
+                Ok(()) => {}
+                // RollbackOnly is returned only after a successful rollback.
+                // The failed input is retryable; unknown database outcomes are
+                // not evidence of rollback and must still reach the caller.
+                Err(Error::RollbackOnly) => {
+                    self.store
+                        .fail(&claim, FailureDisposition::Retry, Utc::now())
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            },
             (result, expired) => {
                 scope.rollback().await?;
                 self.store

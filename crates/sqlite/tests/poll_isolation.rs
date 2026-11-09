@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use chrono::{TimeDelta, Utc};
 use raddle::transport::{Transport, TransportError};
 use raddle::wire::{Codecs, Envelope, WireMessage};
 use raddle_sqlite::{
-    Claim, Delivery, DeliveryKind, Error, FailureDisposition, OutboxWorker, Store, Worker,
+    Claim, Delivery, DeliveryKind, Error, FailureDisposition, OutboxWorker, Scope, Store, Worker,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteOperation;
@@ -499,4 +499,272 @@ async fn two_scoped_pools_do_not_claim_the_same_delivery() {
     );
     second.close().await;
     first.close().await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Swallowed {
+    InvalidStage,
+    CancelledStage,
+    ExplicitRollback,
+}
+
+async fn cancel_partial_child_stage(scope: &mut Scope<'static>) {
+    let barrier = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Release(Arc::clone(&barrier));
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut sender = Some(sender);
+    scope
+        .connection()
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_update_hook(move |event| {
+            if event.table == "raddle_jobs"
+                && event.operation == SqliteOperation::Insert
+                && let Some(sender) = sender.take()
+            {
+                let _ = sender.send(());
+                let (released, wake) = &*barrier;
+                let mut guard = released.lock().unwrap();
+                while !*guard {
+                    guard = wake.wait(guard).unwrap();
+                }
+            }
+        });
+    let child = Envelope::encode(&Message { value: 99 }).unwrap();
+    let now = Utc::now();
+    let deliveries = [
+        Delivery::new(DeliveryKind::Remote, "child-a", now),
+        Delivery::new(DeliveryKind::Remote, "child-b", now),
+    ];
+    {
+        let mut pending = Box::pin(scope.stage("test", "tenant", &child, &deliveries));
+        tokio::select! {
+            ready = receiver => ready.unwrap(),
+            result = &mut pending => panic!("child stage completed before insert gate: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("child insert gate timed out"),
+        }
+    }
+    drop(release);
+    scope
+        .connection()
+        .lock_handle()
+        .await
+        .unwrap()
+        .remove_update_hook();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM raddle_jobs WHERE kind='remote'")
+            .fetch_one(scope.connection())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn confirmed_rollback_only_commits_retry_failed_orders_without_stopping_neighbors() {
+    for mode in [
+        Swallowed::InvalidStage,
+        Swallowed::CancelledStage,
+        Swallowed::ExplicitRollback,
+    ] {
+        for failed in 0..3 {
+            let (_directory, store) = fixture().await;
+            let mut setup = store.begin().await.unwrap();
+            sqlx::query("CREATE TABLE business(value INTEGER PRIMARY KEY)")
+                .execute(setup.connection())
+                .await
+                .unwrap();
+            setup.commit(Utc::now()).await.unwrap();
+            let mut jobs = Vec::new();
+            for value in 0..3 {
+                jobs.push(enqueue(&store, value, DeliveryKind::Local, "owned").await);
+            }
+            let corrected = Arc::new(AtomicBool::new(false));
+            let swallowed = Arc::new(AtomicUsize::new(0));
+            let fixed = Arc::clone(&corrected);
+            let observed = Arc::clone(&swallowed);
+            let mut worker = Worker::try_new(store.clone(), Duration::from_secs(5)).unwrap();
+            worker
+                .handle::<Message, _>("owned", Codecs::default(), move |message, scope| {
+                    let fixed = Arc::clone(&fixed);
+                    let observed = Arc::clone(&observed);
+                    Box::pin(async move {
+                        sqlx::query("INSERT INTO business VALUES(?)")
+                            .bind(message.value)
+                            .execute(scope.connection())
+                            .await
+                            .unwrap();
+                        if message.value == failed && !fixed.load(Ordering::SeqCst) {
+                            match mode {
+                                Swallowed::InvalidStage => {
+                                    let child = Envelope::encode(&Message { value: 99 }).unwrap();
+                                    let invalid =
+                                        Delivery::new(DeliveryKind::Remote, "", Utc::now());
+                                    assert!(matches!(
+                                        scope.stage("test", "tenant", &child, &[invalid]).await,
+                                        Err(Error::Invalid(_))
+                                    ));
+                                }
+                                Swallowed::CancelledStage => {
+                                    cancel_partial_child_stage(scope).await
+                                }
+                                Swallowed::ExplicitRollback => scope.mark_rollback_only(),
+                            }
+                            // Prove the handler actually returned success after the
+                            // poison operation, rather than timing out beforehand.
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(())
+                    })
+                })
+                .unwrap();
+            for position in 0..3 {
+                assert!(
+                    worker.run_once().await.unwrap(),
+                    "{mode:?}, position {position}"
+                );
+                if position == failed {
+                    let id = jobs[failed as usize].0;
+                    let job = store.inspect("tenant", id).await.unwrap().unwrap();
+                    assert_eq!((job.status.as_str(), job.attempts), ("ready", 1));
+                    let mut inspect = store.begin().await.unwrap();
+                    let due: i64 =
+                        sqlx::query_scalar("SELECT available_at FROM raddle_jobs WHERE id=?")
+                            .bind(id.to_string())
+                            .fetch_one(inspect.connection())
+                            .await
+                            .unwrap();
+                    assert!(due > jobs[failed as usize].2.available_at.timestamp_millis());
+                    // Hold this already-recorded retry outside the wall-clock
+                    // duration of the neighbor phase, then advance it once fixed.
+                    assert_eq!(
+                        sqlx::query(
+                            "UPDATE raddle_jobs SET available_at=? WHERE id=? AND status='ready'"
+                        )
+                        .bind((Utc::now() + TimeDelta::hours(1)).timestamp_millis())
+                        .bind(id.to_string())
+                        .execute(inspect.connection())
+                        .await
+                        .unwrap()
+                        .rows_affected(),
+                        1
+                    );
+                    inspect.commit(Utc::now()).await.unwrap();
+                }
+            }
+            assert_eq!(swallowed.load(Ordering::SeqCst), 1);
+            jobs.push(enqueue(&store, 3, DeliveryKind::Local, "owned").await);
+            assert!(worker.run_once().await.unwrap());
+            assert!(!worker.run_once().await.unwrap());
+            let mut inspect = store.begin().await.unwrap();
+            let values: Vec<i64> = sqlx::query_scalar("SELECT value FROM business ORDER BY value")
+                .fetch_all(inspect.connection())
+                .await
+                .unwrap();
+            assert_eq!(
+                values,
+                (0..4)
+                    .filter(|value| *value != i64::from(failed))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM raddle_jobs WHERE kind='remote'"
+                )
+                .fetch_one(inspect.connection())
+                .await
+                .unwrap(),
+                0
+            );
+            inspect.rollback().await.unwrap();
+            corrected.store(true, Ordering::SeqCst);
+            let mut advance = store.begin().await.unwrap();
+            assert_eq!(
+                sqlx::query("UPDATE raddle_jobs SET available_at=0 WHERE id=? AND status='ready'")
+                    .bind(jobs[failed as usize].0.to_string())
+                    .execute(advance.connection())
+                    .await
+                    .unwrap()
+                    .rows_affected(),
+                1
+            );
+            advance.commit(Utc::now()).await.unwrap();
+            assert!(worker.run_once().await.unwrap());
+            assert!(!worker.run_once().await.unwrap());
+            for (value, (id, _, _)) in jobs.iter().enumerate() {
+                let job = store.inspect("tenant", *id).await.unwrap().unwrap();
+                assert_eq!(job.status, "completed");
+                assert_eq!(job.attempts, if value as u32 == failed { 2 } else { 1 });
+            }
+            let mut inspect = store.begin().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM business")
+                    .fetch_one(inspect.connection())
+                    .await
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM raddle_replay_audit")
+                    .fetch_one(inspect.connection())
+                    .await
+                    .unwrap(),
+                0
+            );
+            inspect.rollback().await.unwrap();
+            store.close().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn commit_database_errors_are_not_reclassified_as_confirmed_rollback() {
+    let (_directory, store) = fixture().await;
+    let mut setup = store.begin().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(setup.connection())
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("CREATE TABLE parents(id INTEGER PRIMARY KEY)")
+        .execute(setup.connection())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE children(parent INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)").execute(setup.connection()).await.unwrap();
+    setup.commit(Utc::now()).await.unwrap();
+    let id = enqueue(&store, 404, DeliveryKind::Local, "owned").await.0;
+    let mut worker = Worker::try_new(store.clone(), Duration::from_secs(5)).unwrap();
+    worker
+        .handle::<Message, _>("owned", Codecs::default(), |message, scope| {
+            Box::pin(async move {
+                sqlx::query("INSERT INTO children VALUES(?)")
+                    .bind(message.value)
+                    .execute(scope.connection())
+                    .await
+                    .unwrap();
+                Ok(())
+            })
+        })
+        .unwrap();
+    match worker.run_once().await {
+        Err(Error::Database(sqlx::Error::Database(error))) => {
+            assert_eq!(error.code().as_deref(), Some("787"))
+        }
+        other => panic!("expected deferred commit error, got {other:?}"),
+    }
+    let job = store.inspect("tenant", id).await.unwrap().unwrap();
+    assert_eq!((job.status.as_str(), job.attempts), ("active", 1));
+    let mut inspect = store.begin().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM children")
+            .fetch_one(inspect.connection())
+            .await
+            .unwrap(),
+        0
+    );
+    inspect.rollback().await.unwrap();
+    store.close().await;
 }

@@ -75,6 +75,12 @@ database and configuration errors still propagate. A database error is not itsel
 proof that a commit rolled back: reconcile persisted state before making an
 operator recovery decision.
 
+If an application swallows a staging error or cancellation and returns success,
+`Scope::commit` still rolls back and reports `RollbackOnly`. The worker records a
+bounded retry for that input instead of letting its confirmed rollback stop
+neighboring polls. This classification is specific to confirmed rollback-only
+completion; commit or rollback database errors are not converted into retries.
+
 Successful jobs retain their completion state while failed jobs remain retryable
 or quarantined. Audited replay targets failed custody only; it does not resubmit
 successful neighbors. Outgoing effects remain at least once: remote publication
